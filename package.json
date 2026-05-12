@@ -2,6 +2,25 @@
   "name": "audioplayer",
   "private": true,
   "version": "0.1.0",
+  "description": "Desktop audiobook and music player for Linux (Tauri + React + mpv)",
+  "keywords": [
+    "audiobook",
+    "audio-player",
+    "linux",
+    "tauri",
+    "mpv",
+    "chaptercheck"
+  ],
+  "author": "Alexander Mäule <info@software-by-design.de> (http://nextcloud.software-by-design.de)",
+  "license": "MIT",
+  "homepage": "https://github.com/aSoftwareByDesignRepository/ChapterCheck#readme",
+  "bugs": {
+    "url": "https://github.com/aSoftwareByDesignRepository/ChapterCheck/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/aSoftwareByDesignRepository/ChapterCheck.git"
+  },
   "type": "module",
   "scripts": {
     "dev": "vite",

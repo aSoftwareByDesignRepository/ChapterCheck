@@ -2,7 +2,7 @@
 name = "audioplayer"
 version = "0.1.0"
 description = "Audiobook-focused audio player for Linux"
-authors = ["you"]
+authors = ["Alexander Mäule <info@software-by-design.de>"]
 license = "MIT"
 repository = "https://github.com/aSoftwareByDesignRepository/ChapterCheck"
 edition = "2021"

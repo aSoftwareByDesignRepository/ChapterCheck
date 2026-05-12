@@ -32,6 +32,11 @@ npm run tauri build
 
 Data (library DB) is stored under the OS user data directory (XDG on Linux), not inside the repo.
 
+## Author
+
+**Alexander Mäule** — [info@software-by-design.de](mailto:info@software-by-design.de)  
+Part of **Software by Design**; see also the [Nextcloud apps](http://nextcloud.software-by-design.de) in the same ecosystem (e.g. ArbeitszeitCheck, TicketCheck, ProjectCheck).
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
