@@ -24,11 +24,19 @@ npm install
 npm run tauri dev
 ```
 
-Release build (Linux `.deb` when configured in Tauri):
+Release build (Linux `.deb`):
 
 ```bash
 npm run tauri build
 ```
+
+Install the package (name matches **productName** + version + arch; use what `ls` shows):
+
+```bash
+sudo apt install ./src-tauri/target/release/bundle/deb/ChapterCheck_0.1.0_amd64.deb
+```
+
+If the version changes, run `ls src-tauri/target/release/bundle/deb/*.deb` and pass that path to `apt install`.
 
 Data (library DB) is stored under the OS user data directory (XDG on Linux), not inside the repo.
 
