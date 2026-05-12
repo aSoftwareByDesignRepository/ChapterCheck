@@ -1,0 +1,40 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "ChapterCheck",
+  "version": "0.1.0",
+  "identifier": "com.chaptercheck.app",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "ChapterCheck",
+        "width": 1200,
+        "height": 800,
+        "resizable": true
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; font-src 'self' data:; connect-src ipc: http://ipc.localhost http://127.0.0.1:1420 http://localhost:1420 ws://127.0.0.1:1420 ws://localhost:1420",
+      "capabilities": ["default"]
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "deb",
+    "category": "Audio",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png"
+    ],
+    "shortDescription": "Local audiobook player with resume, speed control, and SQLite-backed progress.",
+    "longDescription": "ChapterCheck is a Linux desktop player for long-form audio: open a folder as a playlist, sort tracks, adjust speed, and resume where you left off. Playback uses mpv; your library paths and positions stay on disk under your user profile."
+  },
+  "plugins": {}
+}
