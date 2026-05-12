@@ -20,6 +20,7 @@ type PlaylistItemDto = {
   duration_sec: number | null;
   artist?: string | null;
   album?: string | null;
+  listened: boolean;
 };
 
 type PlaylistDto = {
@@ -92,6 +93,7 @@ function isPlaylistDto(v: unknown): v is PlaylistDto {
     if (d != null && (typeof d !== "number" || !Number.isFinite(d))) return false;
     if ("artist" in it && it.artist != null && typeof it.artist !== "string") return false;
     if ("album" in it && it.album != null && typeof it.album !== "string") return false;
+    if (typeof it.listened !== "boolean") return false;
   }
   return true;
 }
@@ -187,6 +189,32 @@ function IconSkipNext() {
   );
 }
 
+function IconCheck() {
+  return (
+    <svg className="qa-icon" viewBox="0 0 24 24" aria-hidden="true">
+      <path
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="2.4"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        d="M5 12.5l4.5 4.5L19 7"
+      />
+    </svg>
+  );
+}
+
+function IconTrash() {
+  return (
+    <svg className="qa-icon" viewBox="0 0 24 24" aria-hidden="true">
+      <path
+        fill="currentColor"
+        d="M9 3h6a1 1 0 011 1v1h4v2H4V5h4V4a1 1 0 011-1zm1 5h2v10h-2V8zm4 0h2v10h-2V8zM6 8h2v10H6V8zm-1 12a2 2 0 002 2h10a2 2 0 002-2V8H5v12z"
+      />
+    </svg>
+  );
+}
+
 export default function App() {
   const [playlist, setPlaylist] = useState<PlaylistDto | null>(null);
   const [transport, setTransport] = useState<TransportDto | null>(null);
@@ -203,8 +231,36 @@ export default function App() {
   const modalCloseRef = useRef<HTMLButtonElement>(null);
   const [menuOpen, setMenuOpen] = useState<null | "file" | "playback" | "view" | "help">(null);
   const [modalSheet, setModalSheet] = useState<
-    null | "shortcuts" | "about" | "preferences" | "sleep"
+    null | "shortcuts" | "about" | "preferences" | "sleep" | "confirm"
   >(null);
+  const [confirmDialog, setConfirmDialog] = useState<{
+    title: string;
+    body: string;
+    confirmLabel: string;
+    danger?: boolean;
+    onConfirm: () => void | Promise<void>;
+  } | null>(null);
+  const openConfirm = useCallback(
+    (cfg: {
+      title: string;
+      body: string;
+      confirmLabel: string;
+      danger?: boolean;
+      onConfirm: () => void | Promise<void>;
+    }) => {
+      setConfirmDialog(cfg);
+      setModalSheet("confirm");
+    },
+    [],
+  );
+  const closeConfirm = useCallback(() => {
+    setConfirmDialog(null);
+    setModalSheet((m) => (m === "confirm" ? null : m));
+  }, []);
+
+  useEffect(() => {
+    if (modalSheet !== "confirm" && confirmDialog) setConfirmDialog(null);
+  }, [modalSheet, confirmDialog]);
   const [recent, setRecent] = useState<RecentOpenDto[]>([]);
   const [queueSearch, setQueueSearch] = useState("");
   const [appPrefs, setAppPrefs] = useState<AppPrefsDto | null>(null);
@@ -579,20 +635,22 @@ export default function App() {
     }
   };
 
-  const clearRecentHistory = async () => {
+  const clearRecentHistory = () => {
     if (!isTauri()) return;
-    if (
-      !window.confirm(t("confirm.clearRecent"))
-    ) {
-      return;
-    }
-    setError(null);
-    try {
-      await invoke("clear_recent_opened");
-      await loadRecent();
-    } catch (e) {
-      setError(String(e));
-    }
+    openConfirm({
+      title: t("confirm.clearRecentTitle"),
+      body: t("confirm.clearRecent"),
+      confirmLabel: t("confirm.clearRecentBtn"),
+      onConfirm: async () => {
+        setError(null);
+        try {
+          await invoke("clear_recent_opened");
+          await loadRecent();
+        } catch (e) {
+          setError(String(e));
+        }
+      },
+    });
   };
 
   const changeSort = async (sort: SortKey) => {
@@ -700,6 +758,78 @@ export default function App() {
     } catch (e) {
       setError(String(e));
     }
+  };
+
+  const toggleTrackListened = async (item: PlaylistItemDto) => {
+    if (!isTauri()) return;
+    setError(null);
+    try {
+      const dto = await invoke<PlaylistDto>("set_track_listened", {
+        path: item.path,
+        listened: !item.listened,
+      });
+      setPlaylist(dto);
+    } catch (e) {
+      setError(String(e));
+    }
+  };
+
+  const deleteTrackFile = (item: PlaylistItemDto) => {
+    if (!isTauri()) return;
+    openConfirm({
+      title: t("confirm.deleteTrackTitle"),
+      body: t("confirm.deleteTrack", { label: item.label }),
+      confirmLabel: t("confirm.deleteTrackBtn"),
+      danger: true,
+      onConfirm: async () => {
+        setError(null);
+        try {
+          const dto = await invoke<PlaylistDto | null>("delete_track_file", {
+            path: item.path,
+          });
+          setPlaylist(dto);
+          await refreshTransport();
+          await loadRecent();
+        } catch (e) {
+          setError(String(e));
+        }
+      },
+    });
+  };
+
+  const markSessionListened = async (listened: boolean) => {
+    if (!isTauri() || !playlist) return;
+    setError(null);
+    try {
+      const dto = await invoke<PlaylistDto>("mark_session_listened", { listened });
+      setPlaylist(dto);
+    } catch (e) {
+      setError(String(e));
+    }
+  };
+
+  const deleteSessionFiles = () => {
+    if (!isTauri() || !playlist) return;
+    openConfirm({
+      title: t("confirm.deleteSessionTitle"),
+      body: t("confirm.deleteSession", {
+        label: playlist.root,
+        count: playlist.items.length,
+      }),
+      confirmLabel: t("confirm.deleteSessionBtn"),
+      danger: true,
+      onConfirm: async () => {
+        setError(null);
+        try {
+          await invoke("delete_session_files");
+          setPlaylist(null);
+          await refreshTransport();
+          await loadRecent();
+        } catch (e) {
+          setError(String(e));
+        }
+      },
+    });
   };
 
   const togglePause = async () => {
@@ -815,6 +945,11 @@ export default function App() {
   const hasQueue = (playlist?.items.length ?? 0) > 0;
   const hasTrack = transport != null && transport.current_index !== null;
   const canSeekTransport = hasQueue && transport != null && !transport.idle;
+  const allTracksListened = useMemo(() => {
+    const items = playlist?.items;
+    if (!items || items.length === 0) return false;
+    return items.every((it) => it.listened);
+  }, [playlist?.items]);
 
   const queueSearchNorm = useMemo(() => normalizeQueueSearch(queueSearch), [queueSearch]);
 
@@ -1227,6 +1362,28 @@ export default function App() {
                 {rootDisplay}
               </p>
               <p className="path-hint">{t("sidebar.pathHint")}</p>
+              {hasQueue ? (
+                <div className="library-actions">
+                  <button
+                    type="button"
+                    className="btn btn-secondary btn-block"
+                    disabled={!isTauri()}
+                    onClick={() => void markSessionListened(!allTracksListened)}
+                  >
+                    {allTracksListened
+                      ? t("library.markUnlistened")
+                      : t("library.markListened")}
+                  </button>
+                  <button
+                    type="button"
+                    className="btn btn-danger btn-block"
+                    disabled={!isTauri()}
+                    onClick={() => void deleteSessionFiles()}
+                  >
+                    {t("library.deleteAudiobook")}
+                  </button>
+                </div>
+              ) : null}
             </div>
           ) : null}
 
@@ -1528,40 +1685,78 @@ export default function App() {
                       ? formatClock(it.duration_sec)
                       : null;
                   const meta = formatQueueItemMeta(it.artist, it.album);
+                  const listenedTitle = it.listened
+                    ? t("queue.unmarkListenedTitle")
+                    : t("queue.markListenedTitle");
                   return (
                     <li key={it.path} className="playlist-li">
-                      <button
-                        type="button"
-                        className={`playlist-item${active ? " playlist-item--active" : ""}`}
-                        aria-current={active ? "true" : undefined}
-                        title={it.path}
-                        onClick={() => void playIndex(idx)}
+                      <div
+                        className={`playlist-row${it.listened ? " playlist-row--listened" : ""}`}
                       >
-                        <span className="track-idx" aria-hidden="true">
-                          {String(idx + 1).padStart(2, "0")}
-                        </span>
-                        <span className="track-body">
-                          <span className="track-row track-row--main">
-                            <span className="track-title">{it.label}</span>
-                            <span
-                              className="track-duration"
-                              {...(dur
-                                ? { title: `${t("queue.durationColumn")}: ${dur}` }
-                                : {
-                                    title: t("queue.durationUnknown"),
-                                    "aria-label": t("queue.durationUnknown"),
-                                  })}
-                            >
-                              {dur ?? "—"}
-                            </span>
+                        <button
+                          type="button"
+                          className={`playlist-item${active ? " playlist-item--active" : ""}`}
+                          aria-current={active ? "true" : undefined}
+                          title={it.path}
+                          onClick={() => void playIndex(idx)}
+                        >
+                          <span className="track-idx" aria-hidden="true">
+                            {it.listened ? (
+                              <span className="track-idx-check" aria-hidden="true">
+                                <IconCheck />
+                              </span>
+                            ) : (
+                              String(idx + 1).padStart(2, "0")
+                            )}
                           </span>
-                          {meta ? (
-                            <span className="track-meta" title={meta}>
-                              {meta}
+                          <span className="track-body">
+                            <span className="track-row track-row--main">
+                              <span className="track-title">{it.label}</span>
+                              <span
+                                className="track-duration"
+                                {...(dur
+                                  ? { title: `${t("queue.durationColumn")}: ${dur}` }
+                                  : {
+                                      title: t("queue.durationUnknown"),
+                                      "aria-label": t("queue.durationUnknown"),
+                                    })}
+                              >
+                                {dur ?? "—"}
+                              </span>
                             </span>
-                          ) : null}
-                        </span>
-                      </button>
+                            {meta ? (
+                              <span className="track-meta" title={meta}>
+                                {meta}
+                              </span>
+                            ) : null}
+                          </span>
+                        </button>
+                        <div className="track-actions" aria-label={t("queue.itemActionsAria")}>
+                          <button
+                            type="button"
+                            className={`track-action${
+                              it.listened ? " track-action--on" : ""
+                            }`}
+                            disabled={!isTauri()}
+                            aria-pressed={it.listened}
+                            aria-label={listenedTitle}
+                            title={listenedTitle}
+                            onClick={() => void toggleTrackListened(it)}
+                          >
+                            <IconCheck />
+                          </button>
+                          <button
+                            type="button"
+                            className="track-action track-action--danger"
+                            disabled={!isTauri()}
+                            aria-label={t("queue.deleteTrackTitle")}
+                            title={t("queue.deleteTrackTitle")}
+                            onClick={() => void deleteTrackFile(it)}
+                          >
+                            <IconTrash />
+                          </button>
+                        </div>
+                      </div>
                     </li>
                   );
                 })}
@@ -1585,9 +1780,9 @@ export default function App() {
           <div
             className={`modal-sheet${
               modalSheet === "preferences" || modalSheet === "sleep" ? " modal-sheet--prefs" : ""
-            }`}
+            }${modalSheet === "confirm" ? " modal-sheet--confirm" : ""}`}
             ref={modalSheetRef}
-            role="dialog"
+            role={modalSheet === "confirm" ? "alertdialog" : "dialog"}
             aria-modal="true"
             aria-labelledby={
               modalSheet === "shortcuts"
@@ -1596,11 +1791,23 @@ export default function App() {
                   ? "help-about-title"
                   : modalSheet === "preferences"
                     ? "preferences-dialog-title"
-                    : "sleep-dialog-title"
+                    : modalSheet === "confirm"
+                      ? "confirm-dialog-title"
+                      : "sleep-dialog-title"
             }
+            aria-describedby={modalSheet === "confirm" ? "confirm-dialog-body" : undefined}
             onClick={(e) => e.stopPropagation()}
           >
-            {modalSheet === "shortcuts" ? (
+            {modalSheet === "confirm" && confirmDialog ? (
+              <>
+                <h2 className="modal-title" id="confirm-dialog-title">
+                  {confirmDialog.title}
+                </h2>
+                <p className="modal-body modal-body--confirm" id="confirm-dialog-body">
+                  {confirmDialog.body}
+                </p>
+              </>
+            ) : modalSheet === "shortcuts" ? (
               <>
                 <h2 className="modal-title" id="help-dialog-title">
                   {t("shortcuts.title")}
@@ -1723,14 +1930,38 @@ export default function App() {
                 </div>
               </>
             )}
-            <button
-              className="btn btn-primary modal-close"
-              ref={modalCloseRef}
-              type="button"
-              onClick={() => setModalSheet(null)}
-            >
-              {t("modal.close")}
-            </button>
+            {modalSheet === "confirm" && confirmDialog ? (
+              <div className="modal-actions">
+                <button
+                  className="btn btn-ghost"
+                  type="button"
+                  ref={modalCloseRef}
+                  onClick={() => closeConfirm()}
+                >
+                  {t("modal.cancel")}
+                </button>
+                <button
+                  className={`btn ${confirmDialog.danger ? "btn-danger" : "btn-primary"}`}
+                  type="button"
+                  onClick={() => {
+                    const action = confirmDialog.onConfirm;
+                    closeConfirm();
+                    void action();
+                  }}
+                >
+                  {confirmDialog.confirmLabel}
+                </button>
+              </div>
+            ) : (
+              <button
+                className="btn btn-primary modal-close"
+                ref={modalCloseRef}
+                type="button"
+                onClick={() => setModalSheet(null)}
+              >
+                {t("modal.close")}
+              </button>
+            )}
           </div>
         </div>
       ) : null}

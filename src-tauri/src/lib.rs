@@ -161,6 +161,8 @@ pub struct PlaylistItemDto {
     pub duration_sec: Option<f64>,
     pub artist: Option<String>,
     pub album: Option<String>,
+    /// True when the user has marked this track as listened/finished.
+    pub listened: bool,
 }
 
 #[derive(Clone, Serialize)]
@@ -445,11 +447,11 @@ impl InnerState {
         let mut items = Vec::new();
         for p in &self.playlist {
             let key_owned = p.to_string_lossy().into_owned();
-            let (mut dur, mut artist, mut album) = self
+            let (mut dur, mut artist, mut album, listened_at) = self
                 .db
                 .get_media_display_meta(&key_owned)
                 .map_err(|e| e.to_string())?
-                .unwrap_or((None, None, None));
+                .unwrap_or((None, None, None, None));
             if dur.is_none() {
                 dur = self
                     .db
@@ -480,6 +482,7 @@ impl InnerState {
                 duration_sec: dur,
                 artist,
                 album,
+                listened: listened_at.is_some(),
             });
         }
         Ok(PlaylistDto {
@@ -902,6 +905,147 @@ impl InnerState {
         self.play_path_at_index_with_autoplay(idx, false)?;
         self.persist_session_meta_checkpoint()?;
         self.build_playlist_dto()
+    }
+
+    fn set_track_listened_inner(
+        &mut self,
+        path: PathBuf,
+        listened: bool,
+    ) -> Result<PlaylistDto, String> {
+        let canon = InnerState::canonicalize_allowed(&path).unwrap_or(path);
+        if !self.allowed_files.contains(&canon) {
+            return Err("Track is not part of the current session".into());
+        }
+        let key = canon.to_string_lossy().into_owned();
+        let now = Self::now_unix();
+        let when = if listened { Some(now) } else { None };
+        self.db
+            .set_listened_at(&key, when, now)
+            .map_err(|e| e.to_string())?;
+        self.build_playlist_dto()
+    }
+
+    fn mark_session_listened_inner(&mut self, listened: bool) -> Result<PlaylistDto, String> {
+        if self.session_root.is_none() {
+            return Err("No session is open".into());
+        }
+        let now = Self::now_unix();
+        let when = if listened { Some(now) } else { None };
+        let keys: Vec<String> = self
+            .playlist
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        for k in &keys {
+            self.db
+                .set_listened_at(k, when, now)
+                .map_err(|e| e.to_string())?;
+        }
+        self.build_playlist_dto()
+    }
+
+    /// Delete one tracked file from disk. Updates queue, advances playback if it was current.
+    /// Returns `None` if the session became empty (caller should treat as fully closed).
+    fn delete_track_inner(&mut self, path: PathBuf) -> Result<Option<PlaylistDto>, String> {
+        let canon = InnerState::canonicalize_allowed(&path).unwrap_or(path);
+        if !self.allowed_files.contains(&canon) {
+            return Err("Track is not part of the current session".into());
+        }
+        let key = canon.to_string_lossy().into_owned();
+        let was_current = self.current_path().as_ref() == Some(&canon);
+
+        if was_current {
+            let _ = self.persist_current();
+            self.mpv.reset_session();
+        }
+
+        if let Err(e) = fs::remove_file(&canon) {
+            if was_current {
+                let _ = self.mpv.ensure_running();
+                if let Some(idx) = self.current_index {
+                    if idx < self.playlist.len() {
+                        let _ = self.play_path_at_index_with_autoplay(idx, false);
+                    }
+                }
+            }
+            return Err(format!("Cannot delete file: {e}"));
+        }
+        let _ = self.db.delete_media_row(&key);
+
+        let removed_idx = self.playlist.iter().position(|p| p == &canon);
+        self.allowed_files.remove(&canon);
+        if let Some(idx_removed) = removed_idx {
+            self.playlist.remove(idx_removed);
+            if was_current {
+                self.current_index = None;
+            } else if let Some(cur) = self.current_index {
+                if cur > idx_removed {
+                    self.current_index = Some(cur - 1);
+                }
+            }
+        }
+
+        if self.playlist.is_empty() {
+            self.session_root = None;
+            self.allowed_files.clear();
+            self.current_index = None;
+            self.single_file_session = false;
+            self.mpv.reset_session();
+            self.clear_stored_session_keys();
+            return Ok(None);
+        }
+
+        if was_current {
+            let new_idx = removed_idx
+                .map(|i| i.min(self.playlist.len() - 1))
+                .unwrap_or(0);
+            self.mpv
+                .ensure_running()
+                .map_err(|e: MpvError| e.to_string())?;
+            self.play_path_at_index_with_autoplay(new_idx, false)?;
+        }
+
+        self.persist_session_meta_checkpoint()?;
+        self.build_playlist_dto().map(Some)
+    }
+
+    /// Permanently delete every tracked file in the session (and remove the folder if it ends up empty).
+    fn delete_session_inner(&mut self) -> Result<(), String> {
+        let Some(root) = self.session_root.clone() else {
+            return Err("No session is open".into());
+        };
+        let _ = self.persist_current();
+        self.mpv.reset_session();
+
+        let files: Vec<PathBuf> = self.playlist.clone();
+        let mut last_err: Option<String> = None;
+        for p in &files {
+            let key = p.to_string_lossy().into_owned();
+            match fs::remove_file(p) {
+                Ok(()) => {
+                    let _ = self.db.delete_media_row(&key);
+                }
+                Err(e) => {
+                    last_err = Some(format!("{}: {e}", p.display()));
+                }
+            }
+        }
+
+        if !self.single_file_session {
+            let _ = fs::remove_dir(&root);
+        }
+
+        self.session_root = None;
+        self.allowed_files.clear();
+        self.playlist.clear();
+        self.current_index = None;
+        self.single_file_session = false;
+        self.clear_stored_session_keys();
+
+        if let Some(msg) = last_err {
+            return Err(format!("Some files could not be deleted: {msg}"));
+        }
+        Ok(())
     }
 
     fn app_prefs(&self) -> AppPrefsDto {
@@ -1608,6 +1752,49 @@ fn recover_mpv(app: AppHandle) -> Result<(), String> {
 }
 
 #[tauri::command]
+fn set_track_listened(
+    app: AppHandle,
+    path: String,
+    listened: bool,
+) -> Result<PlaylistDto, String> {
+    let p = path.trim();
+    if p.is_empty() {
+        return Err("Empty path".into());
+    }
+    let state = app.state::<AppState>();
+    let mut g = state.inner.lock().map_err(|e| e.to_string())?;
+    g.set_track_listened_inner(PathBuf::from(p), listened)
+}
+
+#[tauri::command]
+fn mark_session_listened(app: AppHandle, listened: bool) -> Result<PlaylistDto, String> {
+    let state = app.state::<AppState>();
+    let mut g = state.inner.lock().map_err(|e| e.to_string())?;
+    g.mark_session_listened_inner(listened)
+}
+
+#[tauri::command]
+fn delete_track_file(app: AppHandle, path: String) -> Result<Option<PlaylistDto>, String> {
+    let p = path.trim();
+    if p.is_empty() {
+        return Err("Empty path".into());
+    }
+    let state = app.state::<AppState>();
+    let dto = {
+        let mut g = state.inner.lock().map_err(|e| e.to_string())?;
+        g.delete_track_inner(PathBuf::from(p))?
+    };
+    Ok(dto)
+}
+
+#[tauri::command]
+fn delete_session_files(app: AppHandle) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    let mut g = state.inner.lock().map_err(|e| e.to_string())?;
+    g.delete_session_inner()
+}
+
+#[tauri::command]
 fn get_chapters(app: AppHandle) -> Result<Vec<ChapterDto>, String> {
     let state = app.state::<AppState>();
     let mut g = state.inner.lock().map_err(|e| e.to_string())?;
@@ -1699,6 +1886,10 @@ pub fn run() {
             set_ui_locale,
             recover_mpv,
             get_chapters,
+            set_track_listened,
+            mark_session_listened,
+            delete_track_file,
+            delete_session_files,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

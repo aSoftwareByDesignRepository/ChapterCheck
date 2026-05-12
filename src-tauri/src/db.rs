@@ -47,6 +47,7 @@ impl LibraryDb {
         )?;
         let _ = conn.execute("ALTER TABLE media_state ADD COLUMN artist TEXT", []);
         let _ = conn.execute("ALTER TABLE media_state ADD COLUMN album TEXT", []);
+        let _ = conn.execute("ALTER TABLE media_state ADD COLUMN listened_at INTEGER", []);
         Ok(Self { conn })
     }
 
@@ -89,18 +90,60 @@ impl LibraryDb {
             .optional()
     }
 
-    /// Returns `(duration_sec, artist, album)` when the row exists; `None` if no row.
+    /// Returns `(duration_sec, artist, album, listened_at)` when the row exists; `None` if no row.
     pub fn get_media_display_meta(
         &self,
         file_key: &str,
-    ) -> rusqlite::Result<Option<(Option<f64>, Option<String>, Option<String>)>> {
+    ) -> rusqlite::Result<Option<(Option<f64>, Option<String>, Option<String>, Option<i64>)>> {
         self.conn
             .query_row(
-                "SELECT duration_sec, artist, album FROM media_state WHERE file_key = ?1",
+                "SELECT duration_sec, artist, album, listened_at FROM media_state WHERE file_key = ?1",
                 [file_key],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )
             .optional()
+    }
+
+    /// Toggle the per-track "listened" flag. `listened_at=Some(ts)` marks it done; `None` clears it.
+    pub fn set_listened_at(
+        &mut self,
+        file_key: &str,
+        listened_at: Option<i64>,
+        now_unix: i64,
+    ) -> rusqlite::Result<()> {
+        let playback_speed = self
+            .get_media(file_key)
+            .ok()
+            .flatten()
+            .map(|m| m.playback_speed)
+            .unwrap_or_else(|| self.get_default_speed());
+        let position_sec = self
+            .get_media(file_key)
+            .ok()
+            .flatten()
+            .map(|m| m.position_sec)
+            .unwrap_or(0.0);
+        let duration_sec = self
+            .get_media(file_key)
+            .ok()
+            .flatten()
+            .and_then(|m| m.duration_sec);
+        self.conn.execute(
+            "INSERT INTO media_state (file_key, position_sec, duration_sec, playback_speed, updated_at, listened_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(file_key) DO UPDATE SET
+                listened_at = excluded.listened_at,
+                updated_at = excluded.updated_at",
+            params![file_key, position_sec, duration_sec, playback_speed, now_unix, listened_at],
+        )?;
+        Ok(())
+    }
+
+    /// Remove the per-file row (used when the file is deleted from disk).
+    pub fn delete_media_row(&mut self, file_key: &str) -> rusqlite::Result<()> {
+        self.conn
+            .execute("DELETE FROM media_state WHERE file_key = ?1", [file_key])?;
+        Ok(())
     }
 
     /// Merge tag fields into an existing row (or insert a stub row if missing).
