@@ -1,9 +1,12 @@
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
+
+const MPV_SOCKET_NAME: &str = "chaptercheck-mpv.sock";
+const MPV_SOCKET_LEGACY_PREFIX: &str = "chaptercheck-mpv-";
 
 #[derive(Debug, thiserror::Error)]
 pub enum MpvError {
@@ -20,11 +23,17 @@ pub enum MpvError {
 }
 
 struct MpvConnection {
-    #[allow(dead_code)]
     child: Child,
     sock_path: PathBuf,
     io: BufReader<UnixStream>,
     next_id: i64,
+}
+
+impl Drop for MpvConnection {
+    fn drop(&mut self) {
+        terminate_child(&mut self.child);
+        let _ = std::fs::remove_file(&self.sock_path);
+    }
 }
 
 fn mpv_property_unavailable(cmd_err: &str) -> bool {
@@ -128,16 +137,26 @@ impl MpvConnection {
         Ok(())
     }
 
-    fn loadfile_start(
-        &mut self,
-        path: &str,
-        start: f64,
-        muted_start: bool,
-        unpause_after_load: bool,
-    ) -> Result<(), MpvError> {
-        if muted_start {
-            let _ = self.set_prop_bool("pause", true);
+    fn wait_file_ready(&mut self, deadline: Instant) -> Result<(), MpvError> {
+        loop {
+            let idle = self.get_prop_bool("idle-active")?.unwrap_or(true);
+            if !idle {
+                return Ok(());
+            }
+            if Instant::now() > deadline {
+                return Err(MpvError::Ipc("timed out waiting for file load".into()));
+            }
+            std::thread::sleep(Duration::from_millis(25));
         }
+    }
+
+    /// Load a file and only start audible playback when `autoplay` is true.
+    ///
+    /// mpv may begin decoding as soon as `loadfile` is accepted; we always pause
+    /// before load, wait until the file is actually ready, then set the final
+    /// pause state so restore-on-launch cannot leak audio when the user opted out.
+    fn loadfile_controlled(&mut self, path: &str, start: f64, autoplay: bool) -> Result<(), MpvError> {
+        self.set_prop_bool("pause", true)?;
         let args = if start > 0.05 {
             vec![
                 Value::String("loadfile".into()),
@@ -153,9 +172,8 @@ impl MpvConnection {
             ]
         };
         self.request(json!({ "command": Value::Array(args) }))?;
-        if muted_start && unpause_after_load {
-            let _ = self.set_prop_bool("pause", false);
-        }
+        self.wait_file_ready(Instant::now() + Duration::from_secs(20))?;
+        self.set_prop_bool("pause", !autoplay)?;
         Ok(())
     }
 }
@@ -181,6 +199,12 @@ impl Default for MpvController {
     }
 }
 
+impl Drop for MpvController {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
 impl MpvController {
     pub fn ensure_running(&mut self) -> Result<(), MpvError> {
         if self.conn.is_some() {
@@ -197,8 +221,7 @@ impl MpvController {
 
     pub fn shutdown(&mut self) {
         if let Some(mut c) = self.conn.take() {
-            let _ = c.child.kill();
-            let _ = c.child.wait();
+            terminate_child(&mut c.child);
             let _ = std::fs::remove_file(&c.sock_path);
         }
     }
@@ -233,12 +256,16 @@ impl MpvController {
     }
 
     pub fn load_file(&mut self, path: &str, start: f64) -> Result<(), MpvError> {
-        self.with_conn(|c| c.loadfile_start(path, start, true, true))
+        self.load_file_controlled(path, start, true)
     }
 
     /// Load file and leave playback **paused** at `start` (no audible start).
     pub fn load_file_start_paused(&mut self, path: &str, start: f64) -> Result<(), MpvError> {
-        self.with_conn(|c| c.loadfile_start(path, start, true, false))
+        self.load_file_controlled(path, start, false)
+    }
+
+    pub fn load_file_controlled(&mut self, path: &str, start: f64, autoplay: bool) -> Result<(), MpvError> {
+        self.with_conn(|c| c.loadfile_controlled(path, start, autoplay))
     }
 
     pub fn pause(&mut self) -> Result<(), MpvError> {
@@ -388,38 +415,128 @@ impl MpvController {
     }
 }
 
-fn start_mpv() -> Result<MpvConnection, MpvError> {
-    let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR")
+/// Kill orphaned ChapterCheck mpv engines left behind by crashed or force-killed app runs.
+pub fn cleanup_orphaned_processes() {
+    cleanup_orphaned_mpv_processes();
+    if let Some(runtime_dir) = runtime_dir() {
+        cleanup_stale_mpv_sockets(&runtime_dir);
+    }
+}
+
+fn runtime_dir() -> Option<PathBuf> {
+    std::env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir);
+        .or_else(|| Some(std::env::temp_dir()))
+}
+
+fn terminate_child(child: &mut Child) {
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[cfg(unix)]
+fn configure_child_process(cmd: &mut Command) {
+    use std::os::unix::process::CommandExt;
+
+    unsafe {
+        cmd.pre_exec(|| {
+            // If the app exits abruptly, the kernel terminates mpv with us.
+            libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);
+            Ok(())
+        });
+    }
+}
+
+#[cfg(not(unix))]
+fn configure_child_process(_cmd: &mut Command) {}
+
+#[cfg(unix)]
+fn cleanup_orphaned_mpv_processes() {
+    let my_pid = std::process::id();
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Ok(name) = entry.file_name().into_string() else {
+            continue;
+        };
+        if !name.chars().all(|c| c.is_ascii_digit()) {
+            continue;
+        }
+        let Ok(pid) = name.parse::<i32>() else {
+            continue;
+        };
+        if pid as u32 == my_pid {
+            continue;
+        }
+        let cmdline_path = entry.path().join("cmdline");
+        let Ok(raw) = std::fs::read(cmdline_path) else {
+            continue;
+        };
+        if !raw.windows(4).any(|w| w == b"mpv\0") {
+            continue;
+        }
+        let cmdline = String::from_utf8_lossy(&raw);
+        if !cmdline.contains("chaptercheck-mpv") {
+            continue;
+        }
+        unsafe {
+            libc::kill(pid, libc::SIGTERM);
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn cleanup_orphaned_mpv_processes() {}
+
+fn cleanup_stale_mpv_sockets(runtime_dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(runtime_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name == MPV_SOCKET_NAME
+            || (name.starts_with(MPV_SOCKET_LEGACY_PREFIX) && name.ends_with(".sock"))
+        {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+fn start_mpv() -> Result<MpvConnection, MpvError> {
+    cleanup_orphaned_processes();
+
+    let runtime_dir = runtime_dir().unwrap_or_else(std::env::temp_dir);
     let _ = std::fs::create_dir_all(&runtime_dir);
-    let sock_path = runtime_dir.join(format!("chaptercheck-mpv-{}.sock", uuid::Uuid::new_v4()));
+    let sock_path = runtime_dir.join(MPV_SOCKET_NAME);
     if sock_path.exists() {
         let _ = std::fs::remove_file(&sock_path);
     }
 
     let mpv_bin = std::env::var("MPV_PATH").unwrap_or_else(|_| "mpv".into());
     let ipc = format!("--input-ipc-server={}", sock_path.display());
-    let mut child = Command::new(&mpv_bin)
-        .args([
-            "--idle=yes",
-            "--keep-open=yes",
-            "--no-video",
-            "--no-terminal",
-            "--really-quiet",
-            "--no-config",
-            "--load-scripts=no",
-            &ipc,
-        ])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|e| {
-            MpvError::Spawn(format!(
-                "{e}. Install mpv (e.g. `sudo apt install mpv`) or set MPV_PATH."
-            ))
-        })?;
+    let mut cmd = Command::new(&mpv_bin);
+    cmd.args([
+        "--idle=yes",
+        "--keep-open=yes",
+        "--pause",
+        "--no-video",
+        "--no-terminal",
+        "--really-quiet",
+        "--no-config",
+        "--load-scripts=no",
+        &ipc,
+    ])
+    .stdin(Stdio::null())
+    .stdout(Stdio::null())
+    .stderr(Stdio::null());
+    configure_child_process(&mut cmd);
+    let mut child = cmd.spawn().map_err(|e| {
+        MpvError::Spawn(format!(
+            "{e}. Install mpv (e.g. `sudo apt install mpv`) or set MPV_PATH."
+        ))
+    })?;
 
     let deadline = Instant::now() + Duration::from_secs(8);
     let stream = loop {
@@ -429,8 +546,8 @@ fn start_mpv() -> Result<MpvConnection, MpvError> {
             }
         }
         if Instant::now() > deadline {
-            let _ = child.kill();
-            let _ = child.wait();
+            terminate_child(&mut child);
+            let _ = std::fs::remove_file(&sock_path);
             return Err(MpvError::SocketTimeout);
         }
         std::thread::sleep(Duration::from_millis(40));

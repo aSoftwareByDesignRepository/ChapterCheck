@@ -8,13 +8,19 @@ import "@fontsource/fraunces/500.css";
 import "@fontsource/fraunces/600.css";
 import "@fontsource/fraunces/700.css";
 import App from "./App";
+import { AddToPlaylistProvider } from "./context/AddToPlaylistContext";
+import { ContextMenuProvider } from "./context/ContextMenuContext";
 import { I18nProvider } from "./i18n/I18nContext";
 import "./styles.css";
 
 ReactDOM.createRoot(document.getElementById("root")!).render(
   <React.StrictMode>
     <I18nProvider>
-      <App />
+      <AddToPlaylistProvider>
+        <ContextMenuProvider>
+          <App />
+        </ContextMenuProvider>
+      </AddToPlaylistProvider>
     </I18nProvider>
   </React.StrictMode>,
 );

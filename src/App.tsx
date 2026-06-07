@@ -1,9 +1,29 @@
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { AppNav } from "./components/AppNav";
+import { LibrarySidebar } from "./components/LibrarySidebar";
+import { MiniPlayerBar } from "./components/MiniPlayerBar";
 import { useI18n } from "./i18n/I18nContext";
 import type { Locale } from "./i18n/types";
 import { normalizeLocale } from "./i18n/types";
+import type {
+  AppView,
+  CollectionDetailDto,
+  CollectionSummaryDto,
+  LibraryRootDto,
+} from "./types/catalog";
+import { AddToPlaylistButton } from "./components/AddToPlaylistButton";
+import { useAddToPlaylist } from "./context/AddToPlaylistContext";
+import { useContextMenu, type ContextMenuEntry } from "./context/ContextMenuContext";
+import { CollectionDetailSheet } from "./components/CollectionDetailSheet";
+import { CatalogView } from "./views/CatalogView";
+import { coverUrl } from "./utils/coverUrl";
+import { HomeView } from "./views/HomeView";
+import { NowPlayingView } from "./views/NowPlayingView";
+import { LibraryView } from "./views/LibraryView";
+import { PlaylistsView } from "./views/PlaylistsView";
+import { missingFileContextEntries } from "./utils/missingFileMenu";
 
 export type SortKey =
   | "name-asc"
@@ -21,6 +41,8 @@ type PlaylistItemDto = {
   artist?: string | null;
   album?: string | null;
   listened: boolean;
+  collection_file_id?: number | null;
+  library_missing?: boolean;
 };
 
 type PlaylistDto = {
@@ -43,6 +65,9 @@ type TransportDto = {
   session_root: string | null;
   mpv_error: string | null;
   repeat_mode: string;
+  playback_kind?: string | null;
+  active_collection_id?: number | null;
+  active_collection_kind?: string | null;
 };
 
 type RecentOpenDto = {
@@ -54,7 +79,10 @@ type RecentOpenDto = {
 type AppPrefsDto = {
   resume_playing_on_launch: boolean;
   scan_subfolders: boolean;
+  online_metadata_enabled: boolean;
   ui_locale: string;
+  default_speed_audiobook: number;
+  default_speed_music: number;
 };
 
 type SetScanFoldersResult = {
@@ -94,6 +122,16 @@ function isPlaylistDto(v: unknown): v is PlaylistDto {
     if ("artist" in it && it.artist != null && typeof it.artist !== "string") return false;
     if ("album" in it && it.album != null && typeof it.album !== "string") return false;
     if (typeof it.listened !== "boolean") return false;
+    if (
+      "collection_file_id" in it &&
+      it.collection_file_id != null &&
+      typeof it.collection_file_id !== "number"
+    ) {
+      return false;
+    }
+    if ("library_missing" in it && it.library_missing != null && typeof it.library_missing !== "boolean") {
+      return false;
+    }
   }
   return true;
 }
@@ -104,7 +142,13 @@ type UiAction =
   | "help.shortcuts"
   | "help.about"
   | "app.preferences"
-  | "playback.sleep_timer";
+  | "playback.sleep_timer"
+  | "library.link_folder";
+
+type UserSessionOpenPayload = {
+  playlist: PlaylistDto;
+  suggest_library_link: boolean;
+};
 
 function isUiActionPayload(v: unknown): v is { action: UiAction } {
   if (!v || typeof v !== "object") return false;
@@ -115,8 +159,77 @@ function isUiActionPayload(v: unknown): v is { action: UiAction } {
     a === "help.shortcuts" ||
     a === "help.about" ||
     a === "app.preferences" ||
-    a === "playback.sleep_timer"
+    a === "playback.sleep_timer" ||
+    a === "library.link_folder"
   );
+}
+
+function isUserSessionOpenPayload(v: unknown): v is UserSessionOpenPayload {
+  if (!v || typeof v !== "object") return false;
+  const o = v as Record<string, unknown>;
+  return isPlaylistDto(o.playlist) && typeof o.suggest_library_link === "boolean";
+}
+
+function pathUnderAvailableRoot(filePath: string, roots: LibraryRootDto[]): boolean {
+  for (const root of roots) {
+    if (!root.is_available) continue;
+    if (filePath === root.path) return true;
+    const prefix = root.path.endsWith("/") ? root.path : `${root.path}/`;
+    if (filePath.startsWith(prefix)) return true;
+  }
+  return false;
+}
+
+function pathsUnderRoot(items: PlaylistItemDto[], root: string): boolean {
+  if (items.length === 0) return false;
+  return items.every((it) => {
+    if (it.path === root) return true;
+    const prefix = root.endsWith("/") ? root : `${root}/`;
+    return it.path.startsWith(prefix);
+  });
+}
+
+type SessionDeleteCopy = {
+  buttonLabel: string;
+  confirmTitle: string;
+  confirmBody: string;
+  confirmLabel: string;
+};
+
+function buildSessionDeleteCopy(
+  playlist: PlaylistDto,
+  playbackKind: string | null | undefined,
+  t: (key: string, vars?: Record<string, string | number>) => string,
+): SessionDeleteCopy {
+  const items = playlist.items;
+  const count = items.length;
+  const isOne = count === 1;
+  const isFolderSession =
+    !isOne && playbackKind === "session" && pathsUnderRoot(items, playlist.root);
+  const label = isOne
+    ? items[0]!.label
+    : isFolderSession
+      ? playlist.root
+      : t("confirm.deleteSessionQueueLabel", { count });
+  const confirmLabel = isOne ? t("confirm.deleteTrackBtn") : t("confirm.deleteSessionBtn");
+
+  if (isOne) {
+    return {
+      buttonLabel: t("queue.deleteSessionOne"),
+      confirmTitle: t("confirm.deleteSessionTitleOne"),
+      confirmBody: t("confirm.deleteSessionOne", { label }),
+      confirmLabel,
+    };
+  }
+
+  return {
+    buttonLabel: t("queue.deleteSessionMany", { count }),
+    confirmTitle: t("confirm.deleteSessionTitleMany", { count }),
+    confirmBody: isFolderSession
+      ? t("confirm.deleteSessionManyFolder", { count, label })
+      : t("confirm.deleteSessionMany", { count, label }),
+    confirmLabel,
+  };
 }
 
 function formatClock(seconds: number): string {
@@ -218,6 +331,7 @@ function IconTrash() {
 export default function App() {
   const [playlist, setPlaylist] = useState<PlaylistDto | null>(null);
   const [transport, setTransport] = useState<TransportDto | null>(null);
+  const [osMediaActive, setOsMediaActive] = useState(false);
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -231,8 +345,22 @@ export default function App() {
   const modalCloseRef = useRef<HTMLButtonElement>(null);
   const [menuOpen, setMenuOpen] = useState<null | "file" | "playback" | "view" | "help">(null);
   const [modalSheet, setModalSheet] = useState<
-    null | "shortcuts" | "about" | "preferences" | "sleep" | "confirm"
+    null | "shortcuts" | "about" | "preferences" | "sleep" | "confirm" | "addLibrary"
   >(null);
+  const [activeView, setActiveView] = useState<AppView>("home");
+  const [libraryRoots, setLibraryRoots] = useState<LibraryRootDto[]>([]);
+  const [libraryRefreshKey, setLibraryRefreshKey] = useState(0);
+  const [nowCoverSrc, setNowCoverSrc] = useState<string | null>(null);
+  const [playingCollectionKind, setPlayingCollectionKind] = useState<string | null>(null);
+  const [libraryPromptPath, setLibraryPromptPath] = useState<string | null>(null);
+  const [driveNotice, setDriveNotice] = useState<string | null>(null);
+  const [queueNotice, setQueueNotice] = useState<string | null>(null);
+  const [collectionDetailId, setCollectionDetailId] = useState<number | null>(null);
+  const [resolvedTrackCollectionId, setResolvedTrackCollectionId] = useState<number | null>(
+    null,
+  );
+  const [finishBookPrompt, setFinishBookPrompt] = useState(false);
+  const libraryRootsRef = useRef<LibraryRootDto[]>([]);
   const [confirmDialog, setConfirmDialog] = useState<{
     title: string;
     body: string;
@@ -276,6 +404,8 @@ export default function App() {
   }, [stopAfterTrackUi]);
 
   const { t, locale, setLocale } = useI18n();
+  const { openContextMenu } = useContextMenu();
+  const { appendPlaylistContextEntries } = useAddToPlaylist();
 
   useEffect(() => {
     if (!appPrefs?.ui_locale) return;
@@ -314,11 +444,34 @@ export default function App() {
   }, [transport?.current_path]);
 
   const refreshTransport = useCallback(async () => {
+    if (!isTauri()) return;
     try {
       const t = await invoke<TransportDto>("get_transport");
       setTransport(t);
     } catch (e) {
       setError(String(e));
+    }
+  }, []);
+
+  const syncPlaylistFromBackend = useCallback(async () => {
+    if (!isTauri()) return;
+    try {
+      const dto = await invoke<PlaylistDto | null>("get_current_playlist");
+      if (isPlaylistDto(dto)) {
+        setPlaylist(dto);
+      }
+    } catch {
+      /* ignore transient IPC errors */
+    }
+  }, []);
+
+  const refreshOsMedia = useCallback(async () => {
+    if (!isTauri()) return;
+    try {
+      const status = await invoke<{ available: boolean }>("get_os_media_status");
+      setOsMediaActive(status.available);
+    } catch {
+      setOsMediaActive(false);
     }
   }, []);
 
@@ -338,21 +491,178 @@ export default function App() {
       const p = await invoke<AppPrefsDto>("get_app_prefs");
       setAppPrefs(p);
     } catch {
-      setAppPrefs({ resume_playing_on_launch: false, scan_subfolders: false, ui_locale: "en" });
+      setAppPrefs({
+        resume_playing_on_launch: false,
+        scan_subfolders: false,
+        online_metadata_enabled: false,
+        ui_locale: "en",
+      });
     }
   }, []);
 
-  useEffect(() => {
+  const loadLibraryRoots = useCallback(async () => {
+    if (!isTauri()) return;
+    try {
+      const roots = await invoke<LibraryRootDto[]>("list_library_roots");
+      setLibraryRoots(roots);
+      libraryRootsRef.current = roots;
+    } catch {
+      setLibraryRoots([]);
+      libraryRootsRef.current = [];
+    }
+  }, []);
+
+  const openManageLibrary = useCallback(() => {
+    void loadLibraryRoots();
+    setActiveView("library");
+  }, [loadLibraryRoots]);
+
+  const openPreferences = useCallback(() => {
     void loadAppPrefs();
+    setModalSheet("preferences");
   }, [loadAppPrefs]);
 
+  const linkLibraryFolder = async (knownPath?: string | null) => {
+    if (!isTauri()) return;
+    setBusy(t("library.busy.adding"));
+    setError(null);
+    try {
+      const path = knownPath ?? (await invoke<string | null>("pick_library_folder"));
+      if (!path) return;
+      await invoke("add_library_root", {
+        input: {
+          path,
+          label: null,
+          content_kind: "mixed",
+          scan_rule: "auto-classify",
+          scan_subfolders: true,
+        },
+      });
+      await loadLibraryRoots();
+      setLibraryRefreshKey((k) => k + 1);
+      setLibraryPromptPath(null);
+      setModalSheet(null);
+      setActiveView((prev) => (prev === "library" ? prev : "home"));
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const handleUserSessionOpen = useCallback(
+    async (dto: PlaylistDto, suggestLibraryLink: boolean) => {
+      setPlaylist(dto);
+      setActiveView("nowPlaying");
+      await refreshTransport();
+      void loadRecent();
+      if (!suggestLibraryLink) return;
+      try {
+        const tr = await invoke<TransportDto>("get_transport");
+        if (!tr.active_collection_id) {
+          const alreadyLinked = libraryRootsRef.current.some((r) => r.path === dto.root);
+          if (!alreadyLinked) setLibraryPromptPath(dto.root);
+        }
+      } catch {
+        /* transport read is best-effort for the link banner */
+      }
+    },
+    [refreshTransport, loadRecent],
+  );
+
+  useEffect(() => {
+    void loadAppPrefs();
+    void loadLibraryRoots();
+  }, [loadAppPrefs, loadLibraryRoots]);
+
+  useEffect(() => {
+    if (transport?.active_collection_id != null) {
+      setResolvedTrackCollectionId(null);
+      return;
+    }
+    const path = transport?.current_path;
+    if (!path || !isTauri()) {
+      setResolvedTrackCollectionId(null);
+      return;
+    }
+    let cancelled = false;
+    void invoke<number | null>("find_collection_id_for_path", { path })
+      .then((id) => {
+        if (!cancelled) setResolvedTrackCollectionId(id);
+      })
+      .catch(() => {
+        if (!cancelled) setResolvedTrackCollectionId(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [transport?.active_collection_id, transport?.current_path]);
+
+  const playingCollectionId =
+    transport?.active_collection_id ?? resolvedTrackCollectionId ?? null;
+
+  useEffect(() => {
+    const id = playingCollectionId;
+    if (!id || !isTauri()) {
+      setNowCoverSrc(null);
+      setPlayingCollectionKind(null);
+      return;
+    }
+    let cancelled = false;
+    void invoke<CollectionDetailDto>("get_collection_detail", { collectionId: id })
+      .then((d) => {
+        if (!cancelled) {
+          setNowCoverSrc(coverUrl(d.cover_path));
+          setPlayingCollectionKind(d.kind);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setNowCoverSrc(null);
+          setPlayingCollectionKind(null);
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [playingCollectionId, libraryRefreshKey]);
+
   const scrollToPlayer = useCallback(() => {
+    setActiveView("nowPlaying");
     const el = mainStageRef.current;
     if (!el) return;
     const reduce = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
     el.scrollIntoView({ behavior: reduce ? "auto" : "smooth", block: "start" });
     window.setTimeout(() => el.focus(), reduce ? 0 : 280);
   }, []);
+
+  useEffect(() => {
+    if (!isTauri()) return;
+    const refreshDrives = async () => {
+      const before = libraryRootsRef.current;
+      try {
+        await invoke("refresh_library_roots");
+        const roots = await invoke<LibraryRootDto[]>("list_library_roots");
+        setLibraryRoots(roots);
+        libraryRootsRef.current = roots;
+        const reconnected = roots.some(
+          (r) => r.is_available && before.find((b) => b.id === r.id && !b.is_available),
+        );
+        if (reconnected) {
+          setDriveNotice(t("library.driveReconnected"));
+        }
+      } catch {
+        /* ignore background refresh errors */
+      }
+    };
+    const interval = window.setInterval(() => void refreshDrives(), 60_000);
+    const onFocus = () => void refreshDrives();
+    window.addEventListener("focus", onFocus);
+    return () => {
+      window.clearInterval(interval);
+      window.removeEventListener("focus", onFocus);
+    };
+  }, [t]);
 
   useEffect(() => {
     setSleepDeadlineMs(null);
@@ -418,8 +728,7 @@ export default function App() {
           setModalSheet("about");
           break;
         case "app.preferences":
-          void loadAppPrefs();
-          setModalSheet("preferences");
+          openPreferences();
           break;
         case "playback.sleep_timer":
           setModalSheet("sleep");
@@ -428,7 +737,7 @@ export default function App() {
           break;
       }
     },
-    [scrollToPlayer, scrollToQueue, loadAppPrefs],
+    [scrollToPlayer, scrollToQueue, loadAppPrefs, loadLibraryRoots],
   );
 
   const transportPollMs = useMemo(() => {
@@ -449,7 +758,15 @@ export default function App() {
 
   useEffect(() => {
     void loadRecent();
-  }, [loadRecent]);
+    void syncPlaylistFromBackend();
+  }, [loadRecent, syncPlaylistFromBackend]);
+
+  useEffect(() => {
+    if (!isTauri() || !transport) return;
+    if (transport.playlist_len > 0 && (playlist?.items.length ?? 0) === 0) {
+      void syncPlaylistFromBackend();
+    }
+  }, [transport?.playlist_len, playlist?.items.length, syncPlaylistFromBackend]);
 
   useEffect(() => {
     void refreshTransport();
@@ -458,6 +775,13 @@ export default function App() {
     }, transportPollMs);
     return () => window.clearInterval(id);
   }, [refreshTransport, transportPollMs]);
+
+  useEffect(() => {
+    if (!isTauri()) return;
+    void refreshOsMedia();
+    const id = window.setInterval(() => void refreshOsMedia(), 2500);
+    return () => window.clearInterval(id);
+  }, [refreshOsMedia]);
 
   useEffect(() => {
     if (!isTauri()) return;
@@ -475,6 +799,13 @@ export default function App() {
           void loadRecent();
         }
       }),
+      listen<unknown>("abp:user-session-open", (ev) => {
+        if (!mounted) return;
+        const p = ev.payload;
+        if (isUserSessionOpenPayload(p)) {
+          void handleUserSessionOpen(p.playlist, p.suggest_library_link);
+        }
+      }),
       listen<unknown>("abp:user-error", (ev) => {
         if (!mounted) return;
         const msg = ev.payload;
@@ -483,11 +814,17 @@ export default function App() {
       listen<unknown>("abp:ui-action", (ev) => {
         if (!mounted) return;
         if (!isUiActionPayload(ev.payload)) return;
-        applyUiAction(ev.payload.action);
+        const action = ev.payload.action;
+        if (action === "library.link_folder") {
+          void linkLibraryFolder();
+          return;
+        }
+        applyUiAction(action);
       }),
       listen("abp:transport-changed", () => {
         if (!mounted) return;
         void refreshTransport();
+        void refreshOsMedia();
       }),
     ])
       .then((unlisteners) => {
@@ -503,7 +840,7 @@ export default function App() {
       mounted = false;
       dispose?.();
     };
-  }, [refreshTransport, applyUiAction, loadRecent]);
+  }, [refreshTransport, applyUiAction, loadRecent, handleUserSessionOpen]);
 
   useEffect(() => {
     if (!modalSheet) return;
@@ -573,10 +910,40 @@ export default function App() {
   }, [transport, refreshTransport]);
 
   useEffect(() => {
+    const tr = transport;
+    const isMusic =
+      playingCollectionKind === "music" ||
+      tr?.active_collection_kind === "music" ||
+      tr?.playback_kind === "music";
+    if (!tr || isMusic || !tr.eof || !tr.active_collection_id) {
+      setFinishBookPrompt(false);
+      return;
+    }
+    const idx = tr.current_index;
+    const len = tr.playlist_len;
+    if (idx != null && len > 0 && idx === len - 1) {
+      setFinishBookPrompt(true);
+    } else {
+      setFinishBookPrompt(false);
+    }
+  }, [
+    transport?.eof,
+    transport?.current_index,
+    transport?.playlist_len,
+    transport?.active_collection_id,
+    transport?.playback_kind,
+    transport?.active_collection_kind,
+    playingCollectionKind,
+  ]);
+
+  useEffect(() => {
     const runTransport = (fn: () => Promise<void>) => {
       setError(null);
       void fn().catch((e) => setError(String(e)));
     };
+
+    const onLinux =
+      typeof navigator !== "undefined" && /linux/i.test(navigator.userAgent);
 
     const onKeyDown = (ev: KeyboardEvent) => {
       if (modalSheet) return;
@@ -646,6 +1013,21 @@ export default function App() {
         return;
       }
 
+      // When MPRIS is active, Linux routes headset keys via D-Bus — skip here to
+      // avoid double-firing. If MPRIS failed to register (Docker, no session bus),
+      // fall through so focused-window media keys still work.
+      if (
+        onLinux &&
+        osMediaActive &&
+        (ev.code === "MediaTrackPrevious" ||
+          ev.code === "MediaTrackNext" ||
+          ev.code === "MediaPlayPause" ||
+          ev.code === "MediaPlay" ||
+          ev.code === "MediaPause")
+      ) {
+        return;
+      }
+
       if (ev.code === "MediaTrackPrevious") {
         ev.preventDefault();
         runTransport(async () => {
@@ -664,30 +1046,222 @@ export default function App() {
         return;
       }
 
-      if (ev.code === "MediaPlayPause" || ev.code === "MediaPlay" || ev.code === "MediaPause") {
+      if (ev.code === "MediaPlayPause") {
         ev.preventDefault();
         runTransport(async () => {
           await invoke("toggle_pause");
+          await refreshTransport();
+        });
+        return;
+      }
+
+      if (ev.code === "MediaPlay") {
+        ev.preventDefault();
+        runTransport(async () => {
+          await invoke("set_paused", { paused: false });
+          await refreshTransport();
+        });
+        return;
+      }
+
+      if (ev.code === "MediaPause") {
+        ev.preventDefault();
+        runTransport(async () => {
+          await invoke("set_paused", { paused: true });
           await refreshTransport();
         });
       }
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [refreshTransport, modalSheet, playlist?.items.length]);
+  }, [refreshTransport, modalSheet, playlist?.items.length, osMediaActive]);
+
+  const playCollection = async (
+    collectionId: number,
+    mode: "continue" | "start",
+    shuffle = false,
+  ) => {
+    if (!isTauri()) return;
+    setBusy(t("busy.opening"));
+    setError(null);
+    try {
+      const dto = await invoke<PlaylistDto>("play_collection", {
+        collectionId,
+        mode,
+        shuffle,
+      });
+      setPlaylist(dto);
+      setActiveView("nowPlaying");
+      await refreshTransport();
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const openCollectionDetail = useCallback((id: number) => {
+    setCollectionDetailId(id);
+  }, []);
+
+  const onCollectionDetailChanged = useCallback(() => {
+    setLibraryRefreshKey((k) => k + 1);
+    void refreshTransport();
+    void loadLibraryRoots();
+  }, [refreshTransport, loadLibraryRoots]);
+
+  const confirmRemoveCollection = useCallback(
+    (collectionId: number, title: string) => {
+      openConfirm({
+        title: t("catalog.removeCollectionConfirmTitle"),
+        body: t("catalog.removeCollectionConfirmBody", { title }),
+        confirmLabel: t("catalog.removeCollectionConfirmBtn"),
+        danger: true,
+        onConfirm: async () => {
+          await invoke("remove_collection_from_library", { collectionId });
+          onCollectionDetailChanged();
+        },
+      });
+    },
+    [openConfirm, onCollectionDetailChanged, t],
+  );
+
+  const enqueueCollection = async (
+    collectionId: number,
+    position: "next" | "end" = "end",
+  ) => {
+    if (!isTauri()) return;
+    setError(null);
+    try {
+      const result = await invoke<{
+        playlist: PlaylistDto;
+        tracks_added: number;
+        collection_title: string;
+      }>("enqueue_collection", { collectionId, position });
+      setPlaylist(result.playlist);
+      const notice =
+        position === "next"
+          ? t("queue.addedNext", {
+              count: result.tracks_added,
+              title: result.collection_title,
+            })
+          : t("queue.addedEnd", {
+              count: result.tracks_added,
+              title: result.collection_title,
+            });
+      setQueueNotice(notice);
+      window.setTimeout(() => setQueueNotice(null), 4000);
+      await refreshTransport();
+    } catch (e) {
+      setError(String(e));
+    }
+  };
+
+  const playPlaylistById = async (playlistId: number) => {
+    if (!isTauri()) return;
+    setBusy(t("busy.opening"));
+    setError(null);
+    try {
+      const dto = await invoke<PlaylistDto>("play_playlist", {
+        playlistId,
+        shuffle: true,
+      });
+      setPlaylist(dto);
+      setActiveView("nowPlaying");
+      await refreshTransport();
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const shuffleRelax = async () => {
+    if (!isTauri()) return;
+    setError(null);
+    try {
+      const relaxId = await invoke<number | null>("find_relax_playlist");
+      if (relaxId != null) {
+        await playPlaylistById(relaxId);
+        return;
+      }
+      const music = await invoke<CollectionSummaryDto[]>("list_collections", {
+        kind: "music",
+        filter: null,
+        search: null,
+        limit: 200,
+        offset: 0,
+      });
+      const available = music.filter((m) => !m.unavailable);
+      if (available.length === 0) {
+        setError(t("home.noRelaxMusic"));
+        return;
+      }
+      const pick = available[Math.floor(Math.random() * available.length)]!;
+      await playCollection(pick.id, "start", true);
+    } catch (e) {
+      setError(String(e));
+    }
+  };
+
+  const scanLibraryRoot = async (rootId: number) => {
+    if (!isTauri()) return;
+    setBusy(t("library.busy.scanning"));
+    setError(null);
+    try {
+      await invoke("scan_library_root", { rootId });
+      await loadLibraryRoots();
+      setLibraryRefreshKey((k) => k + 1);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const exportLibraryDb = async () => {
+    if (!isTauri()) return;
+    setBusy(t("library.busy.exporting"));
+    setError(null);
+    try {
+      await invoke<string | null>("export_db");
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const removeLibraryRoot = (root: LibraryRootDto) => {
+    if (!isTauri()) return;
+    openConfirm({
+      title: t("library.removeConfirmTitle"),
+      body: t("library.removeConfirmBody"),
+      confirmLabel: t("library.removeConfirmBtn"),
+      danger: true,
+      onConfirm: async () => {
+        setError(null);
+        try {
+          await invoke("remove_library_root", { rootId: root.id });
+          await loadLibraryRoots();
+          setLibraryRefreshKey((k) => k + 1);
+        } catch (e) {
+          setError(String(e));
+        }
+      },
+    });
+  };
 
   const openFolder = async () => {
     setBusy(t("busy.openingFolder"));
     setError(null);
     try {
       const dto = await invoke<PlaylistDto | null>("pick_open_folder");
-      if (dto) setPlaylist(dto);
-      await refreshTransport();
+      if (dto) await handleUserSessionOpen(dto, true);
     } catch (e) {
       setError(String(e));
     } finally {
       setBusy(null);
-      void loadRecent();
     }
   };
 
@@ -696,13 +1270,11 @@ export default function App() {
     setError(null);
     try {
       const dto = await invoke<PlaylistDto | null>("pick_open_file");
-      if (dto) setPlaylist(dto);
-      await refreshTransport();
+      if (dto) await handleUserSessionOpen(dto, false);
     } catch (e) {
       setError(String(e));
     } finally {
       setBusy(null);
-      void loadRecent();
     }
   };
 
@@ -714,9 +1286,7 @@ export default function App() {
         path: entry.path,
         kind: entry.kind,
       });
-      if (dto) setPlaylist(dto);
-      await refreshTransport();
-      await loadRecent();
+      if (dto) await handleUserSessionOpen(dto, entry.kind === "folder");
     } catch (e) {
       setError(String(e));
     } finally {
@@ -781,11 +1351,13 @@ export default function App() {
   const setResumePref = async (enabled: boolean) => {
     if (!isTauri()) return;
     setError(null);
+    setAppPrefs((prev) => (prev ? { ...prev, resume_playing_on_launch: enabled } : prev));
     try {
       const p = await invoke<AppPrefsDto>("set_resume_playing_on_launch", { enabled });
       setAppPrefs(p);
     } catch (e) {
       setError(String(e));
+      void loadAppPrefs();
     }
   };
 
@@ -797,6 +1369,28 @@ export default function App() {
       setAppPrefs(r.prefs);
       if (r.playlist) setPlaylist(r.playlist);
       await refreshTransport();
+    } catch (e) {
+      setError(String(e));
+    }
+  };
+
+  const setOnlineMetadataPref = async (enabled: boolean) => {
+    if (!isTauri()) return;
+    setError(null);
+    try {
+      const p = await invoke<AppPrefsDto>("set_online_metadata_enabled", { enabled });
+      setAppPrefs(p);
+    } catch (e) {
+      setError(String(e));
+    }
+  };
+
+  const markActiveCollectionFinished = async () => {
+    const cid = transport?.active_collection_id;
+    if (!cid) return;
+    setFinishBookPrompt(false);
+    try {
+      await invoke("mark_collection_listened", { collectionId: cid, listened: true });
     } catch (e) {
       setError(String(e));
     }
@@ -863,6 +1457,56 @@ export default function App() {
     }
   };
 
+  const relinkLibraryFile = async (fileId: number) => {
+    if (!isTauri()) return;
+    setError(null);
+    try {
+      const path = await invoke<string | null>("pick_relink_audio_file");
+      if (!path) return;
+      const result = await invoke<{ playlist: PlaylistDto | null }>("relink_collection_file", {
+        fileId,
+        newPath: path,
+      });
+      setLibraryRefreshKey((k) => k + 1);
+      if (result.playlist) setPlaylist(result.playlist);
+      await refreshTransport();
+    } catch (e) {
+      setError(String(e));
+    }
+  };
+
+  const removeLibraryFile = (fileId: number, title: string) => {
+    if (!isTauri()) return;
+    openConfirm({
+      title: t("catalog.removeFromLibraryConfirmTitle"),
+      body: t("catalog.removeFromLibraryConfirmBody", { title }),
+      confirmLabel: t("catalog.removeFromLibraryConfirmBtn"),
+      danger: true,
+      onConfirm: async () => {
+        setError(null);
+        try {
+          await invoke("remove_collection_file_from_library", { fileId });
+          setLibraryRefreshKey((k) => k + 1);
+          await refreshTransport();
+        } catch (e) {
+          setError(String(e));
+        }
+      },
+    });
+  };
+
+  const removeQueueItem = async (path: string) => {
+    if (!isTauri()) return;
+    setError(null);
+    try {
+      const dto = await invoke<PlaylistDto | null>("remove_queue_item", { path });
+      setPlaylist(dto);
+      await refreshTransport();
+    } catch (e) {
+      setError(String(e));
+    }
+  };
+
   const deleteTrackFile = (item: PlaylistItemDto) => {
     if (!isTauri()) return;
     openConfirm({
@@ -898,14 +1542,11 @@ export default function App() {
   };
 
   const deleteSessionFiles = () => {
-    if (!isTauri() || !playlist) return;
+    if (!isTauri() || !playlist || !sessionDeleteCopy) return;
     openConfirm({
-      title: t("confirm.deleteSessionTitle"),
-      body: t("confirm.deleteSession", {
-        label: playlist.root,
-        count: playlist.items.length,
-      }),
-      confirmLabel: t("confirm.deleteSessionBtn"),
+      title: sessionDeleteCopy.confirmTitle,
+      body: sessionDeleteCopy.confirmBody,
+      confirmLabel: sessionDeleteCopy.confirmLabel,
       danger: true,
       onConfirm: async () => {
         setError(null);
@@ -965,6 +1606,30 @@ export default function App() {
     setError(null);
     try {
       await invoke<number>("set_default_playback_speed", { speed });
+      const p = await invoke<AppPrefsDto>("get_app_prefs");
+      setAppPrefs(p);
+      await refreshTransport();
+    } catch (e) {
+      setError(String(e));
+    }
+  };
+
+  const resetTrackSpeed = async () => {
+    setError(null);
+    try {
+      await invoke<number>("reset_track_speed_to_default");
+      await refreshTransport();
+    } catch (e) {
+      setError(String(e));
+    }
+  };
+
+  const setPlaybackSpeedDefaults = async (audiobook: number, music: number) => {
+    if (!isTauri()) return;
+    setError(null);
+    try {
+      const p = await invoke<AppPrefsDto>("set_playback_speed_defaults", { audiobook, music });
+      setAppPrefs(p);
       await refreshTransport();
     } catch (e) {
       setError(String(e));
@@ -1032,7 +1697,16 @@ export default function App() {
   }, [playlist?.root]);
 
   const hasQueue = (playlist?.items.length ?? 0) > 0;
+  const hasSession = hasQueue;
   const hasTrack = transport != null && transport.current_index !== null;
+  const isPlaying =
+    hasTrack && transport != null && !transport.paused && !transport.eof && !transport.idle;
+  const showMiniPlayer = hasSession && activeView !== "nowPlaying";
+  const showQueuePanel = activeView === "nowPlaying";
+  const isMusicSession =
+    playingCollectionKind === "music" ||
+    transport?.active_collection_kind === "music" ||
+    transport?.playback_kind === "music";
   const canSeekTransport =
     hasQueue && transport != null && !transport.mpv_error;
   const canSkipTransport = hasQueue && transport != null && !transport.mpv_error;
@@ -1042,6 +1716,19 @@ export default function App() {
     if (!items || items.length === 0) return false;
     return items.every((it) => it.listened);
   }, [playlist?.items]);
+
+  const isCatalogSession = transport?.active_collection_id != null;
+  const canDeleteQueueItem = useCallback(
+    (path: string) => isCatalogSession || pathUnderAvailableRoot(path, libraryRoots),
+    [isCatalogSession, libraryRoots],
+  );
+
+  const sessionDeleteCopy = useMemo((): SessionDeleteCopy | null => {
+    const items = playlist?.items ?? [];
+    if (items.length === 0) return null;
+    if (!items.every((it) => canDeleteQueueItem(it.path))) return null;
+    return buildSessionDeleteCopy(playlist!, transport?.playback_kind, t);
+  }, [playlist, canDeleteQueueItem, transport?.playback_kind, t]);
 
   const queueSearchNorm = useMemo(() => normalizeQueueSearch(queueSearch), [queueSearch]);
 
@@ -1085,7 +1772,7 @@ export default function App() {
   return (
     <div className="app-shell">
       <a className="skip-link" href="#main-stage">
-        {t("skip.toPlayback")}
+        {activeView === "nowPlaying" ? t("skip.toPlayback") : t("nav.home")}
       </a>
 
       <div className="app-chrome">
@@ -1121,6 +1808,21 @@ export default function App() {
                   <button
                     type="button"
                     role="menuitem"
+                    className="menubar-item menubar-item--primary"
+                    onClick={() => {
+                      setMenuOpen(null);
+                      void linkLibraryFolder();
+                    }}
+                  >
+                    {t("menu.file.linkFolder")}
+                  </button>
+                  <div className="menubar-sep" role="separator" />
+                  <div className="menubar-group-label" role="presentation">
+                    {t("sidebar.quickListen")}
+                  </div>
+                  <button
+                    type="button"
+                    role="menuitem"
                     className="menubar-item"
                     onClick={() => {
                       setMenuOpen(null);
@@ -1140,14 +1842,14 @@ export default function App() {
                   >
                     {t("menu.file.openFile")}
                   </button>
+                  <div className="menubar-sep" role="separator" />
                   <button
                     type="button"
                     role="menuitem"
                     className="menubar-item"
                     onClick={() => {
                       setMenuOpen(null);
-                      void loadAppPrefs();
-                      setModalSheet("preferences");
+                      openPreferences();
                     }}
                   >
                     {t("menu.file.preferences")}
@@ -1359,6 +2061,68 @@ export default function App() {
             </div>
           </div>
         ) : null}
+        {driveNotice ? (
+          <div className="library-prompt-banner library-prompt-banner--info" role="status">
+            <div className="library-prompt-row">
+              <p>{driveNotice}</p>
+              <button
+                type="button"
+                className="btn btn-ghost btn-compact"
+                aria-label={t("alert.dismiss")}
+                onClick={() => setDriveNotice(null)}
+              >
+                {t("alert.dismiss")}
+              </button>
+            </div>
+          </div>
+        ) : null}
+        {finishBookPrompt ? (
+          <div className="library-prompt-banner" role="status">
+            <div className="library-prompt-row">
+              <p>{t("finishBook.prompt")}</p>
+              <button
+                type="button"
+                className="btn btn-secondary btn-compact"
+                onClick={() => void markActiveCollectionFinished()}
+              >
+                {t("finishBook.mark")}
+              </button>
+              <button
+                type="button"
+                className="btn btn-ghost btn-compact"
+                onClick={() => setFinishBookPrompt(false)}
+              >
+                {t("finishBook.dismiss")}
+              </button>
+            </div>
+          </div>
+        ) : null}
+        {libraryPromptPath ? (
+          <div className="library-prompt-banner" role="status">
+            <div className="library-prompt-row">
+              <p>{t("library.linkPrompt")}</p>
+              <button
+                type="button"
+                className="btn btn-secondary btn-compact"
+                onClick={() => {
+                  const path = libraryPromptPath;
+                  setLibraryPromptPath(null);
+                  void linkLibraryFolder(path);
+                }}
+              >
+                {t("library.linkFolder")}
+              </button>
+              <button
+                type="button"
+                className="btn btn-ghost btn-compact"
+                aria-label={t("alert.dismiss")}
+                onClick={() => setLibraryPromptPath(null)}
+              >
+                {t("alert.dismiss")}
+              </button>
+            </div>
+          </div>
+        ) : null}
         {transport?.mpv_error ? (
           <div className="mpv-recover-banner" role="status">
             <div className="mpv-recover-row">
@@ -1373,62 +2137,42 @@ export default function App() {
         ) : null}
       </div>
 
-      <div className="app-body">
-        <aside className="sidebar sidebar--left" aria-label={t("sidebar.library")}>
-          <div className="sidebar-brand">
-            <img
-              className="sidebar-brand-mark"
-              src="/app-icon.png"
-              width={40}
-              height={40}
-              alt=""
-              decoding="async"
-            />
-            <div className="sidebar-brand-text">
-              <span className="sidebar-brand-name">{t("app.title")}</span>
-              <span className="sidebar-brand-tag">{t("app.tagline")}</span>
-            </div>
-          </div>
-
-          <div className="sidebar-section">
-            <h2 className="sidebar-heading">{t("sidebar.library")}</h2>
-            <div className="sidebar-actions">
-              <button className="btn btn-primary btn-block" type="button" onClick={() => void openFolder()}>
-                {t("sidebar.openFolder")}
-              </button>
-              <button className="btn btn-ghost btn-block" type="button" onClick={() => void openFile()}>
-                {t("sidebar.openFile")}
-              </button>
-            </div>
-          </div>
-
-          <div className="sidebar-section">
-            <div className="recent-section-head">
-              <h2 className="sidebar-heading" id="recent-opened-heading">
-                {t("sidebar.recent")}
-              </h2>
-              <button
-                type="button"
-                className="btn btn-ghost btn-compact recent-clear"
-                aria-label={t("sidebar.recentClearAria")}
-                title={t("sidebar.recentClearTitle")}
-                disabled={recent.length === 0}
-                onClick={() => void clearRecentHistory()}
-              >
-                <svg className="recent-clear-icon" viewBox="0 0 24 24" aria-hidden="true">
-                  <path
-                    fill="currentColor"
-                    d="M9 3h6a1 1 0 011 1v1h4v2H4V5h4V4a1 1 0 011-1zm1 5h2v10h-2V8zm4 0h2v10h-2V8zM6 8h2v10H6V8zm-1 12a2 2 0 002 2h10a2 2 0 002-2V8H5v12z"
-                  />
-                </svg>
-                <span className="recent-clear-label">{t("sidebar.recentClear")}</span>
-              </button>
-            </div>
-            {recent.length === 0 ? (
-              <p className="recent-empty">{t("sidebar.recentEmpty")}</p>
-            ) : (
-              <ul className="recent-list" aria-label={t("sidebar.recent")}>
-                {recent.map((it) => (
+      <div
+        className={`app-body${showQueuePanel ? " app-body--playing" : " app-body--library"}`}
+        {...(modalSheet ? { inert: "" as const } : {})}
+      >
+        <aside className="sidebar sidebar--left sidebar--nav" aria-label={t("nav.aria")}>
+          <AppNav
+            active={activeView}
+            hasSession={hasSession}
+            isPlaying={isPlaying}
+            onNavigate={setActiveView}
+          />
+          <LibrarySidebar
+            linkedFolderCount={libraryRoots.length}
+            onLinkFolder={() => void linkLibraryFolder()}
+            onManageLibrary={openManageLibrary}
+            onOpenFolder={() => void openFolder()}
+            onOpenFile={() => void openFile()}
+          />
+          {recent.length > 0 ? (
+            <div className="sidebar-section sidebar-section--recent">
+              <div className="recent-section-head">
+                <h2 className="sidebar-heading sidebar-heading--compact" id="recent-opened-heading">
+                  {t("sidebar.recent")}
+                </h2>
+                <button
+                  type="button"
+                  className="btn btn-ghost btn-compact recent-clear"
+                  aria-label={t("sidebar.recentClearAria")}
+                  title={t("sidebar.recentClearTitle")}
+                  onClick={() => void clearRecentHistory()}
+                >
+                  {t("sidebar.recentClear")}
+                </button>
+              </div>
+              <ul className="recent-list recent-list--compact" aria-label={t("sidebar.recent")}>
+                {recent.slice(0, 5).map((it) => (
                   <li key={`${it.kind}:${it.path}`} className="recent-li">
                     <button
                       type="button"
@@ -1436,254 +2180,111 @@ export default function App() {
                       title={it.path}
                       onClick={() => void reopenRecent(it)}
                     >
-                      <span className="recent-kind">
-                        {it.kind === "file" ? t("sidebar.recentKind.file") : t("sidebar.recentKind.folder")}
-                      </span>
                       <span className="recent-label">{it.label}</span>
                     </button>
                   </li>
                 ))}
               </ul>
-            )}
-          </div>
-
-          {rootDisplay ? (
-            <div className="sidebar-section sidebar-section--grow">
-              <h2 className="sidebar-heading">{t("sidebar.sessionFolder")}</h2>
-              <p className="sidebar-path" title={playlist?.root ?? ""}>
-                {rootDisplay}
-              </p>
-              <p className="path-hint">{t("sidebar.pathHint")}</p>
-              {hasQueue ? (
-                <div className="library-actions">
-                  <button
-                    type="button"
-                    className="btn btn-secondary btn-block"
-                    disabled={!isTauri()}
-                    onClick={() => void markSessionListened(!allTracksListened)}
-                  >
-                    {allTracksListened
-                      ? t("library.markUnlistened")
-                      : t("library.markListened")}
-                  </button>
-                  <button
-                    type="button"
-                    className="btn btn-danger btn-block"
-                    disabled={!isTauri()}
-                    onClick={() => void deleteSessionFiles()}
-                  >
-                    {t("library.deleteAudiobook")}
-                  </button>
-                </div>
-              ) : null}
             </div>
           ) : null}
-
-          <div className="sidebar-foot">
-            <p className="sidebar-tip">
-              <strong>{t("sidebar.tipLabel")}</strong> {t("sidebar.tipBody")}
-            </p>
-          </div>
         </aside>
 
         <main ref={mainStageRef} className="main-stage" id="main-stage" tabIndex={-1}>
-          <section className="panel panel-hero panel--stage" aria-labelledby="now-playing-title">
-          <div className="panel-header panel-header--hero">
-            <h2 className="panel-title" id="now-playing-title">
-              {t("nowPlaying.title")}
-            </h2>
-            <span className={`status-pill status-pill--${statusTone}`} aria-live="polite">
-              {liveStatus}
-            </span>
-          </div>
-
-          <div className="panel-body now-playing">
-            <div className="now-hero">
-              <div className="now-hero-art" aria-hidden="true">
-                <div className="now-hero-art-inner" />
-              </div>
-              <div className="now-hero-text">
-                <div className="meta-label">{t("nowPlaying.currentTitle")}</div>
-                <div className="meta-value meta-value--title" id="current-track-name">
-                  {currentTitle}
-                </div>
-              </div>
-            </div>
-
-            <div className="progress" aria-label={t("nowPlaying.progressAria")}>
-              <div className="progress-row">
-                <span className="time-tag" aria-hidden="true">
-                  {formatClock(position)}
-                </span>
-                <span className="progress-divider" aria-hidden="true" />
-                <span className="time-tag time-tag--dim" aria-hidden="true">
-                  {duration ? formatClock(duration) : t("nowPlaying.timeUnknown")}
-                </span>
-              </div>
-              <input
-                className="slider slider--seek"
-                aria-valuemin={0}
-                aria-valuemax={progressMax}
-                aria-valuenow={Math.min(sliderValue, progressMax)}
-                aria-label={t("nowPlaying.seekAria")}
-                type="range"
-                min={0}
-                max={progressMax}
-                step={0.25}
-                value={Math.min(sliderValue, progressMax)}
-                disabled={!canSeekTransport}
-                onPointerDown={() => {
-                  setSeekUi(position);
-                }}
-                onInput={(e) => {
-                  setSeekUi(Number(e.currentTarget.value));
-                }}
-                onPointerUp={(e) => {
-                  const v = Number((e.currentTarget as HTMLInputElement).value);
-                  setSeekUi(null);
-                  void seekTo(v);
-                }}
-                onPointerCancel={() => {
-                  setSeekUi(null);
-                }}
-              />
-            </div>
-
-            <div className="transport-block">
-              <p className="transport-block-label" id="transport-controls-label">
-                {t("nowPlaying.transportLabel")}
-              </p>
-              <div
-                className="transport"
-                role="group"
-                aria-labelledby="transport-controls-label"
-              >
-                <button
-                  className="btn icon-btn"
-                  type="button"
-                  aria-label={t("nowPlaying.prevAria")}
-                  disabled={!canSkipTransport}
-                  onClick={() => void skipPrev()}
-                >
-                  <IconSkipPrev />
-                </button>
-                <button
-                  className="btn btn-skip"
-                  type="button"
-                  aria-label={t("nowPlaying.rewindAria")}
-                  disabled={!canSeekTransport}
-                  onClick={() => void seekDelta(-30)}
-                >
-                  −30s
-                </button>
-                <button
-                  className="btn btn-primary icon-btn icon-btn--play"
-                  type="button"
-                  aria-label={
-                    !hasTrack || transport?.paused || transport?.eof
-                      ? t("nowPlaying.playAria")
-                      : t("nowPlaying.pauseAria")
-                  }
-                  disabled={!canTogglePlayback}
-                  onClick={() => void togglePause()}
-                >
-                  {!hasTrack || transport?.paused || transport?.eof ? <IconPlay /> : <IconPause />}
-                </button>
-                <button
-                  className="btn btn-skip"
-                  type="button"
-                  aria-label={t("nowPlaying.forwardAria")}
-                  disabled={!canSeekTransport}
-                  onClick={() => void seekDelta(30)}
-                >
-                  +30s
-                </button>
-                <button
-                  className="btn icon-btn"
-                  type="button"
-                  aria-label={t("nowPlaying.nextAria")}
-                  disabled={!canSkipTransport}
-                  onClick={() => void skipNext()}
-                >
-                  <IconSkipNext />
-                </button>
-              </div>
-              <p className="transport-hint">{t("nowPlaying.headphoneHint")}</p>
-            </div>
-
-            {chapters.length > 0 ? (
-              <div className="chapters-card" aria-label={t("chapters.title")}>
-                <div className="speed-card-head">
-                  <span className="field-label">{t("chapters.title")}</span>
-                  <span className="chapters-badge">{chapters.length}</span>
-                </div>
-                <ul className="chapter-list">
-                  {chapters.map((ch) => (
-                    <li key={`${ch.index}-${ch.time_sec}`}>
-                      <button
-                        type="button"
-                        className="chapter-item"
-                        disabled={!canSeekTransport || !!transport?.mpv_error}
-                        onClick={() => void seekTo(ch.time_sec)}
-                      >
-                        <span className="chapter-time">{formatClock(ch.time_sec)}</span>
-                        <span className="chapter-title">{ch.title}</span>
-                      </button>
-                    </li>
-                  ))}
-                </ul>
-                <p className="hint">{t("chapters.hint")}</p>
-              </div>
-            ) : null}
-
-            <div className="speed-card" aria-label={t("speed.label")}>
-              <div className="speed-card-head">
-                <label className="field-label" htmlFor="speed-slider">
-                  {t("speed.label")}
-                </label>
-                <div className="speed-readout" aria-live="polite">
-                  {transport ? `${transport.speed.toFixed(2)}×` : t("speed.readoutEmpty")}
-                </div>
-              </div>
-              <input
-                id="speed-slider"
-                className="slider slider--speed"
-                type="range"
-                min={0.5}
-                max={4}
-                step={0.05}
-                value={transport?.speed ?? 1}
-                disabled={!transport}
-                onChange={(e) => void setSpeed(Number(e.target.value))}
-              />
-              <p className="hint">{t("speed.hint")}</p>
-              <div className="speed-actions">
-                <button
-                  className="btn btn-secondary speed-actions-btn"
-                  type="button"
-                  disabled={!transport || !!transport.mpv_error}
-                  onClick={() => void setDefaultSpeed(transport?.speed ?? 1)}
-                >
-                  {t("speed.saveDefault")}
-                </button>
-                <button
-                  className="btn btn-ghost speed-actions-btn"
-                  type="button"
-                  disabled={
-                    !transport ||
-                    !!transport.mpv_error ||
-                    (transport.speed >= 0.995 && transport.speed <= 1.005)
-                  }
-                  onClick={() => void setSpeed(1)}
-                >
-                  {t("speed.resetOne")}
-                </button>
-              </div>
-            </div>
-          </div>
-        </section>
+          {activeView === "home" ? (
+            <HomeView
+              refreshKey={libraryRefreshKey}
+              onPlayCollection={(id, mode) => void playCollection(id, mode)}
+              onAddToQueue={(id, position) => void enqueueCollection(id, position)}
+              onOpenDetail={openCollectionDetail}
+              onShuffleRelax={() => void shuffleRelax()}
+              onLinkFolder={() => void linkLibraryFolder()}
+              onOpenFolder={() => void openFolder()}
+              onOpenFile={() => void openFile()}
+              onBrowseAudiobooks={() => setActiveView("audiobooks")}
+              onBrowseMusic={() => setActiveView("music")}
+            />
+          ) : activeView === "audiobooks" ? (
+            <CatalogView
+              kind="audiobook"
+              refreshKey={libraryRefreshKey}
+              onPlayCollection={(id, mode) => void playCollection(id, mode)}
+              onOpenDetail={openCollectionDetail}
+              onAddToQueue={(id, position) => void enqueueCollection(id, position)}
+              onLinkFolder={() => void linkLibraryFolder()}
+              onOpenFolder={() => void openFolder()}
+              onRemoveCollection={confirmRemoveCollection}
+            />
+          ) : activeView === "music" ? (
+            <CatalogView
+              kind="music"
+              refreshKey={libraryRefreshKey}
+              onPlayCollection={(id, mode) => void playCollection(id, mode)}
+              onOpenDetail={openCollectionDetail}
+              onAddToQueue={(id, position) => void enqueueCollection(id, position)}
+              onLinkFolder={() => void linkLibraryFolder()}
+              onOpenFolder={() => void openFolder()}
+              onRemoveCollection={confirmRemoveCollection}
+            />
+          ) : activeView === "library" ? (
+            <LibraryView
+              libraryRoots={libraryRoots}
+              onLinkFolder={() => void linkLibraryFolder()}
+              onScanRoot={(id) => void scanLibraryRoot(id)}
+              onRemoveRoot={removeLibraryRoot}
+              onExportDb={() => void exportLibraryDb()}
+            />
+          ) : activeView === "playlists" ? (
+            <PlaylistsView
+              onPlayPlaylist={(id) => void playPlaylistById(id)}
+              openConfirm={openConfirm}
+              onLibraryChanged={() => {
+                void loadLibraryRoots();
+                setLibraryRefreshKey((k) => k + 1);
+              }}
+            />
+          ) : (
+            <NowPlayingView
+              transport={transport}
+              chapters={chapters}
+              isMusicSession={isMusicSession}
+              nowCoverSrc={nowCoverSrc}
+              currentTitle={currentTitle}
+              liveStatus={liveStatus}
+              statusTone={statusTone}
+              hasQueue={hasQueue}
+              hasTrack={hasTrack}
+              canSeekTransport={canSeekTransport}
+              canSkipTransport={canSkipTransport}
+              canTogglePlayback={canTogglePlayback}
+              allTracksListened={allTracksListened}
+              sliderValue={sliderValue}
+              progressMax={progressMax}
+              seekUi={seekUi}
+              setSeekUi={setSeekUi}
+              formatClock={formatClock}
+              onSeekTo={(v) => void seekTo(v)}
+              onSeekDelta={(d) => void seekDelta(d)}
+              onTogglePause={() => void togglePause()}
+              onSkipPrev={() => void skipPrev()}
+              onSkipNext={() => void skipNext()}
+              onSetSpeed={(s) => void setSpeed(s)}
+              onSetDefaultSpeed={(s) => void setDefaultSpeed(s)}
+              onResetTrackSpeed={() => void resetTrackSpeed()}
+              onMarkSessionListened={(l) => void markSessionListened(l)}
+              onDeleteSessionFiles={() => void deleteSessionFiles()}
+              deleteSessionLabel={sessionDeleteCopy?.buttonLabel ?? null}
+              onOpenDetails={
+                playingCollectionId != null
+                  ? () => openCollectionDetail(playingCollectionId)
+                  : undefined
+              }
+              currentPath={transport?.current_path ?? null}
+              osMediaActive={osMediaActive}
+            />
+          )}
         </main>
 
+        {showQueuePanel ? (
         <aside
           ref={playlistPanelRef}
           id="queue-panel"
@@ -1698,6 +2299,11 @@ export default function App() {
                   {t("queue.title")}
                 </h2>
                 <p className="sidebar-rail-sub">{t("queue.subtitle")}</p>
+                {queueNotice ? (
+                  <p className="queue-notice" role="status">
+                    {queueNotice}
+                  </p>
+                ) : null}
               </div>
               <span
                 className="queue-badge"
@@ -1708,6 +2314,17 @@ export default function App() {
               </span>
             </div>
             <div className="queue-toolbar">
+              {playingCollectionId != null ? (
+                <div className="queue-toolbar-row">
+                  <button
+                    type="button"
+                    className="btn btn-secondary queue-details-btn"
+                    onClick={() => openCollectionDetail(playingCollectionId)}
+                  >
+                    {t("queue.openDetails")}
+                  </button>
+                </div>
+              ) : null}
               <div className="queue-toolbar-row">
                 <label className="field-label queue-toolbar-label" htmlFor="sort-select">
                   {t("queue.sortLabel")}
@@ -1810,7 +2427,67 @@ export default function App() {
                   return (
                     <li key={it.path} className="playlist-li">
                       <div
-                        className={`playlist-row${it.listened ? " playlist-row--listened" : ""}`}
+                        className={`playlist-row${it.listened ? " playlist-row--listened" : ""}${it.library_missing ? " playlist-row--missing" : ""}`}
+                        onContextMenu={(e) => {
+                          const items: ContextMenuEntry[] = [
+                            {
+                              id: "play",
+                              label: t("home.play"),
+                              disabled: it.library_missing,
+                              onClick: () => void playIndex(idx),
+                            },
+                            {
+                              id: "listened",
+                              label: it.listened
+                                ? t("contextMenu.unmarkListened")
+                                : t("contextMenu.markListened"),
+                              disabled: !isTauri(),
+                              onClick: () => void toggleTrackListened(it),
+                            },
+                          ];
+                          if (it.library_missing && it.collection_file_id != null) {
+                            items.push(
+                              ...missingFileContextEntries(
+                                it.collection_file_id,
+                                it.label,
+                                {
+                                  onRelink: relinkLibraryFile,
+                                  onRemove: removeLibraryFile,
+                                },
+                                t,
+                              ),
+                            );
+                          } else if (it.library_missing) {
+                            items.push({ type: "separator" });
+                            items.push({
+                              id: "remove-queue",
+                              label: t("queue.removeMissing"),
+                              danger: true,
+                              onClick: () => void removeQueueItem(it.path),
+                            });
+                          } else if (canDeleteQueueItem(it.path)) {
+                            items.push({ type: "separator" });
+                            items.push({
+                              id: "delete",
+                              label: t("contextMenu.deleteFile"),
+                              danger: true,
+                              disabled: !isTauri(),
+                              onClick: () => void deleteTrackFile(it),
+                            });
+                          }
+                          if (playingCollectionId != null) {
+                            items.push({ type: "separator" });
+                            items.push({
+                              id: "details",
+                              label: t("catalog.editTitle"),
+                              onClick: () => openCollectionDetail(playingCollectionId),
+                            });
+                          }
+                          openContextMenu(
+                            e,
+                            appendPlaylistContextEntries(items, { path: it.path }),
+                          );
+                        }}
                       >
                         <button
                           type="button"
@@ -1830,7 +2507,12 @@ export default function App() {
                           </span>
                           <span className="track-body">
                             <span className="track-row track-row--main">
-                              <span className="track-title">{it.label}</span>
+                              <span className="track-title">
+                                {it.label}
+                                {it.library_missing ? (
+                                  <span className="track-missing-badge">{t("catalog.fileMissing")}</span>
+                                ) : null}
+                              </span>
                               <span
                                 className="track-duration"
                                 {...(dur
@@ -1851,6 +2533,44 @@ export default function App() {
                           </span>
                         </button>
                         <div className="track-actions" aria-label={t("queue.itemActionsAria")}>
+                          {it.library_missing && it.collection_file_id != null ? (
+                            <>
+                              <button
+                                type="button"
+                                className="track-action track-action--repair"
+                                disabled={!isTauri()}
+                                aria-label={t("catalog.relinkFile")}
+                                title={t("catalog.relinkFile")}
+                                onClick={() => void relinkLibraryFile(it.collection_file_id!)}
+                              >
+                                ↗
+                              </button>
+                              <button
+                                type="button"
+                                className="track-action track-action--danger"
+                                disabled={!isTauri()}
+                                aria-label={t("catalog.removeFromLibrary")}
+                                title={t("catalog.removeFromLibrary")}
+                                onClick={() => void removeLibraryFile(it.collection_file_id!, it.label)}
+                              >
+                                ×
+                              </button>
+                            </>
+                          ) : it.library_missing ? (
+                            <button
+                              type="button"
+                              className="track-action track-action--danger"
+                              disabled={!isTauri()}
+                              aria-label={t("queue.removeMissing")}
+                              title={t("queue.removeMissing")}
+                              onClick={() => void removeQueueItem(it.path)}
+                            >
+                              ×
+                            </button>
+                          ) : null}
+                          {isCatalogSession ? (
+                            <AddToPlaylistButton target={{ path: it.path }} compact />
+                          ) : null}
                           <button
                             type="button"
                             className={`track-action${
@@ -1864,16 +2584,18 @@ export default function App() {
                           >
                             <IconCheck />
                           </button>
-                          <button
-                            type="button"
-                            className="track-action track-action--danger"
-                            disabled={!isTauri()}
-                            aria-label={t("queue.deleteTrackTitle")}
-                            title={t("queue.deleteTrackTitle")}
-                            onClick={() => void deleteTrackFile(it)}
-                          >
-                            <IconTrash />
-                          </button>
+                          {canDeleteQueueItem(it.path) ? (
+                            <button
+                              type="button"
+                              className="track-action track-action--danger"
+                              disabled={!isTauri()}
+                              aria-label={t("queue.deleteTrackTitle")}
+                              title={t("queue.deleteTrackTitle")}
+                              onClick={() => void deleteTrackFile(it)}
+                            >
+                              <IconTrash />
+                            </button>
+                          ) : null}
                         </div>
                       </div>
                     </li>
@@ -1884,6 +2606,22 @@ export default function App() {
             </div>
           </div>
         </aside>
+        ) : null}
+
+        {showMiniPlayer ? (
+          <MiniPlayerBar
+            title={currentTitle}
+            paused={!!transport?.paused || !!transport?.eof}
+            currentPath={transport?.current_path ?? null}
+            onExpand={() => setActiveView("nowPlaying")}
+            onToggle={() => void togglePause()}
+            onOpenDetails={
+              playingCollectionId != null
+                ? () => openCollectionDetail(playingCollectionId)
+                : undefined
+            }
+          />
+        ) : null}
       </div>
 
       {modalSheet ? (
@@ -1898,7 +2636,9 @@ export default function App() {
         >
           <div
             className={`modal-sheet${
-              modalSheet === "preferences" || modalSheet === "sleep" ? " modal-sheet--prefs" : ""
+              modalSheet === "preferences" || modalSheet === "sleep" || modalSheet === "addLibrary"
+                ? " modal-sheet--prefs"
+                : ""
             }${modalSheet === "confirm" ? " modal-sheet--confirm" : ""}`}
             ref={modalSheetRef}
             role={modalSheet === "confirm" ? "alertdialog" : "dialog"}
@@ -1910,9 +2650,11 @@ export default function App() {
                   ? "help-about-title"
                   : modalSheet === "preferences"
                     ? "preferences-dialog-title"
-                    : modalSheet === "confirm"
-                      ? "confirm-dialog-title"
-                      : "sleep-dialog-title"
+                    : modalSheet === "addLibrary"
+                      ? "add-library-dialog-title"
+                      : modalSheet === "confirm"
+                        ? "confirm-dialog-title"
+                        : "sleep-dialog-title"
             }
             aria-describedby={modalSheet === "confirm" ? "confirm-dialog-body" : undefined}
             onClick={(e) => e.stopPropagation()}
@@ -1960,36 +2702,145 @@ export default function App() {
                 </h2>
                 <p className="modal-body modal-body--tight">{t("prefs.intro")}</p>
                 <div className="modal-prefs">
-                  <label className="prefs-row prefs-row--select">
-                    <span>{t("prefs.language")}</span>
-                    <select
-                      className="select prefs-locale-select"
-                      value={locale}
-                      onChange={(e) => void changeUiLocale(e.target.value as Locale)}
-                    >
-                      <option value="en">{t("prefs.lang.en")}</option>
-                      <option value="de">{t("prefs.lang.de")}</option>
-                    </select>
-                  </label>
-                  <label className="prefs-row">
-                    <input
-                      type="checkbox"
-                      checked={!!appPrefs?.resume_playing_on_launch}
-                      disabled={!isTauri() || appPrefs == null}
-                      onChange={(e) => void setResumePref(e.target.checked)}
-                    />
-                    <span>{t("prefs.resume")}</span>
-                  </label>
-                  <label className="prefs-row">
-                    <input
-                      type="checkbox"
-                      checked={!!appPrefs?.scan_subfolders}
-                      disabled={!isTauri() || appPrefs == null}
-                      onChange={(e) => void setScanPref(e.target.checked)}
-                    />
-                    <span>{t("prefs.scan")}</span>
-                  </label>
-                  <p className="hint prefs-hint">{t("prefs.scanHint")}</p>
+                  <fieldset className="prefs-section">
+                    <legend className="prefs-section-title">{t("prefs.section.general")}</legend>
+                    <label className="prefs-row prefs-row--select">
+                      <span id="prefs-language-label">{t("prefs.language")}</span>
+                      <select
+                        className="select prefs-locale-select"
+                        value={locale}
+                        aria-labelledby="prefs-language-label"
+                        onChange={(e) => void changeUiLocale(e.target.value as Locale)}
+                      >
+                        <option value="en">{t("prefs.lang.en")}</option>
+                        <option value="de">{t("prefs.lang.de")}</option>
+                      </select>
+                    </label>
+                  </fieldset>
+
+                  <fieldset className="prefs-section">
+                    <legend className="prefs-section-title">{t("prefs.section.playback")}</legend>
+                    <label className="prefs-row prefs-row--toggle">
+                      <input
+                        type="checkbox"
+                        className="prefs-checkbox"
+                        checked={!!appPrefs?.resume_playing_on_launch}
+                        disabled={!isTauri() || appPrefs == null}
+                        aria-describedby="prefs-resume-hint"
+                        onChange={(e) => void setResumePref(e.target.checked)}
+                      />
+                      <span className="prefs-row-text">
+                        <span className="prefs-row-label">{t("prefs.resume")}</span>
+                        <span className="hint prefs-hint" id="prefs-resume-hint">
+                          {t("prefs.resumeHint")}
+                        </span>
+                      </span>
+                    </label>
+                  </fieldset>
+
+                  <fieldset className="prefs-section">
+                    <legend className="prefs-section-title">{t("prefs.section.library")}</legend>
+                    <label className="prefs-row prefs-row--toggle">
+                      <input
+                        type="checkbox"
+                        className="prefs-checkbox"
+                        checked={!!appPrefs?.scan_subfolders}
+                        disabled={!isTauri() || appPrefs == null}
+                        aria-describedby="prefs-scan-hint"
+                        onChange={(e) => void setScanPref(e.target.checked)}
+                      />
+                      <span className="prefs-row-text">
+                        <span className="prefs-row-label">{t("prefs.scan")}</span>
+                        <span className="hint prefs-hint" id="prefs-scan-hint">
+                          {t("prefs.scanHint")}
+                        </span>
+                      </span>
+                    </label>
+                  </fieldset>
+
+                  <fieldset className="prefs-section">
+                    <legend className="prefs-section-title">{t("prefs.section.privacy")}</legend>
+                    <label className="prefs-row prefs-row--toggle">
+                      <input
+                        type="checkbox"
+                        className="prefs-checkbox"
+                        checked={!!appPrefs?.online_metadata_enabled}
+                        disabled={!isTauri() || appPrefs == null}
+                        aria-describedby="prefs-metadata-hint"
+                        onChange={(e) => void setOnlineMetadataPref(e.target.checked)}
+                      />
+                      <span className="prefs-row-text">
+                        <span className="prefs-row-label">{t("prefs.onlineMetadata")}</span>
+                        <span className="hint prefs-hint" id="prefs-metadata-hint">
+                          {t("prefs.onlineMetadataHint")}
+                        </span>
+                      </span>
+                    </label>
+                  </fieldset>
+
+                  <fieldset className="prefs-section prefs-section--speed">
+                    <legend className="prefs-section-title">{t("prefs.section.speed")}</legend>
+                    <p className="hint prefs-hint prefs-section-lead">{t("prefs.speedDefaultsHint")}</p>
+                    <label className="prefs-speed-row">
+                      <span className="prefs-speed-label">{t("prefs.speedAudiobook")}</span>
+                      <input
+                        type="range"
+                        className="slider slider--speed"
+                        min={0.5}
+                        max={4}
+                        step={0.05}
+                        value={appPrefs?.default_speed_audiobook ?? 1.5}
+                        disabled={!isTauri() || appPrefs == null}
+                        onChange={(e) =>
+                          void setPlaybackSpeedDefaults(
+                            Number(e.target.value),
+                            appPrefs?.default_speed_music ?? 1,
+                          )
+                        }
+                      />
+                      <span className="prefs-speed-readout" aria-live="polite">
+                        {(appPrefs?.default_speed_audiobook ?? 1.5).toFixed(2)}×
+                      </span>
+                    </label>
+                    <label className="prefs-speed-row">
+                      <span className="prefs-speed-label">{t("prefs.speedMusic")}</span>
+                      <input
+                        type="range"
+                        className="slider slider--speed"
+                        min={0.5}
+                        max={4}
+                        step={0.05}
+                        value={appPrefs?.default_speed_music ?? 1}
+                        disabled={!isTauri() || appPrefs == null}
+                        onChange={(e) =>
+                          void setPlaybackSpeedDefaults(
+                            appPrefs?.default_speed_audiobook ?? 1.5,
+                            Number(e.target.value),
+                          )
+                        }
+                      />
+                      <span className="prefs-speed-readout" aria-live="polite">
+                        {(appPrefs?.default_speed_music ?? 1).toFixed(2)}×
+                      </span>
+                    </label>
+                  </fieldset>
+                </div>
+              </>
+            ) : modalSheet === "addLibrary" ? (
+              <>
+                <h2 className="modal-title" id="add-library-dialog-title">
+                  {t("addLibrary.title")}
+                </h2>
+                <p className="modal-body modal-body--tight">{t("addLibrary.body")}</p>
+                <div className="add-library-actions">
+                  <button
+                    type="button"
+                    className="btn btn-primary"
+                    disabled={!isTauri()}
+                    onClick={() => void linkLibraryFolder()}
+                  >
+                    {t("library.linkFolder")}
+                  </button>
                 </div>
               </>
             ) : (
@@ -2091,6 +2942,18 @@ export default function App() {
             )}
           </div>
         </div>
+      ) : null}
+
+      {collectionDetailId != null ? (
+        <CollectionDetailSheet
+          collectionId={collectionDetailId}
+          onlineMetadataEnabled={!!appPrefs?.online_metadata_enabled}
+          onClose={() => setCollectionDetailId(null)}
+          onPlayCollection={(id, mode) => void playCollection(id, mode)}
+          onAddToQueue={(id, position) => void enqueueCollection(id, position)}
+          onChanged={onCollectionDetailChanged}
+          openConfirm={openConfirm}
+        />
       ) : null}
     </div>
   );

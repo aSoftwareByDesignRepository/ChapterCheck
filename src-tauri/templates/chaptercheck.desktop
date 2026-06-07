@@ -1,0 +1,14 @@
+[Desktop Entry]
+Categories={{categories}};
+Comment=Play audiobooks and music with resume and variable speed
+Exec={{exec}} %F
+Icon={{icon}}
+Name={{name}}
+GenericName=Audio Player
+Keywords=audio;audiobook;music;player;chaptercheck;
+StartupWMClass={{exec}}
+Terminal=false
+Type=Application
+{{#if mime_type}}
+MimeType={{mime_type}};
+{{/if}}

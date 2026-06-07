@@ -30,13 +30,13 @@ Release build (Linux `.deb`):
 npm run tauri build
 ```
 
-Install the package (name matches **productName** + version + arch; use what `ls` shows):
+Install the built package:
 
 ```bash
-sudo apt install ./src-tauri/target/release/bundle/deb/ChapterCheck_0.1.0_amd64.deb
+npm run install:deb
 ```
 
-If the version changes, run `ls src-tauri/target/release/bundle/deb/*.deb` and pass that path to `apt install`.
+That copies the newest `.deb` from `src-tauri/target/release/bundle/deb/` to `/tmp` and installs it with `apt-get` (so apt’s `_apt` sandbox can read the file). Do not run `sudo apt install ./…/*.deb` directly from the repo — paths under `$HOME` trigger permission warnings even when the install succeeds.
 
 Data (library DB) is stored under the OS user data directory (XDG on Linux), not inside the repo.
 

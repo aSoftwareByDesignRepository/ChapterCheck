@@ -20,7 +20,13 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; font-src 'self' data:; connect-src ipc: http://ipc.localhost http://127.0.0.1:1420 http://localhost:1420 ws://127.0.0.1:1420 ws://localhost:1420",
+      "assetProtocol": {
+        "enable": true,
+        "scope": {
+          "allow": ["$DATA/**", "$HOME/**", "$DOCUMENT/**", "$DOWNLOAD/**", "$MUSIC/**"]
+        }
+      },
+      "csp": "default-src 'self'; img-src 'self' data: asset: http://asset.localhost https://asset.localhost blob:; style-src 'self' 'unsafe-inline'; font-src 'self' data:; connect-src ipc: http://ipc.localhost http://127.0.0.1:1420 http://localhost:1420 ws://127.0.0.1:1420 ws://localhost:1420",
       "capabilities": ["default"]
     }
   },
@@ -34,7 +40,69 @@
       "icons/128x128@2x.png"
     ],
     "shortDescription": "Local audiobook player with resume, speed control, and SQLite-backed progress.",
-    "longDescription": "ChapterCheck is a Linux desktop player for long-form audio: open a folder as a playlist, sort tracks, adjust speed, and resume where you left off. Playback uses mpv; your library paths and positions stay on disk under your user profile."
+    "longDescription": "ChapterCheck is a Linux desktop player for long-form audio: open a folder as a playlist, sort tracks, adjust speed, and resume where you left off. Playback uses mpv; your library paths and positions stay on disk under your user profile.",
+    "fileAssociations": [
+      {
+        "ext": ["mp3"],
+        "mimeType": "audio/mpeg",
+        "description": "MP3 audio",
+        "role": "Viewer"
+      },
+      {
+        "ext": ["m4a", "m4b"],
+        "mimeType": "audio/mp4",
+        "description": "MPEG-4 audio",
+        "role": "Viewer"
+      },
+      {
+        "ext": ["aac"],
+        "mimeType": "audio/aac",
+        "description": "AAC audio",
+        "role": "Viewer"
+      },
+      {
+        "ext": ["flac"],
+        "mimeType": "audio/flac",
+        "description": "FLAC audio",
+        "role": "Viewer"
+      },
+      {
+        "ext": ["ogg", "oga"],
+        "mimeType": "audio/ogg",
+        "description": "Ogg audio",
+        "role": "Viewer"
+      },
+      {
+        "ext": ["opus"],
+        "mimeType": "audio/opus",
+        "description": "Opus audio",
+        "role": "Viewer"
+      },
+      {
+        "ext": ["wav"],
+        "mimeType": "audio/wav",
+        "description": "WAV audio",
+        "role": "Viewer"
+      },
+      {
+        "ext": ["wma"],
+        "mimeType": "audio/x-ms-wma",
+        "description": "WMA audio",
+        "role": "Viewer"
+      },
+      {
+        "ext": ["aiff", "aif"],
+        "mimeType": "audio/aiff",
+        "description": "AIFF audio",
+        "role": "Viewer"
+      }
+    ],
+    "linux": {
+      "deb": {
+        "desktopTemplate": "templates/chaptercheck.desktop",
+        "depends": ["mpv"]
+      }
+    }
   },
   "plugins": {}
 }

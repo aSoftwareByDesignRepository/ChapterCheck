@@ -26,7 +26,8 @@
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "install:deb": "bash scripts/install-deb.sh"
   },
   "dependencies": {
     "@fontsource/fraunces": "^5.2.9",

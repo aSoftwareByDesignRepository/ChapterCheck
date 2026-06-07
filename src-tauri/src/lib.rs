@@ -1,8 +1,17 @@
+mod catalog;
 mod db;
 #[cfg(target_os = "linux")]
 mod media_controls;
 mod mpv;
+mod path_policy;
 
+use path_policy::tracked_file_on_disk;
+
+use catalog::{
+    AddLibraryRootInput, AddToLibraryInput, CatalogService, CollectionMetadataInput,
+    fetch_metadata_online, MetadataLookupPlan, MetadataSuggestionDto, PREF_ONLINE_METADATA,
+    PREF_REPEAT_MODE, SESSION_COLLECTION_ID, SESSION_PLAYBACK_KIND, SESSION_PLAYLIST_ID,
+};
 use db::{LibraryDb, MediaRow};
 use mpv::{MpvController, MpvError};
 use serde::{Deserialize, Serialize};
@@ -12,6 +21,7 @@ use serde_json::{json, Value};
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, Manager, WindowEvent};
@@ -36,8 +46,13 @@ const PREF_UI_LOCALE: &str = "pref.ui_locale";
 /// Headphones / MPRIS "Previous" restart the current track when playback is past this point.
 const TRACK_RESTART_SECS: f64 = 3.0;
 
+/// Ensures session persistence runs at most once per process exit.
+static CLOSE_PERSISTED: AtomicBool = AtomicBool::new(false);
+
 fn notify_transport_changed(app: &AppHandle) {
     let _ = app.emit("abp:transport-changed", ());
+    #[cfg(target_os = "linux")]
+    media_controls::nudge();
 }
 
 fn parse_bool_pref(v: Option<String>) -> bool {
@@ -172,6 +187,10 @@ pub struct PlaylistItemDto {
     pub album: Option<String>,
     /// True when the user has marked this track as listened/finished.
     pub listened: bool,
+    /// Library file id when this queue item matches a catalog track.
+    pub collection_file_id: Option<i64>,
+    /// True when the catalog track is marked missing (moved / not found on rescan).
+    pub library_missing: bool,
 }
 
 #[derive(Clone, Serialize)]
@@ -205,6 +224,9 @@ pub struct TransportDto {
     pub mpv_error: Option<String>,
     /// `"off"` | `"one"` | `"all"`
     pub repeat_mode: String,
+    pub playback_kind: String,
+    pub active_collection_id: Option<i64>,
+    pub active_collection_kind: Option<String>,
 }
 
 #[derive(Clone, Serialize)]
@@ -218,14 +240,24 @@ pub struct ChapterDto {
 pub struct AppPrefsDto {
     pub resume_playing_on_launch: bool,
     pub scan_subfolders: bool,
+    pub online_metadata_enabled: bool,
     /// `"en"` or `"de"`.
     pub ui_locale: String,
+    pub default_speed_audiobook: f64,
+    pub default_speed_music: f64,
 }
 
 #[derive(Clone, Serialize)]
 pub struct SetScanFoldersResult {
     pub prefs: AppPrefsDto,
     pub playlist: Option<PlaylistDto>,
+}
+
+#[derive(Clone, Serialize)]
+pub struct EnqueueCollectionResult {
+    pub playlist: PlaylistDto,
+    pub tracks_added: usize,
+    pub collection_title: String,
 }
 
 struct InnerState {
@@ -241,6 +273,10 @@ struct InnerState {
     /// When true, opening or rescanning a folder includes audio in nested directories (still under session root).
     scan_subfolders: bool,
     repeat_mode: RepeatMode,
+    active_collection_id: Option<i64>,
+    active_playlist_id: Option<i64>,
+    /// `"audiobook"` or `"music"` for context-aware UI.
+    playback_kind: String,
 }
 
 pub struct AppState {
@@ -250,6 +286,27 @@ pub struct AppState {
 impl AppState {
     fn new(db: LibraryDb) -> Self {
         let scan_subfolders = parse_bool_pref(db.get_setting(PREF_SCAN_SUBFOLDERS).ok().flatten());
+        let repeat_mode = db
+            .get_setting(PREF_REPEAT_MODE)
+            .ok()
+            .flatten()
+            .and_then(|s| RepeatMode::parse(&s))
+            .unwrap_or(RepeatMode::Off);
+        let active_collection_id = db
+            .get_setting(SESSION_COLLECTION_ID)
+            .ok()
+            .flatten()
+            .and_then(|s| s.parse::<i64>().ok());
+        let playback_kind = db
+            .get_setting(SESSION_PLAYBACK_KIND)
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| "audiobook".into());
+        let active_playlist_id = db
+            .get_setting(SESSION_PLAYLIST_ID)
+            .ok()
+            .flatten()
+            .and_then(|s| s.parse::<i64>().ok());
         Self {
             inner: Mutex::new(InnerState {
                 db,
@@ -261,19 +318,21 @@ impl AppState {
                 current_index: None,
                 single_file_session: false,
                 scan_subfolders,
-                repeat_mode: RepeatMode::Off,
+                repeat_mode,
+                active_collection_id,
+                active_playlist_id,
+                playback_kind,
             }),
         }
     }
 
     fn persist_on_close(&self) -> Result<(), String> {
+        if CLOSE_PERSISTED.swap(true, Ordering::SeqCst) {
+            return Ok(());
+        }
         let mut g = self.inner.lock().map_err(|e| e.to_string())?;
         g.persist_current()?;
-        let was_playing = g
-            .mpv
-            .read_transport_state()
-            .map(|r| !r.paused && !r.idle && !r.eof)
-            .unwrap_or(false);
+        let was_playing = g.session_is_actively_playing();
         g.persist_session_for_close(was_playing)?;
         g.mpv.shutdown();
         Ok(())
@@ -482,6 +541,15 @@ impl InnerState {
                     album = album.or(p_album);
                 }
             }
+            let file_ref = CatalogService::new(&mut self.db)
+                .find_collection_file_ref_by_path(p)
+                .ok()
+                .flatten();
+            let on_disk = tracked_file_on_disk(p).is_some();
+            let library_missing = match file_ref {
+                Some((_, db_missing)) => db_missing || !on_disk,
+                None => !on_disk,
+            };
             items.push(PlaylistItemDto {
                 path: key_owned.clone(),
                 label: p
@@ -492,6 +560,8 @@ impl InnerState {
                 artist,
                 album,
                 listened: listened_at.is_some(),
+                collection_file_id: file_ref.map(|(id, _)| id),
+                library_missing,
             });
         }
         Ok(PlaylistDto {
@@ -516,6 +586,341 @@ impl InnerState {
         self.playlist = paths;
         self.current_index = None;
         self.single_file_session = single_file_session;
+        self.active_collection_id = None;
+        self.active_playlist_id = None;
+        self.playback_kind = "session".to_string();
+        let _ = self.db.delete_setting(SESSION_COLLECTION_ID);
+        let _ = self.db.delete_setting(SESSION_PLAYLIST_ID);
+        let _ = self.db.set_setting(SESSION_PLAYBACK_KIND, "session");
+    }
+
+    /// Load a session queue preserving path order (for catalog / playlist playback).
+    fn set_session_paths_ordered(
+        &mut self,
+        root: PathBuf,
+        paths: Vec<PathBuf>,
+        single_file_session: bool,
+        collection_id: Option<i64>,
+        playlist_id: Option<i64>,
+        playback_kind: &str,
+    ) {
+        self.session_root = Some(root);
+        self.allowed_files = paths.iter().cloned().collect();
+        self.playlist = paths;
+        self.current_index = None;
+        self.single_file_session = single_file_session;
+        self.active_collection_id = collection_id;
+        self.active_playlist_id = playlist_id;
+        self.playback_kind = playback_kind.to_string();
+        if let Some(id) = collection_id {
+            let _ = self
+                .db
+                .set_setting(SESSION_COLLECTION_ID, &id.to_string());
+        } else {
+            let _ = self.db.delete_setting(SESSION_COLLECTION_ID);
+        }
+        if let Some(id) = playlist_id {
+            let _ = self.db.set_setting(SESSION_PLAYLIST_ID, &id.to_string());
+        } else {
+            let _ = self.db.delete_setting(SESSION_PLAYLIST_ID);
+        }
+        let _ = self
+            .db
+            .set_setting(SESSION_PLAYBACK_KIND, playback_kind);
+    }
+
+    fn restore_current_index_after_paths_change(&mut self, previous: Option<&PathBuf>) {
+        if self.playlist.is_empty() {
+            self.current_index = None;
+            return;
+        }
+        let Some(prev) = previous else {
+            return;
+        };
+        if let Some(idx) = self.playlist.iter().position(|p| p == prev) {
+            self.current_index = Some(idx);
+            return;
+        }
+        let prev_s = prev.to_string_lossy();
+        if let Some(idx) = self
+            .playlist
+            .iter()
+            .position(|p| p.to_string_lossy() == prev_s)
+        {
+            self.current_index = Some(idx);
+            return;
+        }
+        if let Some(cur) = self.current_index {
+            self.current_index = Some(cur.min(self.playlist.len().saturating_sub(1)));
+        }
+    }
+
+    fn refresh_active_session_from_source(&mut self) -> Result<bool, String> {
+        let playing_path = self.current_index.and_then(|i| self.playlist.get(i).cloned());
+        if let Some(collection_id) = self.active_collection_id {
+            let (paths, root) =
+                CatalogService::new(&mut self.db).collection_playback_paths(collection_id)?;
+            if paths.is_empty() {
+                return Ok(false);
+            }
+            self.session_root = Some(root);
+            self.allowed_files = paths.iter().cloned().collect();
+            self.playlist = paths;
+            self.restore_current_index_after_paths_change(playing_path.as_ref());
+            return Ok(true);
+        }
+        if let Some(playlist_id) = self.active_playlist_id {
+            let paths =
+                CatalogService::new(&mut self.db).playlist_playback_paths(playlist_id)?;
+            if paths.is_empty() {
+                return Ok(false);
+            }
+            let root = paths[0]
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| paths[0].clone());
+            let root = Self::canonicalize_allowed(&root)?;
+            self.session_root = Some(root);
+            self.allowed_files = paths.iter().cloned().collect();
+            self.playlist = paths;
+            self.restore_current_index_after_paths_change(playing_path.as_ref());
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    fn replace_session_path(&mut self, old: &PathBuf, new: PathBuf) -> Result<(), String> {
+        let playing = self.current_index.and_then(|i| self.playlist.get(i).cloned());
+        for p in &mut self.playlist {
+            if p == old {
+                *p = new.clone();
+            }
+        }
+        self.allowed_files.remove(old);
+        self.allowed_files.insert(new.clone());
+        self.restore_current_index_after_paths_change(playing.as_ref());
+        Ok(())
+    }
+
+    fn remove_path_from_session(&mut self, path_s: &str) -> Result<(), String> {
+        let pb = PathBuf::from(path_s);
+        let old_current = self.current_index;
+        let old_playing = old_current.and_then(|i| self.playlist.get(i).cloned());
+        let mut removed_before_current = 0usize;
+        for (i, p) in self.playlist.iter().enumerate() {
+            if p.to_string_lossy() == path_s {
+                if let Some(cur) = old_current {
+                    if i < cur {
+                        removed_before_current += 1;
+                    }
+                }
+            }
+        }
+        self.playlist.retain(|p| p.to_string_lossy() != path_s);
+        self.allowed_files.remove(&pb);
+        if self.playlist.is_empty() {
+            self.current_index = None;
+            return Ok(());
+        }
+        if let Some(cur) = old_current {
+            if old_playing
+                .as_ref()
+                .map(|p| p.to_string_lossy() == path_s)
+                .unwrap_or(false)
+            {
+                self.current_index = Some(cur.min(self.playlist.len().saturating_sub(1)));
+            } else {
+                self.current_index = Some(cur.saturating_sub(removed_before_current));
+            }
+        }
+        Ok(())
+    }
+
+    fn sync_session_after_relink(&mut self, old_path: &str, new_path: &str) -> Result<(), String> {
+        if !self
+            .playlist
+            .iter()
+            .any(|p| p.to_string_lossy() == old_path)
+        {
+            return Ok(());
+        }
+        if self.active_collection_id.is_some() || self.active_playlist_id.is_some() {
+            if !self.refresh_active_session_from_source()? {
+                self.replace_session_path(&PathBuf::from(old_path), PathBuf::from(new_path))?;
+            }
+        } else {
+            self.replace_session_path(&PathBuf::from(old_path), PathBuf::from(new_path))?;
+        }
+        Ok(())
+    }
+
+    fn sync_session_after_remove(&mut self, removed_path: &str) -> Result<(), String> {
+        if !self
+            .playlist
+            .iter()
+            .any(|p| p.to_string_lossy() == removed_path)
+        {
+            return Ok(());
+        }
+        if self.active_collection_id.is_some() || self.active_playlist_id.is_some() {
+            if !self.refresh_active_session_from_source()? {
+                self.remove_path_from_session(removed_path)?;
+            }
+        } else {
+            self.remove_path_from_session(removed_path)?;
+        }
+        Ok(())
+    }
+
+    fn session_playlist_if_open(&mut self) -> Result<Option<PlaylistDto>, String> {
+        if self.session_root.is_none() {
+            return Ok(None);
+        }
+        self.persist_session_meta_checkpoint()?;
+        Ok(Some(self.build_playlist_dto()?))
+    }
+
+    fn remove_queue_item_inner(&mut self, path: PathBuf) -> Result<Option<PlaylistDto>, String> {
+        let canon = Self::canonicalize_allowed(&path).unwrap_or(path);
+        if !self.allowed_files.contains(&canon) {
+            return Err("Track is not part of the current session".into());
+        }
+        self.remove_path_from_session(&canon.to_string_lossy())?;
+        if self.playlist.is_empty() {
+            self.session_root = None;
+            self.allowed_files.clear();
+            self.current_index = None;
+            self.single_file_session = false;
+            self.clear_stored_session_keys();
+            return Ok(None);
+        }
+        self.session_playlist_if_open()
+    }
+
+    fn play_collection_inner(
+        &mut self,
+        collection_id: i64,
+        mode: &str,
+        shuffle: bool,
+        autoplay: bool,
+    ) -> Result<PlaylistDto, String> {
+        let (mut paths, root, detail) = {
+            let mut cat = CatalogService::new(&mut self.db);
+            let (paths, root) = cat.collection_playback_paths(collection_id)?;
+            let detail = cat.get_collection_detail(collection_id)?;
+            (paths, root, detail)
+        };
+        if shuffle && paths.len() >= 2 {
+            paths.shuffle(&mut thread_rng());
+        }
+        let start_idx = if mode == "continue" {
+            let mut idx = 0usize;
+            let mut best_pos = -1.0f64;
+            for (i, p) in paths.iter().enumerate() {
+                let key = p.to_string_lossy();
+                if let Ok(Some(row)) = self.db.get_media(&key) {
+                    if row.position_sec > best_pos && row.position_sec > 1.0 {
+                        if let Some(dur) = row.duration_sec {
+                            if row.position_sec < dur - 30.0 {
+                                best_pos = row.position_sec;
+                                idx = i;
+                            }
+                        } else {
+                            best_pos = row.position_sec;
+                            idx = i;
+                        }
+                    }
+                }
+            }
+            idx
+        } else {
+            0
+        };
+        self.mpv.ensure_running().map_err(|e: MpvError| e.to_string())?;
+        let _ = self.persist_current();
+        let single = paths.len() == 1;
+        self.set_session_paths_ordered(
+            root,
+            paths,
+            single,
+            Some(collection_id),
+            None,
+            &detail.kind,
+        );
+        self.play_path_at_index_with_autoplay(start_idx, autoplay)?;
+        self.touch_session_track_after_play()?;
+        self.persist_session_meta_checkpoint()?;
+        self.build_playlist_dto()
+    }
+
+    fn enqueue_collection_inner(
+        &mut self,
+        collection_id: i64,
+        position: &str,
+    ) -> Result<EnqueueCollectionResult, String> {
+        let (paths, _root, detail) = {
+            let mut cat = CatalogService::new(&mut self.db);
+            let (paths, root) = cat.collection_playback_paths(collection_id)?;
+            let detail = cat.get_collection_detail(collection_id)?;
+            (paths, root, detail)
+        };
+        let mut paths: Vec<PathBuf> = paths.into_iter().filter(|p| p.exists()).collect();
+        if paths.is_empty() {
+            return Err("No playable tracks in this item".into());
+        }
+
+        let has_active_queue =
+            self.session_root.is_some() && !self.playlist.is_empty();
+        if !has_active_queue {
+            let single = paths.len() == 1;
+            self.set_session_paths_ordered(
+                _root,
+                paths.clone(),
+                single,
+                Some(collection_id),
+                None,
+                &detail.kind,
+            );
+            self.persist_session_meta_checkpoint()?;
+            let playlist = self.build_playlist_dto()?;
+            return Ok(EnqueueCollectionResult {
+                playlist,
+                tracks_added: paths.len(),
+                collection_title: detail.title,
+            });
+        }
+
+        let existing: HashSet<PathBuf> = self.playlist.iter().cloned().collect();
+        paths.retain(|p| !existing.contains(p));
+        if paths.is_empty() {
+            return Err("This item is already in your queue".into());
+        }
+
+        let insert_at = match position {
+            "next" => self
+                .current_index
+                .map(|i| i.saturating_add(1))
+                .unwrap_or(0),
+            _ => self.playlist.len(),
+        };
+        let added = paths.len();
+        for (offset, path) in paths.iter().enumerate() {
+            self.playlist.insert(insert_at + offset, path.clone());
+            self.allowed_files.insert(path.clone());
+        }
+        if let Some(cur) = self.current_index {
+            if insert_at <= cur {
+                self.current_index = Some(cur + added);
+            }
+        }
+
+        self.persist_session_meta_checkpoint()?;
+        let playlist = self.build_playlist_dto()?;
+        Ok(EnqueueCollectionResult {
+            playlist,
+            tracks_added: added,
+            collection_title: detail.title,
+        })
     }
 
     fn clear_stored_session_keys(&mut self) {
@@ -525,9 +930,85 @@ impl InnerState {
             SESSION_LAST_SORT,
             SESSION_LAST_TRACK,
             SESSION_LAST_PLAYING,
+            SESSION_COLLECTION_ID,
+            SESSION_PLAYBACK_KIND,
+            SESSION_PLAYLIST_ID,
         ] {
             let _ = self.db.delete_setting(k);
         }
+        self.active_collection_id = None;
+        self.active_playlist_id = None;
+        self.playback_kind = "audiobook".to_string();
+    }
+
+    fn resolve_playback_speed(&mut self, file_key: &str) -> Result<f64, String> {
+        if self.db.is_speed_custom(file_key).map_err(|e| e.to_string())? {
+            if let Some(media) = self.db.get_media(file_key).map_err(|e| e.to_string())? {
+                return Ok(Self::clamp_speed(media.playback_speed));
+            }
+        }
+
+        if let Some(pl_id) = self.active_playlist_id {
+            let speed = CatalogService::new(&mut self.db).get_playlist_default_speed(pl_id)?;
+            if let Some(s) = speed {
+                return Ok(Self::clamp_speed(s));
+            }
+        }
+
+        let kind = self.effective_playback_kind();
+        let speed = match kind.as_str() {
+            "music" => self.db.get_default_speed_music(),
+            _ => self.db.get_default_speed_audiobook(),
+        };
+        Ok(Self::clamp_speed(speed))
+    }
+
+    fn resolved_collection_id(&mut self) -> Option<i64> {
+        if let Some(cid) = self.active_collection_id {
+            return Some(cid);
+        }
+        let path = self.current_path()?;
+        CatalogService::new(&mut self.db)
+            .find_collection_for_path(&path)
+            .ok()
+            .flatten()
+    }
+
+    fn collection_kind(&self, collection_id: i64) -> Option<String> {
+        self.db
+            .connection()
+            .query_row(
+                "SELECT kind FROM collections WHERE id = ?1",
+                [collection_id],
+                |r| r.get::<_, String>(0),
+            )
+            .ok()
+    }
+
+    fn effective_playback_kind(&mut self) -> String {
+        if let Some(cid) = self.resolved_collection_id() {
+            if let Some(kind) = self.collection_kind(cid) {
+                return kind;
+            }
+        }
+        if self.playback_kind == "music" || self.playback_kind == "audiobook" {
+            return self.playback_kind.clone();
+        }
+        "audiobook".to_string()
+    }
+
+    fn resolve_playable_index(&mut self, start: usize) -> Result<usize, String> {
+        for i in start..self.playlist.len() {
+            let p = self.playlist[i].clone();
+            if tracked_file_on_disk(&p).is_none() {
+                let _ = CatalogService::new(&mut self.db).mark_file_unavailable_by_path(&p);
+                continue;
+            }
+            if self.is_allowed_playback(&p) {
+                return Ok(i);
+            }
+        }
+        Err("No playable files in queue".into())
     }
 
     fn push_recent_session(&mut self) -> Result<(), String> {
@@ -580,6 +1061,24 @@ impl InnerState {
         self.push_recent_session()
     }
 
+    fn session_is_actively_playing(&mut self) -> bool {
+        self.mpv
+            .peek_transport()
+            .map(|r| !r.paused && !r.idle && !r.eof)
+            .unwrap_or(false)
+    }
+
+    fn sync_session_last_playing(&mut self) -> Result<(), String> {
+        if self.session_root.is_none() {
+            return Ok(());
+        }
+        let playing = self.session_is_actively_playing();
+        self.db
+            .set_setting(SESSION_LAST_PLAYING, if playing { "1" } else { "0" })
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
     fn persist_session_for_close(&mut self, was_playing: bool) -> Result<(), String> {
         if self.session_root.is_none() {
             return Ok(());
@@ -618,7 +1117,33 @@ impl InnerState {
         Ok(())
     }
 
+    fn launch_autoplay_enabled(&self) -> Result<bool, String> {
+        let resume_on_launch = parse_bool_pref(
+            self.db
+                .get_setting(PREF_RESUME_PLAYING_ON_LAUNCH)
+                .map_err(|e| e.to_string())?,
+        );
+        let was_saved_playing = self
+            .db
+            .get_setting(SESSION_LAST_PLAYING)
+            .map_err(|e| e.to_string())?
+            .map(|s| s == "1" || s.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        Ok(resume_on_launch && was_saved_playing)
+    }
+
     fn restore_last_session(&mut self) -> Result<Option<PlaylistDto>, String> {
+        if let Some(collection_id) = self.active_collection_id {
+            let autoplay = self.launch_autoplay_enabled()?;
+            match self.play_collection_inner(collection_id, "continue", false, autoplay) {
+                Ok(dto) => return Ok(Some(dto)),
+                Err(_) => {
+                    self.active_collection_id = None;
+                    let _ = self.db.delete_setting(SESSION_COLLECTION_ID);
+                }
+            }
+        }
+
         let root_s = match self
             .db
             .get_setting(SESSION_LAST_ROOT)
@@ -718,18 +1243,7 @@ impl InnerState {
         };
         let idx = idx.min(self.playlist.len().saturating_sub(1));
 
-        let resume_on_launch = parse_bool_pref(
-            self.db
-                .get_setting(PREF_RESUME_PLAYING_ON_LAUNCH)
-                .map_err(|e| e.to_string())?,
-        );
-        let was_saved_playing = self
-            .db
-            .get_setting(SESSION_LAST_PLAYING)
-            .map_err(|e| e.to_string())?
-            .map(|s| s == "1" || s.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
-        let autoplay = resume_on_launch && was_saved_playing;
+        let autoplay = self.launch_autoplay_enabled()?;
 
         self.mpv
             .ensure_running()
@@ -823,6 +1337,7 @@ impl InnerState {
     }
 
     fn play_path_at_index_with_autoplay(&mut self, idx: usize, autoplay: bool) -> Result<(), String> {
+        let idx = self.resolve_playable_index(idx)?;
         let path = self
             .playlist
             .get(idx)
@@ -833,37 +1348,21 @@ impl InnerState {
         }
         let key = path.to_string_lossy().into_owned();
         let media: Option<MediaRow> = self.db.get_media(&key).map_err(|e| e.to_string())?;
-        let default_speed = InnerState::clamp_speed(self.db.get_default_speed());
-        let speed = media
-            .as_ref()
-            .map(|m| InnerState::clamp_speed(m.playback_speed))
-            .unwrap_or(default_speed);
+        let speed = self.resolve_playback_speed(&key)?;
         let start = Self::resume_start_seconds(
             media.as_ref().map(|m| m.position_sec).unwrap_or(0.0),
             media.as_ref().and_then(|m| m.duration_sec),
         );
 
-        if autoplay {
-            self.mpv
-                .load_file(&key, start)
-                .map_err(|e: MpvError| e.to_string())?;
-        } else {
-            self.mpv
-                .load_file_start_paused(&key, start)
-                .map_err(|e: MpvError| e.to_string())?;
-        }
+        self.mpv
+            .load_file_controlled(&key, start, autoplay)
+            .map_err(|e: MpvError| e.to_string())?;
         self.mpv
             .set_speed(speed)
             .map_err(|e: MpvError| e.to_string())?;
-        if autoplay {
-            self.mpv
-                .resume()
-                .map_err(|e: MpvError| e.to_string())?;
-        } else {
-            let _ = self.mpv.pause();
-        }
         self.current_index = Some(idx);
         self.touch_session_track_after_play()?;
+        let _ = self.sync_session_last_playing();
         Ok(())
     }
 
@@ -960,6 +1459,7 @@ impl InnerState {
         if !self.allowed_files.contains(&canon) {
             return Err("Track is not part of the current session".into());
         }
+        CatalogService::new(&mut self.db).path_delete_allowed(&canon)?;
         let key = canon.to_string_lossy().into_owned();
         let was_current = self.current_path().as_ref() == Some(&canon);
 
@@ -980,6 +1480,7 @@ impl InnerState {
             return Err(format!("Cannot delete file: {e}"));
         }
         let _ = self.db.delete_media_row(&key);
+        let _ = CatalogService::new(&mut self.db).mark_file_unavailable_by_path(&canon);
 
         let removed_idx = self.playlist.iter().position(|p| p == &canon);
         self.allowed_files.remove(&canon);
@@ -1023,16 +1524,26 @@ impl InnerState {
         let Some(root) = self.session_root.clone() else {
             return Err("No session is open".into());
         };
+        let files: Vec<PathBuf> = self.playlist.clone();
+        {
+            let cat = CatalogService::new(&mut self.db);
+            for p in &files {
+                cat.path_delete_allowed(p)?;
+            }
+            if !self.single_file_session {
+                cat.path_delete_allowed(&root)?;
+            }
+        }
         let _ = self.persist_current();
         self.mpv.reset_session();
 
-        let files: Vec<PathBuf> = self.playlist.clone();
         let mut last_err: Option<String> = None;
         for p in &files {
             let key = p.to_string_lossy().into_owned();
             match fs::remove_file(p) {
                 Ok(()) => {
                     let _ = self.db.delete_media_row(&key);
+                    let _ = CatalogService::new(&mut self.db).mark_file_unavailable_by_path(p);
                 }
                 Err(e) => {
                     last_err = Some(format!("{}: {e}", p.display()));
@@ -1118,6 +1629,7 @@ impl InnerState {
             }
             self.start_first_track_if_needed()?;
             let _ = self.persist_current();
+            let _ = self.sync_session_last_playing();
             return Ok(false);
         }
         self.ensure_current_track_loaded()?;
@@ -1129,6 +1641,7 @@ impl InnerState {
                 .set_pause(false)
                 .map_err(|e: MpvError| e.to_string())?;
             let _ = self.persist_current();
+            let _ = self.sync_session_last_playing();
             return Ok(false);
         }
         let paused = self
@@ -1136,6 +1649,7 @@ impl InnerState {
             .toggle_pause()
             .map_err(|e: MpvError| e.to_string())?;
         let _ = self.persist_current();
+        let _ = self.sync_session_last_playing();
         Ok(paused)
     }
 
@@ -1143,6 +1657,7 @@ impl InnerState {
     fn media_play_inner(&mut self) -> Result<(), String> {
         self.resume_or_start_playback()?;
         let _ = self.persist_current();
+        let _ = self.sync_session_last_playing();
         Ok(())
     }
 
@@ -1257,50 +1772,87 @@ impl InnerState {
         };
         let is_active = self.current_index == Some(idx);
         let key = path.to_string_lossy().into_owned();
-        let title = path
+        let mut title = path
             .file_name()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| key.clone());
-        let (mut duration_sec, artist, album, _listened) = self
+        let (mut duration_sec, mut artist, mut album, _listened) = self
             .db
             .get_media_display_meta(&key)
             .ok()
             .flatten()
             .unwrap_or((None, None, None, None));
+        let mut cover_url: Option<String> = None;
+        if let Some(cid) = self.resolved_collection_id() {
+            if let Ok((t, a, al, cover)) =
+                CatalogService::new(&mut self.db).collection_mpris_meta(cid, &key)
+            {
+                title = t;
+                if artist.is_none() {
+                    artist = a;
+                }
+                if album.is_none() {
+                    album = al;
+                }
+                if let Some(c) = cover.filter(|p| Path::new(p).exists()) {
+                    cover_url = Some(format!("file://{}", c));
+                }
+            }
+        }
+
+        let has_queue = !self.playlist.is_empty();
+        let persisted_pos = self
+            .db
+            .get_media(&key)
+            .ok()
+            .flatten()
+            .map(|m| m.position_sec)
+            .unwrap_or(0.0);
 
         if !is_active {
             return media_controls::OsMediaSnapshot {
-                has_track: true,
-                stopped: true,
+                has_track: has_queue,
+                stopped: !has_queue,
                 playing: false,
-                position_sec: 0.0,
+                position_sec: persisted_pos.max(0.0),
                 duration_sec,
                 title,
                 artist,
                 album,
-                track_key: String::new(),
+                track_key: if has_queue { key } else { String::new() },
+                cover_url,
             };
         }
 
         let read = self.mpv.peek_transport();
-        let (position_sec, paused, eof, idle, mpv_duration) = match read {
+        let (mpv_pos, paused, eof, idle, mpv_duration) = match read {
             Some(r) => (r.position_sec, r.paused, r.eof, r.idle, r.duration_sec),
-            None => (0.0, true, false, true, None),
+            None => (persisted_pos, true, false, true, None),
         };
         if duration_sec.is_none() {
             duration_sec = mpv_duration;
         }
+        let position_sec = if idle {
+            persisted_pos
+        } else {
+            mpv_pos
+        }
+        .max(0.0);
+        // Report Paused (not Stopped) when a track is loaded/selected so the OS routes
+        // headset Play/Pause to resume rather than treating the session as ended.
+        let stopped = !has_queue || (self.current_index.is_none() && idle);
 
         media_controls::OsMediaSnapshot {
-            has_track: true,
-            stopped: idle,
+            has_track: has_queue,
+            stopped,
             playing: !paused && !eof && !idle,
-            position_sec: position_sec.max(0.0),
+            position_sec,
             duration_sec,
             title,
             artist,
             album,
             track_key: key,
+            cover_url,
         }
     }
 
@@ -1315,7 +1867,15 @@ impl InnerState {
                     .flatten(),
             ),
             scan_subfolders: self.scan_subfolders,
+            online_metadata_enabled: parse_bool_pref(
+                self.db
+                    .get_setting(PREF_ONLINE_METADATA)
+                    .ok()
+                    .flatten(),
+            ),
             ui_locale,
+            default_speed_audiobook: Self::clamp_speed(self.db.get_default_speed_audiobook()),
+            default_speed_music: Self::clamp_speed(self.db.get_default_speed_music()),
         }
     }
 }
@@ -1347,10 +1907,26 @@ fn build_native_menu(handle: &AppHandle, ui_locale: &str) -> tauri::Result<Menu<
     } else {
         ("File", "Playback", "View", "Help")
     };
-    let (open_folder, open_file, preferences, s_pb_toggle, s_pb_prev, s_pb_next, s_pb_back, s_pb_fwd, s_pb_sleep, s_view_player, s_view_queue, s_help_keys, s_help_about) = if de {
+    let (
+        link_folder,
+        open_folder,
+        open_file,
+        preferences,
+        s_pb_toggle,
+        s_pb_prev,
+        s_pb_next,
+        s_pb_back,
+        s_pb_fwd,
+        s_pb_sleep,
+        s_view_player,
+        s_view_queue,
+        s_help_keys,
+        s_help_about,
+    ) = if de {
         (
-            "Ordner öffnen…",
-            "Datei öffnen…",
+            "Ordner verknüpfen…",
+            "Ordner einmalig öffnen…",
+            "Datei einmalig öffnen…",
             "Einstellungen…",
             "Wiedergabe / Pause",
             "Vorheriger Titel",
@@ -1365,8 +1941,9 @@ fn build_native_menu(handle: &AppHandle, ui_locale: &str) -> tauri::Result<Menu<
         )
     } else {
         (
-            "Open Folder…",
-            "Open File…",
+            "Link folder…",
+            "Open folder once…",
+            "Open file once…",
             "Preferences…",
             "Play / Pause",
             "Previous Track",
@@ -1381,6 +1958,13 @@ fn build_native_menu(handle: &AppHandle, ui_locale: &str) -> tauri::Result<Menu<
         )
     };
 
+    let file_link_folder = MenuItem::with_id(
+        handle,
+        "abp.file.link_folder",
+        link_folder,
+        true,
+        None::<&str>,
+    )?;
     let file_open_folder = MenuItem::with_id(
         handle,
         "abp.file.open_folder",
@@ -1409,8 +1993,11 @@ fn build_native_menu(handle: &AppHandle, ui_locale: &str) -> tauri::Result<Menu<
 
     Menu::with_items(handle, &[
         &Submenu::with_items(handle, m_file, true, &[
+            &file_link_folder,
+            &PredefinedMenuItem::separator(handle)?,
             &file_open_folder,
             &file_open_file,
+            &PredefinedMenuItem::separator(handle)?,
             &file_preferences,
             &PredefinedMenuItem::separator(handle)?,
             &PredefinedMenuItem::close_window(handle, None)?,
@@ -1437,15 +2024,39 @@ struct UiActionPayload {
 }
 
 #[cfg(desktop)]
+#[derive(Clone, serde::Serialize)]
+struct UserSessionOpenPayload {
+    playlist: PlaylistDto,
+    suggest_library_link: bool,
+}
+
+#[cfg(desktop)]
+fn emit_user_session_open(app: &AppHandle, playlist: PlaylistDto, suggest_library_link: bool) {
+    let _ = app.emit(
+        "abp:user-session-open",
+        UserSessionOpenPayload {
+            playlist,
+            suggest_library_link,
+        },
+    );
+}
+
+#[cfg(desktop)]
 fn handle_native_menu_event(app: &AppHandle, id: &str) {
     match id {
+        "abp.file.link_folder" => {
+            let _ = app.emit(
+                "abp:ui-action",
+                UiActionPayload {
+                    action: "library.link_folder",
+                },
+            );
+        }
         "abp.file.open_folder" => {
             let h = app.clone();
             tauri::async_runtime::spawn(async move {
                 match pick_open_folder(h.clone()).await {
-                    Ok(Some(dto)) => {
-                        let _ = h.emit("abp:playlist-update", dto);
-                    }
+                    Ok(Some(dto)) => emit_user_session_open(&h, dto, true),
                     Ok(None) => {}
                     Err(e) => {
                         let _ = h.emit("abp:user-error", e);
@@ -1457,9 +2068,7 @@ fn handle_native_menu_event(app: &AppHandle, id: &str) {
             let h = app.clone();
             tauri::async_runtime::spawn(async move {
                 match pick_open_file(h.clone()).await {
-                    Ok(Some(dto)) => {
-                        let _ = h.emit("abp:playlist-update", dto);
-                    }
+                    Ok(Some(dto)) => emit_user_session_open(&h, dto, false),
                     Ok(None) => {}
                     Err(e) => {
                         let _ = h.emit("abp:user-error", e);
@@ -1566,6 +2175,22 @@ async fn pick_open_folder(app: AppHandle) -> Result<Option<PlaylistDto>, String>
 }
 
 #[tauri::command]
+async fn pick_library_folder(app: AppHandle) -> Result<Option<String>, String> {
+    let folder = app
+        .dialog()
+        .file()
+        .set_title("Link audio folder")
+        .blocking_pick_folder();
+    let Some(fp) = folder else {
+        return Ok(None);
+    };
+    let folder = fp
+        .into_path()
+        .map_err(|e| format!("Could not use selected folder path: {e}"))?;
+    Ok(Some(folder.to_string_lossy().to_string()))
+}
+
+#[tauri::command]
 async fn pick_open_file(app: AppHandle) -> Result<Option<PlaylistDto>, String> {
     let file = app
         .dialog()
@@ -1594,6 +2219,18 @@ async fn open_folder_path_impl(app: AppHandle, folder: PathBuf) -> Result<Option
     if !root.is_dir() {
         return Err("Selected path is not a folder".to_string());
     }
+    let catalog_match = {
+        let mut g = state.inner.lock().map_err(|e| e.to_string())?;
+        CatalogService::new(&mut g.db).find_collection_for_folder(&root)?
+    };
+    if let Some(collection_id) = catalog_match {
+        let dto = {
+            let mut g = state.inner.lock().map_err(|e| e.to_string())?;
+            g.play_collection_inner(collection_id, "continue", false, true)?
+        };
+        let _ = app.emit("abp:playlist-update", &dto);
+        return Ok(Some(dto));
+    }
     let scan = {
         let g = state.inner.lock().map_err(|e| e.to_string())?;
         g.scan_subfolders
@@ -1617,6 +2254,62 @@ async fn open_folder_path_impl(app: AppHandle, folder: PathBuf) -> Result<Option
     Ok(Some(dto))
 }
 
+/// Paths passed when the desktop or file manager opens a file/folder with this app.
+fn startup_open_paths() -> Vec<PathBuf> {
+    std::env::args()
+        .skip(1)
+        .filter_map(|arg| decode_open_path_arg(&arg))
+        .collect()
+}
+
+fn decode_open_path_arg(arg: &str) -> Option<PathBuf> {
+    let raw = arg.trim();
+    if raw.is_empty() || raw.starts_with('-') {
+        return None;
+    }
+    let path_s = if let Some(rest) = raw.strip_prefix("file://") {
+        percent_decode_path(rest)
+    } else {
+        raw.to_string()
+    };
+    if path_s.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(path_s))
+}
+
+fn percent_decode_path(s: &str) -> String {
+    let mut out = Vec::new();
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(v) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
+                out.push(v);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+async fn open_path_from_os(app: AppHandle, path: PathBuf) -> Result<(), String> {
+    let opened = if path.is_dir() {
+        open_folder_path_impl(app.clone(), path).await?
+    } else if path.is_file() {
+        open_file_path_impl(app.clone(), path).await?
+    } else {
+        return Err("Path does not exist".into());
+    };
+    if let Some(dto) = opened {
+        let _ = app.emit("abp:playlist-update", &dto);
+    }
+    Ok(())
+}
+
 async fn open_file_path_impl(app: AppHandle, file_path: PathBuf) -> Result<Option<PlaylistDto>, String> {
     let state = app.state::<AppState>();
     let file_path = InnerState::canonicalize_allowed(&file_path)?;
@@ -1625,6 +2318,18 @@ async fn open_file_path_impl(app: AppHandle, file_path: PathBuf) -> Result<Optio
     }
     if !InnerState::is_audio_file(&file_path) {
         return Err("Selected file is not a supported audio type".to_string());
+    }
+    let catalog_match = {
+        let mut g = state.inner.lock().map_err(|e| e.to_string())?;
+        CatalogService::new(&mut g.db).find_collection_for_path(&file_path)?
+    };
+    if let Some(collection_id) = catalog_match {
+        let dto = {
+            let mut g = state.inner.lock().map_err(|e| e.to_string())?;
+            g.play_collection_inner(collection_id, "continue", false, true)?
+        };
+        let _ = app.emit("abp:playlist-update", &dto);
+        return Ok(Some(dto));
     }
     let parent = file_path
         .parent()
@@ -1675,6 +2380,9 @@ fn set_repeat_mode(app: AppHandle, mode: String) -> Result<(), String> {
     let state = app.state::<AppState>();
     let mut g = state.inner.lock().map_err(|e| e.to_string())?;
     g.repeat_mode = mode;
+    g.db
+        .set_setting(PREF_REPEAT_MODE, mode.as_str())
+        .map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -1692,7 +2400,9 @@ fn play_index(app: AppHandle, index: usize) -> Result<(), String> {
 fn toggle_pause(app: AppHandle) -> Result<bool, String> {
     let state = app.state::<AppState>();
     let mut g = state.inner.lock().map_err(|e| e.to_string())?;
-    g.toggle_playback_inner()
+    let paused = g.toggle_playback_inner()?;
+    notify_transport_changed(&app);
+    Ok(paused)
 }
 
 #[tauri::command]
@@ -1711,6 +2421,8 @@ fn set_paused(app: AppHandle, paused: bool) -> Result<(), String> {
         g.resume_or_start_playback()?;
         let _ = g.persist_current();
     }
+    let _ = g.sync_session_last_playing();
+    notify_transport_changed(&app);
     Ok(())
 }
 
@@ -1719,7 +2431,9 @@ fn set_paused(app: AppHandle, paused: bool) -> Result<(), String> {
 fn media_play(app: AppHandle) -> Result<(), String> {
     let state = app.state::<AppState>();
     let mut g = state.inner.lock().map_err(|e| e.to_string())?;
-    g.media_play_inner()
+    g.media_play_inner()?;
+    notify_transport_changed(&app);
+    Ok(())
 }
 
 /// Hardware "Play/Pause" toggle key entry point.
@@ -1727,21 +2441,42 @@ fn media_play(app: AppHandle) -> Result<(), String> {
 fn media_toggle(app: AppHandle) -> Result<(), String> {
     let state = app.state::<AppState>();
     let mut g = state.inner.lock().map_err(|e| e.to_string())?;
-    g.toggle_playback_inner().map(|_| ())
+    g.toggle_playback_inner().map(|_| ())?;
+    notify_transport_changed(&app);
+    Ok(())
+}
+
+#[tauri::command]
+fn get_os_media_status() -> media_controls::OsMediaStatusDto {
+    #[cfg(target_os = "linux")]
+    {
+        return media_controls::status();
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        media_controls::OsMediaStatusDto {
+            available: false,
+            player_name: String::new(),
+        }
+    }
 }
 
 #[tauri::command]
 fn seek_seconds(app: AppHandle, seconds: f64) -> Result<(), String> {
     let state = app.state::<AppState>();
     let mut g = state.inner.lock().map_err(|e| e.to_string())?;
-    g.seek_seconds_inner(seconds)
+    g.seek_seconds_inner(seconds)?;
+    notify_transport_changed(&app);
+    Ok(())
 }
 
 #[tauri::command]
 fn seek_delta(app: AppHandle, delta: f64) -> Result<(), String> {
     let state = app.state::<AppState>();
     let mut g = state.inner.lock().map_err(|e| e.to_string())?;
-    g.seek_delta_inner(delta)
+    g.seek_delta_inner(delta)?;
+    notify_transport_changed(&app);
+    Ok(())
 }
 
 #[tauri::command]
@@ -1767,9 +2502,16 @@ fn set_default_playback_speed(app: AppHandle, speed: f64) -> Result<f64, String>
     let speed = InnerState::clamp_speed(speed);
     let state = app.state::<AppState>();
     let mut g = state.inner.lock().map_err(|e| e.to_string())?;
-    g.db
-        .set_default_speed(speed)
-        .map_err(|e| e.to_string())?;
+    let kind = g.effective_playback_kind();
+    if kind == "music" {
+        g.db
+            .set_default_speed_music(speed)
+            .map_err(|e| e.to_string())?;
+    } else {
+        g.db
+            .set_default_speed_audiobook(speed)
+            .map_err(|e| e.to_string())?;
+    }
     g.mpv
         .set_speed(speed)
         .map_err(|e: MpvError| e.to_string())?;
@@ -1780,6 +2522,56 @@ fn set_default_playback_speed(app: AppHandle, speed: f64) -> Result<f64, String>
             .map_err(|e| e.to_string())?;
     }
     let _ = g.persist_current();
+    Ok(speed)
+}
+
+#[tauri::command]
+fn set_playback_speed_defaults(
+    app: AppHandle,
+    audiobook: f64,
+    music: f64,
+) -> Result<AppPrefsDto, String> {
+    let audiobook = InnerState::clamp_speed(audiobook);
+    let music = InnerState::clamp_speed(music);
+    let state = app.state::<AppState>();
+    let mut g = state.inner.lock().map_err(|e| e.to_string())?;
+    g.db
+        .set_default_speed_audiobook(audiobook)
+        .map_err(|e| e.to_string())?;
+    g.db
+        .set_default_speed_music(music)
+        .map_err(|e| e.to_string())?;
+    Ok(g.app_prefs())
+}
+
+#[tauri::command]
+fn set_playlist_default_speed(
+    app: AppHandle,
+    playlist_id: i64,
+    speed: Option<f64>,
+) -> Result<catalog::PlaylistDetailDto, String> {
+    let state = app.state::<AppState>();
+    let mut g = state.inner.lock().map_err(|e| e.to_string())?;
+    let speed = speed.map(InnerState::clamp_speed);
+    CatalogService::new(&mut g.db).set_playlist_default_speed(playlist_id, speed)?;
+    CatalogService::new(&mut g.db).get_playlist_detail(playlist_id)
+}
+
+#[tauri::command]
+fn reset_track_speed_to_default(app: AppHandle) -> Result<f64, String> {
+    let state = app.state::<AppState>();
+    let mut g = state.inner.lock().map_err(|e| e.to_string())?;
+    let Some(path) = g.current_path() else {
+        return Err("Nothing is playing".into());
+    };
+    let key = path.to_string_lossy().into_owned();
+    g.db
+        .clear_speed_custom(&key, InnerState::now_unix())
+        .map_err(|e| e.to_string())?;
+    let speed = g.resolve_playback_speed(&key)?;
+    g.mpv
+        .set_speed(speed)
+        .map_err(|e: MpvError| e.to_string())?;
     Ok(speed)
 }
 
@@ -1829,7 +2621,653 @@ fn get_transport(app: AppHandle) -> Result<TransportDto, String> {
         session_root,
         mpv_error,
         repeat_mode: g.repeat_mode.as_str().to_string(),
+        playback_kind: g.effective_playback_kind(),
+        active_collection_id: g.active_collection_id,
+        active_collection_kind: g
+            .resolved_collection_id()
+            .and_then(|id| g.collection_kind(id)),
     })
+}
+
+#[tauri::command]
+fn get_current_playlist(app: AppHandle) -> Result<Option<PlaylistDto>, String> {
+    let state = app.state::<AppState>();
+    let mut g = state.inner.lock().map_err(|e| e.to_string())?;
+    if g.playlist.is_empty() {
+        return Ok(None);
+    }
+    g.build_playlist_dto().map(Some)
+}
+
+#[tauri::command]
+fn list_library_roots(app: AppHandle) -> Result<Vec<catalog::LibraryRootDto>, String> {
+    let state = app.state::<AppState>();
+    let mut g = state.inner.lock().map_err(|e| e.to_string())?;
+    CatalogService::new(&mut g.db).list_roots()
+}
+
+#[tauri::command]
+fn add_library_root(app: AppHandle, input: AddLibraryRootInput) -> Result<catalog::LibraryRootDto, String> {
+    let state = app.state::<AppState>();
+    let mut g = state.inner.lock().map_err(|e| e.to_string())?;
+    CatalogService::new(&mut g.db).add_root(input)
+}
+
+#[tauri::command]
+fn remove_library_root(app: AppHandle, root_id: i64) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    let mut g = state.inner.lock().map_err(|e| e.to_string())?;
+    CatalogService::new(&mut g.db).remove_root(root_id)
+}
+
+#[tauri::command]
+fn scan_library_root(app: AppHandle, root_id: i64) -> Result<catalog::ScanStatusDto, String> {
+    let state = app.state::<AppState>();
+    let mut g = state.inner.lock().map_err(|e| e.to_string())?;
+    CatalogService::new(&mut g.db).scan_root(root_id)
+}
+
+#[tauri::command]
+fn refresh_library_roots(app: AppHandle) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    let mut g = state.inner.lock().map_err(|e| e.to_string())?;
+    CatalogService::new(&mut g.db).refresh_roots_availability()
+}
+
+#[tauri::command]
+fn list_collections(
+    app: AppHandle,
+    kind: Option<String>,
+    filter: Option<String>,
+    search: Option<String>,
+    series: Option<String>,
+    limit: Option<i64>,
+    offset: Option<i64>,
+) -> Result<Vec<catalog::CollectionSummaryDto>, String> {
+    let state = app.state::<AppState>();
+    let mut g = state.inner.lock().map_err(|e| e.to_string())?;
+    CatalogService::new(&mut g.db).list_collections(
+        kind.as_deref(),
+        filter.as_deref(),
+        search.as_deref(),
+        series.as_deref(),
+        limit.unwrap_or(200),
+        offset.unwrap_or(0),
+    )
+}
+
+#[tauri::command]
+fn list_series_names(app: AppHandle, kind: Option<String>) -> Result<Vec<String>, String> {
+    let state = app.state::<AppState>();
+    let mut g = state.inner.lock().map_err(|e| e.to_string())?;
+    CatalogService::new(&mut g.db).list_series_names(kind.as_deref())
+}
+
+#[tauri::command]
+fn get_collection_detail(app: AppHandle, collection_id: i64) -> Result<catalog::CollectionDetailDto, String> {
+    let state = app.state::<AppState>();
+    let mut g = state.inner.lock().map_err(|e| e.to_string())?;
+    CatalogService::new(&mut g.db).get_collection_detail(collection_id)
+}
+
+#[tauri::command]
+fn find_collection_file_id(app: AppHandle, path: String) -> Result<Option<i64>, String> {
+    let state = app.state::<AppState>();
+    let mut g = state.inner.lock().map_err(|e| e.to_string())?;
+    CatalogService::new(&mut g.db).find_collection_file_id_by_path(Path::new(&path))
+}
+
+#[tauri::command]
+fn find_relax_playlist(app: AppHandle) -> Result<Option<i64>, String> {
+    let state = app.state::<AppState>();
+    let mut g = state.inner.lock().map_err(|e| e.to_string())?;
+    CatalogService::new(&mut g.db).find_relax_playlist_id()
+}
+
+#[tauri::command]
+fn get_home_summary(app: AppHandle) -> Result<catalog::HomeSummaryDto, String> {
+    let state = app.state::<AppState>();
+    let mut g = state.inner.lock().map_err(|e| e.to_string())?;
+    CatalogService::new(&mut g.db).get_home_summary()
+}
+
+#[tauri::command]
+fn play_collection(
+    app: AppHandle,
+    collection_id: i64,
+    mode: String,
+    shuffle: Option<bool>,
+) -> Result<PlaylistDto, String> {
+    let state = app.state::<AppState>();
+    let dto = {
+        let mut g = state.inner.lock().map_err(|e| e.to_string())?;
+        g.play_collection_inner(collection_id, &mode, shuffle.unwrap_or(false), true)?
+    };
+    let _ = app.emit("abp:playlist-update", &dto);
+    Ok(dto)
+}
+
+#[tauri::command]
+fn enqueue_collection(
+    app: AppHandle,
+    collection_id: i64,
+    position: Option<String>,
+) -> Result<EnqueueCollectionResult, String> {
+    let state = app.state::<AppState>();
+    let result = {
+        let mut g = state.inner.lock().map_err(|e| e.to_string())?;
+        g.enqueue_collection_inner(collection_id, position.as_deref().unwrap_or("end"))?
+    };
+    let _ = app.emit("abp:playlist-update", &result.playlist);
+    Ok(result)
+}
+
+#[tauri::command]
+fn update_collection_metadata(
+    app: AppHandle,
+    collection_id: i64,
+    metadata: CollectionMetadataInput,
+) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    let mut g = state.inner.lock().map_err(|e| e.to_string())?;
+    CatalogService::new(&mut g.db).update_collection_metadata(collection_id, metadata)
+}
+
+#[tauri::command]
+fn set_collection_kind(app: AppHandle, collection_id: i64, kind: String) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    let mut g = state.inner.lock().map_err(|e| e.to_string())?;
+    CatalogService::new(&mut g.db).set_collection_kind(collection_id, &kind)?;
+    let playing_collection = g.resolved_collection_id() == Some(collection_id);
+    if playing_collection {
+        g.playback_kind = kind.clone();
+        let _ = g.db.set_setting(SESSION_PLAYBACK_KIND, &kind);
+    }
+    let paths = CatalogService::new(&mut g.db).collection_file_paths(collection_id)?;
+    let now = InnerState::now_unix();
+    for path in &paths {
+        let _ = g.db.clear_speed_custom(path, now);
+    }
+    if playing_collection {
+        if let Some(current) = g.current_path() {
+            let key = current.to_string_lossy().into_owned();
+            let speed = g.resolve_playback_speed(&key)?;
+            if g.mpv.ensure_running().is_ok() {
+                let _ = g.mpv.set_speed(speed);
+            }
+        }
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn find_collection_id_for_path(app: AppHandle, path: String) -> Result<Option<i64>, String> {
+    let state = app.state::<AppState>();
+    let mut g = state.inner.lock().map_err(|e| e.to_string())?;
+    CatalogService::new(&mut g.db).find_collection_for_path(Path::new(&path))
+}
+
+#[tauri::command]
+fn mark_collection_listened(app: AppHandle, collection_id: i64, listened: bool) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    let mut g = state.inner.lock().map_err(|e| e.to_string())?;
+    CatalogService::new(&mut g.db).mark_collection_listened(collection_id, listened)
+}
+
+#[tauri::command]
+fn list_playlists(app: AppHandle) -> Result<Vec<catalog::PlaylistSummaryDto>, String> {
+    let state = app.state::<AppState>();
+    let mut g = state.inner.lock().map_err(|e| e.to_string())?;
+    CatalogService::new(&mut g.db).list_playlists()
+}
+
+#[tauri::command]
+fn create_playlist(app: AppHandle, name: String, pin: Option<bool>) -> Result<i64, String> {
+    let state = app.state::<AppState>();
+    let mut g = state.inner.lock().map_err(|e| e.to_string())?;
+    CatalogService::new(&mut g.db).create_playlist(&name, pin.unwrap_or(false))
+}
+
+#[tauri::command]
+fn add_to_playlist(app: AppHandle, playlist_id: i64, collection_file_id: i64) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    let mut g = state.inner.lock().map_err(|e| e.to_string())?;
+    CatalogService::new(&mut g.db).add_to_playlist(playlist_id, collection_file_id)
+}
+
+#[tauri::command]
+fn list_album_groups(
+    app: AppHandle,
+    search: Option<String>,
+    limit: Option<i64>,
+    offset: Option<i64>,
+) -> Result<Vec<catalog::AlbumGroupDto>, String> {
+    let state = app.state::<AppState>();
+    let mut g = state.inner.lock().map_err(|e| e.to_string())?;
+    CatalogService::new(&mut g.db).list_album_groups(
+        search.as_deref(),
+        limit.unwrap_or(500),
+        offset.unwrap_or(0),
+    )
+}
+
+#[tauri::command]
+fn add_album_to_playlist(
+    app: AppHandle,
+    playlist_id: i64,
+    artist: String,
+    album: String,
+) -> Result<catalog::AddToPlaylistBulkResult, String> {
+    let state = app.state::<AppState>();
+    let mut g = state.inner.lock().map_err(|e| e.to_string())?;
+    CatalogService::new(&mut g.db).add_album_to_playlist(playlist_id, &artist, &album)
+}
+
+#[tauri::command]
+fn add_collection_to_playlist(
+    app: AppHandle,
+    playlist_id: i64,
+    collection_id: i64,
+) -> Result<catalog::AddToPlaylistBulkResult, String> {
+    let state = app.state::<AppState>();
+    let mut g = state.inner.lock().map_err(|e| e.to_string())?;
+    CatalogService::new(&mut g.db).add_collection_to_playlist(playlist_id, collection_id)
+}
+
+#[tauri::command]
+fn create_playlist_from_album(
+    app: AppHandle,
+    artist: String,
+    album: String,
+) -> Result<i64, String> {
+    let state = app.state::<AppState>();
+    let mut g = state.inner.lock().map_err(|e| e.to_string())?;
+    CatalogService::new(&mut g.db).create_playlist_from_album(&artist, &album)
+}
+
+#[tauri::command]
+fn create_playlist_from_collection(app: AppHandle, collection_id: i64) -> Result<i64, String> {
+    let state = app.state::<AppState>();
+    let mut g = state.inner.lock().map_err(|e| e.to_string())?;
+    CatalogService::new(&mut g.db).create_playlist_from_collection(collection_id)
+}
+
+#[tauri::command]
+fn list_metadata_groups(
+    app: AppHandle,
+    group_kind: String,
+    search: Option<String>,
+    limit: Option<i64>,
+    offset: Option<i64>,
+) -> Result<Vec<catalog::MetadataGroupDto>, String> {
+    let state = app.state::<AppState>();
+    let mut g = state.inner.lock().map_err(|e| e.to_string())?;
+    CatalogService::new(&mut g.db).list_metadata_groups(
+        &group_kind,
+        search.as_deref(),
+        limit.unwrap_or(500),
+        offset.unwrap_or(0),
+    )
+}
+
+#[tauri::command]
+fn add_metadata_group_to_playlist(
+    app: AppHandle,
+    playlist_id: i64,
+    group_kind: String,
+    group_key: String,
+) -> Result<catalog::AddToPlaylistBulkResult, String> {
+    let state = app.state::<AppState>();
+    let mut g = state.inner.lock().map_err(|e| e.to_string())?;
+    CatalogService::new(&mut g.db).add_metadata_group_to_playlist(
+        playlist_id,
+        &group_kind,
+        &group_key,
+    )
+}
+
+#[tauri::command]
+fn create_playlist_from_metadata_group(
+    app: AppHandle,
+    group_kind: String,
+    group_key: String,
+) -> Result<i64, String> {
+    let state = app.state::<AppState>();
+    let mut g = state.inner.lock().map_err(|e| e.to_string())?;
+    CatalogService::new(&mut g.db).create_playlist_from_metadata_group(&group_kind, &group_key)
+}
+
+#[tauri::command]
+async fn pick_import_folder_to_playlist(
+    app: AppHandle,
+    playlist_id: i64,
+) -> Result<Option<catalog::ImportFolderToPlaylistResult>, String> {
+    let folder = app
+        .dialog()
+        .file()
+        .set_title("Import folder into playlist")
+        .blocking_pick_folder();
+    let Some(fp) = folder else {
+        return Ok(None);
+    };
+    let folder = fp
+        .into_path()
+        .map_err(|e| format!("Could not use selected folder path: {e}"))?;
+    let state = app.state::<AppState>();
+    let mut g = state.inner.lock().map_err(|e| e.to_string())?;
+    let result = CatalogService::new(&mut g.db).import_folder_to_playlist(playlist_id, &folder)?;
+    Ok(Some(result))
+}
+
+#[tauri::command]
+fn rename_playlist(app: AppHandle, playlist_id: i64, name: String) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    let mut g = state.inner.lock().map_err(|e| e.to_string())?;
+    CatalogService::new(&mut g.db).rename_playlist(playlist_id, &name)
+}
+
+#[tauri::command]
+fn delete_playlist(app: AppHandle, playlist_id: i64) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    let mut g = state.inner.lock().map_err(|e| e.to_string())?;
+    CatalogService::new(&mut g.db).delete_playlist(playlist_id)
+}
+
+#[tauri::command]
+fn get_playlist_detail(
+    app: AppHandle,
+    playlist_id: i64,
+) -> Result<catalog::PlaylistDetailDto, String> {
+    let state = app.state::<AppState>();
+    let mut g = state.inner.lock().map_err(|e| e.to_string())?;
+    CatalogService::new(&mut g.db).get_playlist_detail(playlist_id)
+}
+
+#[tauri::command]
+fn remove_from_playlist(app: AppHandle, item_id: i64) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    let mut g = state.inner.lock().map_err(|e| e.to_string())?;
+    CatalogService::new(&mut g.db).remove_from_playlist(item_id)
+}
+
+#[tauri::command]
+fn reorder_playlist_items(
+    app: AppHandle,
+    playlist_id: i64,
+    item_ids: Vec<i64>,
+) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    let mut g = state.inner.lock().map_err(|e| e.to_string())?;
+    CatalogService::new(&mut g.db).reorder_playlist_items(playlist_id, item_ids)
+}
+
+#[tauri::command]
+fn reorder_collection_files(
+    app: AppHandle,
+    collection_id: i64,
+    file_ids: Vec<i64>,
+) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    let mut g = state.inner.lock().map_err(|e| e.to_string())?;
+    CatalogService::new(&mut g.db).reorder_collection_files(collection_id, file_ids)
+}
+
+#[tauri::command]
+fn update_file_display_title(
+    app: AppHandle,
+    file_id: i64,
+    display_title: String,
+) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    let mut g = state.inner.lock().map_err(|e| e.to_string())?;
+    CatalogService::new(&mut g.db).update_file_display_title(file_id, &display_title)
+}
+
+#[derive(Clone, Serialize)]
+pub struct LibraryFileChangeResult {
+    pub playlist: Option<PlaylistDto>,
+}
+
+#[tauri::command]
+fn relink_collection_file(
+    app: AppHandle,
+    file_id: i64,
+    new_path: String,
+) -> Result<LibraryFileChangeResult, String> {
+    let state = app.state::<AppState>();
+    let mut g = state.inner.lock().map_err(|e| e.to_string())?;
+    let result = CatalogService::new(&mut g.db).relink_collection_file(file_id, &new_path)?;
+    g.sync_session_after_relink(&result.old_path, &result.new_path)?;
+    let playlist = g.session_playlist_if_open()?;
+    if let Some(ref dto) = playlist {
+        let _ = app.emit("abp:playlist-update", dto);
+    }
+    Ok(LibraryFileChangeResult { playlist })
+}
+
+#[tauri::command]
+fn remove_collection_file_from_library(
+    app: AppHandle,
+    file_id: i64,
+) -> Result<catalog::RemoveCollectionFileResult, String> {
+    let state = app.state::<AppState>();
+    let mut g = state.inner.lock().map_err(|e| e.to_string())?;
+    let result = CatalogService::new(&mut g.db).remove_collection_file_from_library(file_id)?;
+    g.sync_session_after_remove(&result.removed_path)?;
+    let playlist = g.session_playlist_if_open()?;
+    if let Some(ref dto) = playlist {
+        let _ = app.emit("abp:playlist-update", dto);
+    }
+    Ok(result)
+}
+
+#[tauri::command]
+fn remove_collection_from_library(
+    app: AppHandle,
+    collection_id: i64,
+) -> Result<catalog::RemoveCollectionResult, String> {
+    let state = app.state::<AppState>();
+    let mut g = state.inner.lock().map_err(|e| e.to_string())?;
+    let result = CatalogService::new(&mut g.db)
+        .remove_collection_from_library(collection_id)?;
+    for path in &result.removed_paths {
+        g.sync_session_after_remove(path)?;
+    }
+    let playlist = g.session_playlist_if_open()?;
+    if let Some(ref dto) = playlist {
+        let _ = app.emit("abp:playlist-update", dto);
+    }
+    Ok(result)
+}
+
+#[tauri::command]
+fn remove_queue_item(app: AppHandle, path: String) -> Result<Option<PlaylistDto>, String> {
+    let state = app.state::<AppState>();
+    let dto = {
+        let mut g = state.inner.lock().map_err(|e| e.to_string())?;
+        g.remove_queue_item_inner(PathBuf::from(path))?
+    };
+    if let Some(ref d) = dto {
+        let _ = app.emit("abp:playlist-update", d);
+    }
+    Ok(dto)
+}
+
+#[tauri::command]
+async fn pick_relink_audio_file(app: AppHandle) -> Result<Option<String>, String> {
+    let file = app
+        .dialog()
+        .file()
+        .add_filter(
+            "Audio",
+            &[
+                "mp3", "m4a", "m4b", "aac", "flac", "ogg", "opus", "wav", "wma", "aiff", "aif",
+                "oga",
+            ],
+        )
+        .set_title("Choose replacement audio file")
+        .blocking_pick_file();
+    let Some(fp) = file else {
+        return Ok(None);
+    };
+    let path = fp
+        .into_path()
+        .map_err(|e| format!("Could not use selected path: {e}"))?;
+    Ok(Some(path.to_string_lossy().to_string()))
+}
+
+#[tauri::command]
+fn fix_collection_track_order(app: AppHandle, collection_id: i64) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    let mut g = state.inner.lock().map_err(|e| e.to_string())?;
+    CatalogService::new(&mut g.db).fix_collection_track_order(collection_id)
+}
+
+#[tauri::command]
+fn set_playlist_pinned(app: AppHandle, playlist_id: i64, pinned: bool) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    let mut g = state.inner.lock().map_err(|e| e.to_string())?;
+    CatalogService::new(&mut g.db).set_playlist_pinned(playlist_id, pinned)
+}
+
+#[tauri::command]
+fn get_scan_status(app: AppHandle) -> Result<Vec<catalog::ScanStatusDto>, String> {
+    let state = app.state::<AppState>();
+    let mut g = state.inner.lock().map_err(|e| e.to_string())?;
+    CatalogService::new(&mut g.db).scan_status_all()
+}
+
+#[tauri::command]
+fn add_to_library(app: AppHandle, input: AddToLibraryInput) -> Result<i64, String> {
+    let state = app.state::<AppState>();
+    let mut g = state.inner.lock().map_err(|e| e.to_string())?;
+    CatalogService::new(&mut g.db).add_to_library(input)
+}
+
+#[tauri::command]
+async fn lookup_metadata_online(
+    app: AppHandle,
+    collection_id: i64,
+) -> Result<Vec<MetadataSuggestionDto>, String> {
+    let plan = {
+        let state = app.state::<AppState>();
+        let mut g = state.inner.lock().map_err(|e| e.to_string())?;
+        let enabled = parse_bool_pref(
+            g.db
+                .get_setting(PREF_ONLINE_METADATA)
+                .ok()
+                .flatten(),
+        );
+        CatalogService::new(&mut g.db).plan_metadata_lookup(collection_id, enabled)?
+    };
+
+    match plan {
+        MetadataLookupPlan::Disabled => {
+            Err("Online metadata lookup is disabled in preferences".into())
+        }
+        MetadataLookupPlan::EmptyTitle => Ok(Vec::new()),
+        MetadataLookupPlan::Cached(suggestions) => Ok(suggestions),
+        MetadataLookupPlan::Fetch(req) => {
+            let cache_key = req.cache_key.clone();
+            let suggestions = tauri::async_runtime::spawn_blocking(move || fetch_metadata_online(&req))
+                .await
+                .map_err(|e| e.to_string())??;
+
+            if !suggestions.is_empty() {
+                let state = app.state::<AppState>();
+                let mut g = state.inner.lock().map_err(|e| e.to_string())?;
+                CatalogService::new(&mut g.db)
+                    .store_metadata_lookup_cache(&cache_key, &suggestions)?;
+            }
+            Ok(suggestions)
+        }
+    }
+}
+
+#[tauri::command]
+fn set_online_metadata_enabled(app: AppHandle, enabled: bool) -> Result<AppPrefsDto, String> {
+    let state = app.state::<AppState>();
+    let mut g = state.inner.lock().map_err(|e| e.to_string())?;
+    g.db
+        .set_setting(
+            PREF_ONLINE_METADATA,
+            if enabled { "1" } else { "0" },
+        )
+        .map_err(|e| e.to_string())?;
+    Ok(g.app_prefs())
+}
+
+#[tauri::command]
+fn update_library_root(
+    app: AppHandle,
+    root_id: i64,
+    new_path: String,
+) -> Result<catalog::LibraryRootDto, String> {
+    let state = app.state::<AppState>();
+    let mut g = state.inner.lock().map_err(|e| e.to_string())?;
+    CatalogService::new(&mut g.db).update_root_path(root_id, &new_path)?;
+    CatalogService::new(&mut g.db)
+        .list_roots()?
+        .into_iter()
+        .find(|r| r.id == root_id)
+        .ok_or_else(|| "Root not found after update".to_string())
+}
+
+#[tauri::command]
+async fn export_db(app: AppHandle) -> Result<Option<String>, String> {
+    let dest = app
+        .dialog()
+        .file()
+        .set_title("Back up library database")
+        .add_filter("SQLite database", &["sqlite3", "db", "sqlite"])
+        .set_file_name("chaptercheck-library-backup.sqlite3")
+        .blocking_save_file();
+    let Some(fp) = dest else {
+        return Ok(None);
+    };
+    let dest_path = fp
+        .into_path()
+        .map_err(|e| format!("Could not use selected path: {e}"))?;
+    let src = data_db_path()?;
+    fs::copy(&src, &dest_path).map_err(|e| format!("Backup failed: {e}"))?;
+    Ok(Some(dest_path.to_string_lossy().to_string()))
+}
+
+#[tauri::command]
+fn play_playlist(
+    app: AppHandle,
+    playlist_id: i64,
+    shuffle: Option<bool>,
+) -> Result<PlaylistDto, String> {
+    let state = app.state::<AppState>();
+    let (paths, kind) = {
+        let mut g = state.inner.lock().map_err(|e| e.to_string())?;
+        let mut cat = CatalogService::new(&mut g.db);
+        let paths = cat.playlist_playback_paths(playlist_id)?;
+        let kind = "music".to_string();
+        (paths, kind)
+    };
+    let mut paths = paths;
+    if shuffle.unwrap_or(true) && paths.len() >= 2 {
+        paths.shuffle(&mut thread_rng());
+    }
+    let dto = {
+        let mut g = state.inner.lock().map_err(|e| e.to_string())?;
+        g.mpv.ensure_running().map_err(|e: MpvError| e.to_string())?;
+        let _ = g.persist_current();
+        let root = paths[0]
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| paths[0].clone());
+        let root = InnerState::canonicalize_allowed(&root)?;
+        g.set_session_paths_ordered(root, paths, false, None, Some(playlist_id), &kind);
+        g.play_path_at_index_with_autoplay(0, true)?;
+        g.touch_session_track_after_play()?;
+        g.persist_session_meta_checkpoint()?;
+        g.build_playlist_dto()?
+    };
+    let _ = app.emit("abp:playlist-update", &dto);
+    Ok(dto)
 }
 
 #[tauri::command]
@@ -1861,7 +3299,14 @@ fn advance_after_eof(app: AppHandle) -> Result<(), String> {
         RepeatMode::Off => {
             let next = idx.saturating_add(1);
             if next < len {
-                g.play_path_at_index(next)?;
+                match g.resolve_playable_index(next) {
+                    Ok(playable) => {
+                        g.play_path_at_index(playable)?;
+                    }
+                    Err(_) => {
+                        let _ = g.mpv.pause();
+                    }
+                }
             } else {
                 let _ = g.mpv.pause();
             }
@@ -1874,14 +3319,18 @@ fn advance_after_eof(app: AppHandle) -> Result<(), String> {
 fn skip_next(app: AppHandle) -> Result<(), String> {
     let state = app.state::<AppState>();
     let mut g = state.inner.lock().map_err(|e| e.to_string())?;
-    g.skip_next_inner()
+    g.skip_next_inner()?;
+    notify_transport_changed(&app);
+    Ok(())
 }
 
 #[tauri::command]
 fn skip_prev(app: AppHandle) -> Result<(), String> {
     let state = app.state::<AppState>();
     let mut g = state.inner.lock().map_err(|e| e.to_string())?;
-    g.skip_prev_inner()
+    g.skip_prev_inner()?;
+    notify_transport_changed(&app);
+    Ok(())
 }
 
 #[tauri::command]
@@ -1927,6 +3376,11 @@ fn set_resume_playing_on_launch(app: AppHandle, enabled: bool) -> Result<AppPref
             if enabled { "1" } else { "0" },
         )
         .map_err(|e| e.to_string())?;
+    if !enabled {
+        g.db
+            .set_setting(SESSION_LAST_PLAYING, "0")
+            .map_err(|e| e.to_string())?;
+    }
     Ok(g.app_prefs())
 }
 
@@ -2050,9 +3504,15 @@ pub fn run() {
 
     builder
         .setup(|app: &mut tauri::App| {
+            mpv::cleanup_orphaned_processes();
             let db_path = data_db_path().map_err(|e| setup_err(e))?;
             let db = LibraryDb::open(&db_path).map_err(|e| setup_err(e.to_string()))?;
             app.manage(AppState::new(db));
+            {
+                let state = app.state::<AppState>();
+                let mut g = state.inner.lock().map_err(|e| setup_err(e.to_string()))?;
+                let _ = CatalogService::new(&mut g.db).refresh_roots_availability();
+            }
             #[cfg(desktop)]
             {
                 let h = app.handle().clone();
@@ -2072,13 +3532,23 @@ pub fn run() {
                     .map_err(|e| setup_err(e.to_string()))?;
             }
             let h = app.handle().clone();
-            match h.state::<AppState>().try_restore_last_session() {
-                Ok(Some(dto)) => {
-                    let _ = h.emit("abp:playlist-update", &dto);
-                }
-                Ok(None) => {}
-                Err(e) => {
-                    eprintln!("ChapterCheck: session restore skipped: {e}");
+            let cli_paths = startup_open_paths();
+            if let Some(path) = cli_paths.into_iter().find(|p| p.exists()) {
+                let open_app = h.clone();
+                tauri::async_runtime::spawn(async move {
+                    if let Err(e) = open_path_from_os(open_app, path).await {
+                        eprintln!("ChapterCheck: open from file manager failed: {e}");
+                    }
+                });
+            } else {
+                match h.state::<AppState>().try_restore_last_session() {
+                    Ok(Some(dto)) => {
+                        let _ = h.emit("abp:playlist-update", &dto);
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        eprintln!("ChapterCheck: session restore skipped: {e}");
+                    }
                 }
             }
             #[cfg(target_os = "linux")]
@@ -2093,6 +3563,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             pick_open_folder,
+            pick_library_folder,
             pick_open_file,
             resort_playlist,
             play_index,
@@ -2102,7 +3573,12 @@ pub fn run() {
             seek_delta,
             set_speed,
             set_default_playback_speed,
+            set_playback_speed_defaults,
+            set_playlist_default_speed,
+            reset_track_speed_to_default,
             get_transport,
+            get_current_playlist,
+            get_os_media_status,
             save_progress,
             advance_after_eof,
             set_repeat_mode,
@@ -2121,7 +3597,64 @@ pub fn run() {
             mark_session_listened,
             delete_track_file,
             delete_session_files,
+            list_library_roots,
+            add_library_root,
+            remove_library_root,
+            scan_library_root,
+            refresh_library_roots,
+            list_collections,
+            list_series_names,
+            get_collection_detail,
+            find_collection_file_id,
+            find_collection_id_for_path,
+            find_relax_playlist,
+            get_home_summary,
+            play_collection,
+            enqueue_collection,
+            update_collection_metadata,
+            set_collection_kind,
+            mark_collection_listened,
+            list_playlists,
+            create_playlist,
+            add_to_playlist,
+            list_album_groups,
+            add_album_to_playlist,
+            add_collection_to_playlist,
+            create_playlist_from_album,
+            create_playlist_from_collection,
+            list_metadata_groups,
+            add_metadata_group_to_playlist,
+            create_playlist_from_metadata_group,
+            pick_import_folder_to_playlist,
+            rename_playlist,
+            delete_playlist,
+            get_playlist_detail,
+            remove_from_playlist,
+            reorder_playlist_items,
+            reorder_collection_files,
+            update_file_display_title,
+            relink_collection_file,
+            remove_collection_file_from_library,
+            remove_collection_from_library,
+            remove_queue_item,
+            pick_relink_audio_file,
+            fix_collection_track_order,
+            set_playlist_pinned,
+            get_scan_status,
+            add_to_library,
+            lookup_metadata_online,
+            set_online_metadata_enabled,
+            update_library_root,
+            export_db,
+            play_playlist,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app_handle, event| {
+            if matches!(event, tauri::RunEvent::Exit) {
+                if let Some(state) = app_handle.try_state::<AppState>() {
+                    let _ = state.persist_on_close();
+                }
+            }
+        });
 }
