@@ -325,6 +325,40 @@ impl MpvController {
         self.with_conn(|c| c.get_prop_json(name))
     }
 
+    /// Passive transport read for background consumers (e.g. the OS media-key
+    /// sync loop). Returns `None` when mpv is not currently connected or any
+    /// read fails. Unlike [`read_transport_state`], this never spawns a new mpv
+    /// process and never resets the session, so it cannot interfere with the
+    /// foreground engine lifecycle or with manual recovery.
+    pub fn peek_transport(&mut self) -> Option<MpvTransportRead> {
+        let conn = self.conn.as_mut()?;
+        let position_sec = conn
+            .get_prop_f64("time-pos")
+            .ok()?
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .unwrap_or(0.0);
+        let duration_sec = conn
+            .get_prop_f64("duration")
+            .ok()?
+            .filter(|v| v.is_finite() && *v > 0.0);
+        let paused = conn.get_prop_bool("pause").ok()?.unwrap_or(false);
+        let speed = conn
+            .get_prop_f64("speed")
+            .ok()?
+            .filter(|v| v.is_finite())
+            .unwrap_or(1.0);
+        let eof = conn.get_prop_bool("eof-reached").ok()?.unwrap_or(false);
+        let idle = conn.get_prop_bool("idle-active").ok()?.unwrap_or(true);
+        Some(MpvTransportRead {
+            position_sec,
+            duration_sec,
+            paused,
+            speed,
+            eof,
+            idle,
+        })
+    }
+
     /// Read all transport-related mpv properties in one IPC session (one mutex hold from the caller).
     pub fn read_transport_state(&mut self) -> Result<MpvTransportRead, MpvError> {
         self.with_conn(|c| {

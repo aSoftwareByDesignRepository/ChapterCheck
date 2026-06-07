@@ -1,4 +1,6 @@
 mod db;
+#[cfg(target_os = "linux")]
+mod media_controls;
 mod mpv;
 
 use db::{LibraryDb, MediaRow};
@@ -30,6 +32,13 @@ const SESSION_RECENT_JSON: &str = "session.recent_json";
 const PREF_RESUME_PLAYING_ON_LAUNCH: &str = "pref.resume_playing_on_launch";
 const PREF_SCAN_SUBFOLDERS: &str = "pref.scan_subfolders";
 const PREF_UI_LOCALE: &str = "pref.ui_locale";
+
+/// Headphones / MPRIS "Previous" restart the current track when playback is past this point.
+const TRACK_RESTART_SECS: f64 = 3.0;
+
+fn notify_transport_changed(app: &AppHandle) {
+    let _ = app.emit("abp:transport-changed", ());
+}
 
 fn parse_bool_pref(v: Option<String>) -> bool {
     v.map(|s| {
@@ -1048,6 +1057,253 @@ impl InnerState {
         Ok(())
     }
 
+    /// True when mpv has no file loaded (or is not connected).
+    fn mpv_is_idle(&mut self) -> bool {
+        self.mpv
+            .peek_transport()
+            .map(|t| t.idle)
+            .unwrap_or(true)
+    }
+
+    /// Reload the current track when mpv is idle but a playlist index is selected.
+    fn ensure_current_track_loaded(&mut self) -> Result<(), String> {
+        let Some(idx) = self.current_index else {
+            return Ok(());
+        };
+        if !self.mpv_is_idle() {
+            return Ok(());
+        }
+        if idx >= self.playlist.len() {
+            return Ok(());
+        }
+        self.mpv
+            .ensure_running()
+            .map_err(|e: MpvError| e.to_string())?;
+        self.play_path_at_index_with_autoplay(idx, false)
+    }
+
+    /// Start the first queue item when nothing is selected yet.
+    fn start_first_track_if_needed(&mut self) -> Result<(), String> {
+        if self.current_index.is_some() || self.playlist.is_empty() {
+            return Ok(());
+        }
+        self.mpv
+            .ensure_running()
+            .map_err(|e: MpvError| e.to_string())?;
+        self.play_path_at_index(0)
+    }
+
+    /// Resume the current track, restart after EOF, or begin the queue at track 1.
+    fn resume_or_start_playback(&mut self) -> Result<(), String> {
+        if self.current_index.is_none() {
+            return self.start_first_track_if_needed();
+        }
+        self.ensure_current_track_loaded()?;
+        if self.mpv.eof_reached_lenient() {
+            self.mpv
+                .seek(0.0)
+                .map_err(|e: MpvError| e.to_string())?;
+        }
+        self.mpv
+            .set_pause(false)
+            .map_err(|e: MpvError| e.to_string())?;
+        Ok(())
+    }
+
+    /// Play/Pause toggle shared by UI, native menu, and headphone keys.
+    fn toggle_playback_inner(&mut self) -> Result<bool, String> {
+        if self.current_index.is_none() {
+            if self.playlist.is_empty() {
+                return Ok(true);
+            }
+            self.start_first_track_if_needed()?;
+            let _ = self.persist_current();
+            return Ok(false);
+        }
+        self.ensure_current_track_loaded()?;
+        if self.mpv.eof_reached_lenient() {
+            self.mpv
+                .seek(0.0)
+                .map_err(|e: MpvError| e.to_string())?;
+            self.mpv
+                .set_pause(false)
+                .map_err(|e: MpvError| e.to_string())?;
+            let _ = self.persist_current();
+            return Ok(false);
+        }
+        let paused = self
+            .mpv
+            .toggle_pause()
+            .map_err(|e: MpvError| e.to_string())?;
+        let _ = self.persist_current();
+        Ok(paused)
+    }
+
+    /// Hardware "Play" key — same resume/start semantics as [`resume_or_start_playback`].
+    fn media_play_inner(&mut self) -> Result<(), String> {
+        self.resume_or_start_playback()?;
+        let _ = self.persist_current();
+        Ok(())
+    }
+
+    fn skip_next_inner(&mut self) -> Result<(), String> {
+        let len = self.playlist.len();
+        if len == 0 {
+            return Ok(());
+        }
+        if self.current_index.is_none() {
+            return self.start_first_track_if_needed();
+        }
+        let idx = self.current_index.unwrap();
+        let next = match self.repeat_mode {
+            RepeatMode::All => (idx + 1) % len,
+            _ => {
+                let n = idx.saturating_add(1);
+                if n >= len {
+                    return Ok(());
+                }
+                n
+            }
+        };
+        self.persist_current()?;
+        self.play_path_at_index(next)
+    }
+
+    fn skip_prev_inner(&mut self) -> Result<(), String> {
+        let len = self.playlist.len();
+        if len == 0 {
+            return Ok(());
+        }
+        if self.current_index.is_none() {
+            return self.start_first_track_if_needed();
+        }
+        let idx = self.current_index.unwrap();
+        self.ensure_current_track_loaded()?;
+        let pos = self.mpv.time_pos_lenient();
+        if pos > TRACK_RESTART_SECS {
+            self.mpv
+                .seek(0.0)
+                .map_err(|e: MpvError| e.to_string())?;
+            self.mpv
+                .resume()
+                .map_err(|e: MpvError| e.to_string())?;
+            let _ = self.persist_current();
+            return Ok(());
+        }
+        let prev = match self.repeat_mode {
+            RepeatMode::All => (idx + len - 1) % len,
+            _ => {
+                if idx == 0 {
+                    self.mpv
+                        .seek(0.0)
+                        .map_err(|e: MpvError| e.to_string())?;
+                    let _ = self.persist_current();
+                    return Ok(());
+                }
+                idx - 1
+            }
+        };
+        self.persist_current()?;
+        self.play_path_at_index(prev)
+    }
+
+    fn seek_delta_inner(&mut self, delta: f64) -> Result<(), String> {
+        if !delta.is_finite() {
+            return Err("Invalid seek delta".to_string());
+        }
+        if self.current_index.is_none() {
+            self.start_first_track_if_needed()?;
+        }
+        self.ensure_current_track_loaded()?;
+        self.mpv
+            .seek_relative(delta)
+            .map_err(|e: MpvError| e.to_string())?;
+        let _ = self.persist_current();
+        Ok(())
+    }
+
+    fn seek_seconds_inner(&mut self, seconds: f64) -> Result<(), String> {
+        if !seconds.is_finite() || seconds < 0.0 {
+            return Err("Invalid seek position".to_string());
+        }
+        if self.current_index.is_none() {
+            self.start_first_track_if_needed()?;
+        }
+        self.ensure_current_track_loaded()?;
+        self.mpv
+            .seek(seconds)
+            .map_err(|e: MpvError| e.to_string())?;
+        let _ = self.persist_current();
+        Ok(())
+    }
+
+    /// Build the snapshot the OS media controls display. Reads playback state
+    /// passively (never spawns mpv) so it is safe from the background sync loop.
+    #[cfg(target_os = "linux")]
+    fn os_media_snapshot(&mut self) -> media_controls::OsMediaSnapshot {
+        let preview_idx = self.current_index.or_else(|| {
+            if self.playlist.is_empty() {
+                None
+            } else {
+                Some(0)
+            }
+        });
+        let Some(idx) = preview_idx else {
+            return media_controls::OsMediaSnapshot::stopped();
+        };
+        let path = match self.playlist.get(idx) {
+            Some(p) => p.clone(),
+            None => return media_controls::OsMediaSnapshot::stopped(),
+        };
+        let is_active = self.current_index == Some(idx);
+        let key = path.to_string_lossy().into_owned();
+        let title = path
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| key.clone());
+        let (mut duration_sec, artist, album, _listened) = self
+            .db
+            .get_media_display_meta(&key)
+            .ok()
+            .flatten()
+            .unwrap_or((None, None, None, None));
+
+        if !is_active {
+            return media_controls::OsMediaSnapshot {
+                has_track: true,
+                stopped: true,
+                playing: false,
+                position_sec: 0.0,
+                duration_sec,
+                title,
+                artist,
+                album,
+                track_key: String::new(),
+            };
+        }
+
+        let read = self.mpv.peek_transport();
+        let (position_sec, paused, eof, idle, mpv_duration) = match read {
+            Some(r) => (r.position_sec, r.paused, r.eof, r.idle, r.duration_sec),
+            None => (0.0, true, false, true, None),
+        };
+        if duration_sec.is_none() {
+            duration_sec = mpv_duration;
+        }
+
+        media_controls::OsMediaSnapshot {
+            has_track: true,
+            stopped: idle,
+            playing: !paused && !eof && !idle,
+            position_sec: position_sec.max(0.0),
+            duration_sec,
+            title,
+            artist,
+            album,
+            track_key: key,
+        }
+    }
+
     fn app_prefs(&self) -> AppPrefsDto {
         let ui_raw = self.db.get_setting(PREF_UI_LOCALE).ok().flatten();
         let ui_locale = normalize_ui_locale_code(ui_raw.as_deref());
@@ -1219,31 +1475,36 @@ fn handle_native_menu_event(app: &AppHandle, id: &str) {
                 },
             );
         }
-        "abp.playback.toggle" => {
-            if let Err(e) = toggle_pause(app.clone()) {
+        "abp.playback.toggle" => match toggle_pause(app.clone()) {
+            Ok(_) => notify_transport_changed(&app),
+            Err(e) => {
                 let _ = app.emit("abp:user-error", e);
             }
-        }
-        "abp.playback.prev" => {
-            if let Err(e) = skip_prev(app.clone()) {
+        },
+        "abp.playback.prev" => match skip_prev(app.clone()) {
+            Ok(()) => notify_transport_changed(&app),
+            Err(e) => {
                 let _ = app.emit("abp:user-error", e);
             }
-        }
-        "abp.playback.next" => {
-            if let Err(e) = skip_next(app.clone()) {
+        },
+        "abp.playback.next" => match skip_next(app.clone()) {
+            Ok(()) => notify_transport_changed(&app),
+            Err(e) => {
                 let _ = app.emit("abp:user-error", e);
             }
-        }
-        "abp.playback.back30" => {
-            if let Err(e) = seek_delta(app.clone(), -30.0) {
+        },
+        "abp.playback.back30" => match seek_delta(app.clone(), -30.0) {
+            Ok(()) => notify_transport_changed(&app),
+            Err(e) => {
                 let _ = app.emit("abp:user-error", e);
             }
-        }
-        "abp.playback.forward30" => {
-            if let Err(e) = seek_delta(app.clone(), 30.0) {
+        },
+        "abp.playback.forward30" => match seek_delta(app.clone(), 30.0) {
+            Ok(()) => notify_transport_changed(&app),
+            Err(e) => {
                 let _ = app.emit("abp:user-error", e);
             }
-        }
+        },
         "abp.playback.sleep_timer" => {
             let _ = app.emit(
                 "abp:ui-action",
@@ -1431,51 +1692,56 @@ fn play_index(app: AppHandle, index: usize) -> Result<(), String> {
 fn toggle_pause(app: AppHandle) -> Result<bool, String> {
     let state = app.state::<AppState>();
     let mut g = state.inner.lock().map_err(|e| e.to_string())?;
-    let v = g
-        .mpv
-        .toggle_pause()
-        .map_err(|e: MpvError| e.to_string())?;
-    let _ = g.persist_current();
-    Ok(v)
+    g.toggle_playback_inner()
 }
 
 #[tauri::command]
 fn set_paused(app: AppHandle, paused: bool) -> Result<(), String> {
     let state = app.state::<AppState>();
     let mut g = state.inner.lock().map_err(|e| e.to_string())?;
-    g.mpv
-        .set_pause(paused)
-        .map_err(|e: MpvError| e.to_string())?;
-    let _ = g.persist_current();
+    if paused {
+        // Ignore stray Pause/Stop signals when nothing is loaded — do not spawn mpv.
+        if g.current_index.is_some() || !g.mpv_is_idle() {
+            g.mpv
+                .set_pause(true)
+                .map_err(|e: MpvError| e.to_string())?;
+            let _ = g.persist_current();
+        }
+    } else {
+        g.resume_or_start_playback()?;
+        let _ = g.persist_current();
+    }
     Ok(())
+}
+
+/// Hardware "Play" key entry point (resume, or start a loaded queue).
+#[cfg(target_os = "linux")]
+fn media_play(app: AppHandle) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    let mut g = state.inner.lock().map_err(|e| e.to_string())?;
+    g.media_play_inner()
+}
+
+/// Hardware "Play/Pause" toggle key entry point.
+#[cfg(target_os = "linux")]
+fn media_toggle(app: AppHandle) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    let mut g = state.inner.lock().map_err(|e| e.to_string())?;
+    g.toggle_playback_inner().map(|_| ())
 }
 
 #[tauri::command]
 fn seek_seconds(app: AppHandle, seconds: f64) -> Result<(), String> {
-    if !seconds.is_finite() || seconds < 0.0 {
-        return Err("Invalid seek position".to_string());
-    }
     let state = app.state::<AppState>();
     let mut g = state.inner.lock().map_err(|e| e.to_string())?;
-    g.mpv
-        .seek(seconds)
-        .map_err(|e: MpvError| e.to_string())?;
-    let _ = g.persist_current();
-    Ok(())
+    g.seek_seconds_inner(seconds)
 }
 
 #[tauri::command]
 fn seek_delta(app: AppHandle, delta: f64) -> Result<(), String> {
-    if !delta.is_finite() {
-        return Err("Invalid seek delta".to_string());
-    }
     let state = app.state::<AppState>();
     let mut g = state.inner.lock().map_err(|e| e.to_string())?;
-    g.mpv
-        .seek_relative(delta)
-        .map_err(|e: MpvError| e.to_string())?;
-    let _ = g.persist_current();
-    Ok(())
+    g.seek_delta_inner(delta)
 }
 
 #[tauri::command]
@@ -1608,51 +1874,14 @@ fn advance_after_eof(app: AppHandle) -> Result<(), String> {
 fn skip_next(app: AppHandle) -> Result<(), String> {
     let state = app.state::<AppState>();
     let mut g = state.inner.lock().map_err(|e| e.to_string())?;
-    let Some(idx) = g.current_index else {
-        return Err("Nothing is playing".to_string());
-    };
-    let len = g.playlist.len();
-    if len == 0 {
-        return Ok(());
-    }
-    let next = match g.repeat_mode {
-        RepeatMode::All => (idx + 1) % len,
-        _ => {
-            let n = idx.saturating_add(1);
-            if n >= len {
-                return Ok(());
-            }
-            n
-        }
-    };
-    g.persist_current()?;
-    g.play_path_at_index(next)?;
-    Ok(())
+    g.skip_next_inner()
 }
 
 #[tauri::command]
 fn skip_prev(app: AppHandle) -> Result<(), String> {
     let state = app.state::<AppState>();
     let mut g = state.inner.lock().map_err(|e| e.to_string())?;
-    let Some(idx) = g.current_index else {
-        return Err("Nothing is playing".to_string());
-    };
-    let len = g.playlist.len();
-    if len == 0 {
-        return Ok(());
-    }
-    let prev = match g.repeat_mode {
-        RepeatMode::All => (idx + len - 1) % len,
-        _ => {
-            if idx == 0 {
-                return Ok(());
-            }
-            idx - 1
-        }
-    };
-    g.persist_current()?;
-    g.play_path_at_index(prev)?;
-    Ok(())
+    g.skip_prev_inner()
 }
 
 #[tauri::command]
@@ -1852,6 +2081,8 @@ pub fn run() {
                     eprintln!("ChapterCheck: session restore skipped: {e}");
                 }
             }
+            #[cfg(target_os = "linux")]
+            media_controls::spawn(app.handle().clone());
             Ok(())
         })
         .on_window_event(|window, event| {

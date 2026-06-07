@@ -47,12 +47,15 @@ const en: Bundle = {
     "Saved positions are tied to each file's path — if you rename or move a file, its bookmark starts fresh.",
   "sidebar.tipLabel": "Tip:",
   "sidebar.tipBody":
-    "Space plays or pauses when a field is not focused. Use the menu bar above, your desktop menu, or the buttons here — they all do the same thing.",
+    "Space plays or pauses. Headphone and keyboard media keys work too. On-screen buttons, the menu bar, and your desktop menu all use the same controls.",
   "nowPlaying.title": "Now playing",
   "nowPlaying.currentTitle": "Current title",
   "nowPlaying.progressAria": "Playback progress",
   "nowPlaying.seekAria": "Seek",
   "nowPlaying.transportAria": "Transport",
+  "nowPlaying.transportLabel": "Playback controls",
+  "nowPlaying.headphoneHint":
+    "Headphones and your desktop media keys use the same play, skip, and seek actions.",
   "nowPlaying.prevAria": "Previous track",
   "nowPlaying.rewindAria": "Rewind 30 seconds",
   "nowPlaying.playAria": "Play",
@@ -136,6 +139,10 @@ const en: Bundle = {
   "modal.cancel": "Cancel",
   "shortcuts.title": "Keyboard shortcuts",
   "shortcuts.spaceLine": "Play or pause (when not typing in a field)",
+  "shortcuts.seekLine": "Seek 30 seconds back or forward",
+  "shortcuts.skipLine": "Previous or next track",
+  "shortcuts.headphoneLine":
+    "Wired or Bluetooth headset buttons and your desktop media keys follow the same rules as the controls above.",
   "shortcuts.menuLine":
     "Use the Playback menu (here or in your desktop menu bar) for skip, seek, and the sleep timer without the mouse.",
   "about.title": "About",
@@ -210,12 +217,15 @@ const de: Bundle = {
     "Gespeicherte Positionen hängen am Dateipfad — wenn Sie eine Datei umbenennen oder verschieben, beginnt das Lesezeichen neu.",
   "sidebar.tipLabel": "Tipp:",
   "sidebar.tipBody":
-    "Leertaste startet oder pausiert die Wiedergabe, wenn kein Eingabefeld fokussiert ist. Menüleiste, Desktop-Menü oder die Schaltflächen hier — alles dasselbe.",
+    "Leertaste startet oder pausiert. Kopfhörer- und Medientasten funktionieren ebenfalls. Schaltflächen, Menüleiste und Desktop-Menü nutzen dieselben Befehle.",
   "nowPlaying.title": "Aktuelle Wiedergabe",
   "nowPlaying.currentTitle": "Aktueller Titel",
   "nowPlaying.progressAria": "Wiedergabefortschritt",
   "nowPlaying.seekAria": "Springen",
   "nowPlaying.transportAria": "Steuerung",
+  "nowPlaying.transportLabel": "Wiedergabesteuerung",
+  "nowPlaying.headphoneHint":
+    "Kopfhörer und Medientasten des Desktops nutzen dieselben Befehle für Wiedergabe, Suche und Springen.",
   "nowPlaying.prevAria": "Vorheriger Titel",
   "nowPlaying.rewindAria": "30 Sekunden zurück",
   "nowPlaying.playAria": "Wiedergabe",
@@ -300,6 +310,10 @@ const de: Bundle = {
   "modal.cancel": "Abbrechen",
   "shortcuts.title": "Tastenkürzel",
   "shortcuts.spaceLine": "Wiedergabe oder Pause (wenn kein Eingabefeld fokussiert ist)",
+  "shortcuts.seekLine": "30 Sekunden zurück oder vor",
+  "shortcuts.skipLine": "Vorheriger oder nächster Titel",
+  "shortcuts.headphoneLine":
+    "Kabel- oder Bluetooth-Kopfhörer und Medientasten des Desktops folgen denselben Regeln wie die Steuerung oben.",
   "shortcuts.menuLine":
     "Über das Menü „Wiedergabe“ (hier oder in der Desktop-Menüleiste) können Sie ohne Maus springen, suchen und den Schlaf-Timer nutzen.",
   "about.title": "Über",

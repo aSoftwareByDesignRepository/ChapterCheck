@@ -485,6 +485,10 @@ export default function App() {
         if (!isUiActionPayload(ev.payload)) return;
         applyUiAction(ev.payload.action);
       }),
+      listen("abp:transport-changed", () => {
+        if (!mounted) return;
+        void refreshTransport();
+      }),
     ])
       .then((unlisteners) => {
         const all = () => unlisteners.forEach((u) => u());
@@ -569,6 +573,11 @@ export default function App() {
   }, [transport, refreshTransport]);
 
   useEffect(() => {
+    const runTransport = (fn: () => Promise<void>) => {
+      setError(null);
+      void fn().catch((e) => setError(String(e)));
+    };
+
     const onKeyDown = (ev: KeyboardEvent) => {
       if (modalSheet) return;
       const target = ev.target as HTMLElement | null;
@@ -576,16 +585,96 @@ export default function App() {
       if (tag === "input" || tag === "select" || tag === "textarea" || target?.isContentEditable) {
         return;
       }
+
       if (ev.code === "Space") {
         ev.preventDefault();
-        void invoke("toggle_pause")
-          .then(() => refreshTransport())
-          .catch((e) => setError(String(e)));
+        runTransport(async () => {
+          await invoke("toggle_pause");
+          await refreshTransport();
+        });
+        return;
+      }
+
+      const queueReady = (playlist?.items.length ?? 0) > 0;
+      if (!queueReady) return;
+
+      if (ev.code === "ArrowLeft" && !ev.shiftKey && !ev.altKey && !ev.ctrlKey && !ev.metaKey) {
+        ev.preventDefault();
+        runTransport(async () => {
+          await invoke("seek_delta", { delta: -30 });
+          await refreshTransport();
+        });
+        return;
+      }
+
+      if (ev.code === "ArrowRight" && !ev.shiftKey && !ev.altKey && !ev.ctrlKey && !ev.metaKey) {
+        ev.preventDefault();
+        runTransport(async () => {
+          await invoke("seek_delta", { delta: 30 });
+          await refreshTransport();
+        });
+        return;
+      }
+
+      if (
+        ev.code === "ArrowLeft" &&
+        ev.shiftKey &&
+        !ev.altKey &&
+        !ev.ctrlKey &&
+        !ev.metaKey
+      ) {
+        ev.preventDefault();
+        runTransport(async () => {
+          await invoke("skip_prev");
+          await refreshTransport();
+        });
+        return;
+      }
+
+      if (
+        ev.code === "ArrowRight" &&
+        ev.shiftKey &&
+        !ev.altKey &&
+        !ev.ctrlKey &&
+        !ev.metaKey
+      ) {
+        ev.preventDefault();
+        runTransport(async () => {
+          await invoke("skip_next");
+          await refreshTransport();
+        });
+        return;
+      }
+
+      if (ev.code === "MediaTrackPrevious") {
+        ev.preventDefault();
+        runTransport(async () => {
+          await invoke("skip_prev");
+          await refreshTransport();
+        });
+        return;
+      }
+
+      if (ev.code === "MediaTrackNext") {
+        ev.preventDefault();
+        runTransport(async () => {
+          await invoke("skip_next");
+          await refreshTransport();
+        });
+        return;
+      }
+
+      if (ev.code === "MediaPlayPause" || ev.code === "MediaPlay" || ev.code === "MediaPause") {
+        ev.preventDefault();
+        runTransport(async () => {
+          await invoke("toggle_pause");
+          await refreshTransport();
+        });
       }
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [refreshTransport, modalSheet]);
+  }, [refreshTransport, modalSheet, playlist?.items.length]);
 
   const openFolder = async () => {
     setBusy(t("busy.openingFolder"));
@@ -944,7 +1033,10 @@ export default function App() {
 
   const hasQueue = (playlist?.items.length ?? 0) > 0;
   const hasTrack = transport != null && transport.current_index !== null;
-  const canSeekTransport = hasQueue && transport != null && !transport.idle;
+  const canSeekTransport =
+    hasQueue && transport != null && !transport.mpv_error;
+  const canSkipTransport = hasQueue && transport != null && !transport.mpv_error;
+  const canTogglePlayback = hasQueue && transport != null && !transport.mpv_error;
   const allTracksListened = useMemo(() => {
     const items = playlist?.items;
     if (!items || items.length === 0) return false;
@@ -1083,7 +1175,7 @@ export default function App() {
                     type="button"
                     role="menuitem"
                     className="menubar-item"
-                    disabled={!canSeekTransport}
+                    disabled={!canTogglePlayback}
                     onClick={() => {
                       setMenuOpen(null);
                       void togglePause();
@@ -1095,7 +1187,7 @@ export default function App() {
                     type="button"
                     role="menuitem"
                     className="menubar-item"
-                    disabled={!hasTrack}
+                    disabled={!canSkipTransport}
                     onClick={() => {
                       setMenuOpen(null);
                       void skipPrev();
@@ -1107,7 +1199,7 @@ export default function App() {
                     type="button"
                     role="menuitem"
                     className="menubar-item"
-                    disabled={!hasTrack}
+                    disabled={!canSkipTransport}
                     onClick={() => {
                       setMenuOpen(null);
                       void skipNext();
@@ -1439,7 +1531,7 @@ export default function App() {
                 max={progressMax}
                 step={0.25}
                 value={Math.min(sliderValue, progressMax)}
-                disabled={!transport || transport.playlist_len === 0 || transport.idle}
+                disabled={!canSeekTransport}
                 onPointerDown={() => {
                   setSeekUi(position);
                 }}
@@ -1457,39 +1549,66 @@ export default function App() {
               />
             </div>
 
-            <div className="transport" aria-label={t("nowPlaying.transportAria")}>
-              <button className="btn icon-btn" type="button" aria-label={t("nowPlaying.prevAria")} onClick={() => void skipPrev()}>
-                <IconSkipPrev />
-              </button>
-              <button
-                className="btn btn-skip"
-                type="button"
-                aria-label={t("nowPlaying.rewindAria")}
-                disabled={!canSeekTransport}
-                onClick={() => void seekDelta(-30)}
+            <div className="transport-block">
+              <p className="transport-block-label" id="transport-controls-label">
+                {t("nowPlaying.transportLabel")}
+              </p>
+              <div
+                className="transport"
+                role="group"
+                aria-labelledby="transport-controls-label"
               >
-                −30s
-              </button>
-              <button
-                className="btn btn-primary icon-btn icon-btn--play"
-                type="button"
-                aria-label={transport?.paused ? t("nowPlaying.playAria") : t("nowPlaying.pauseAria")}
-                onClick={() => void togglePause()}
-              >
-                {transport?.paused ? <IconPlay /> : <IconPause />}
-              </button>
-              <button
-                className="btn btn-skip"
-                type="button"
-                aria-label={t("nowPlaying.forwardAria")}
-                disabled={!canSeekTransport}
-                onClick={() => void seekDelta(30)}
-              >
-                +30s
-              </button>
-              <button className="btn icon-btn" type="button" aria-label={t("nowPlaying.nextAria")} onClick={() => void skipNext()}>
-                <IconSkipNext />
-              </button>
+                <button
+                  className="btn icon-btn"
+                  type="button"
+                  aria-label={t("nowPlaying.prevAria")}
+                  disabled={!canSkipTransport}
+                  onClick={() => void skipPrev()}
+                >
+                  <IconSkipPrev />
+                </button>
+                <button
+                  className="btn btn-skip"
+                  type="button"
+                  aria-label={t("nowPlaying.rewindAria")}
+                  disabled={!canSeekTransport}
+                  onClick={() => void seekDelta(-30)}
+                >
+                  −30s
+                </button>
+                <button
+                  className="btn btn-primary icon-btn icon-btn--play"
+                  type="button"
+                  aria-label={
+                    !hasTrack || transport?.paused || transport?.eof
+                      ? t("nowPlaying.playAria")
+                      : t("nowPlaying.pauseAria")
+                  }
+                  disabled={!canTogglePlayback}
+                  onClick={() => void togglePause()}
+                >
+                  {!hasTrack || transport?.paused || transport?.eof ? <IconPlay /> : <IconPause />}
+                </button>
+                <button
+                  className="btn btn-skip"
+                  type="button"
+                  aria-label={t("nowPlaying.forwardAria")}
+                  disabled={!canSeekTransport}
+                  onClick={() => void seekDelta(30)}
+                >
+                  +30s
+                </button>
+                <button
+                  className="btn icon-btn"
+                  type="button"
+                  aria-label={t("nowPlaying.nextAria")}
+                  disabled={!canSkipTransport}
+                  onClick={() => void skipNext()}
+                >
+                  <IconSkipNext />
+                </button>
+              </div>
+              <p className="transport-hint">{t("nowPlaying.headphoneHint")}</p>
             </div>
 
             {chapters.length > 0 ? (
@@ -1816,6 +1935,14 @@ export default function App() {
                   <li>
                     <kbd className="kbd">Space</kbd> {t("shortcuts.spaceLine")}
                   </li>
+                  <li>
+                    <kbd className="kbd">←</kbd> / <kbd className="kbd">→</kbd> {t("shortcuts.seekLine")}
+                  </li>
+                  <li>
+                    <kbd className="kbd">Shift</kbd> + <kbd className="kbd">←</kbd> /{" "}
+                    <kbd className="kbd">→</kbd> {t("shortcuts.skipLine")}
+                  </li>
+                  <li>{t("shortcuts.headphoneLine")}</li>
                   <li>{t("shortcuts.menuLine")}</li>
                 </ul>
               </>

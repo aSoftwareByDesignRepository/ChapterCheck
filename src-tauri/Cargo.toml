@@ -28,6 +28,12 @@ natord = "1.0"
 directories = "5"
 rand = "0.8"
 
+# OS media-key / headphone (MPRIS on Linux via D-Bus) integration.
+# Default backend is `dbus-crossroads`, which uses the native libdbus that is
+# already linked transitively through `tao`, so no extra system dependency.
+[target.'cfg(target_os = "linux")'.dependencies]
+souvlaki = "0.8"
+
 [profile.release]
 codegen-units = 1
 lto = true
