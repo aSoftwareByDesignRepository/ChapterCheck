@@ -255,15 +255,6 @@ impl MpvController {
         out
     }
 
-    pub fn load_file(&mut self, path: &str, start: f64) -> Result<(), MpvError> {
-        self.load_file_controlled(path, start, true)
-    }
-
-    /// Load file and leave playback **paused** at `start` (no audible start).
-    pub fn load_file_start_paused(&mut self, path: &str, start: f64) -> Result<(), MpvError> {
-        self.load_file_controlled(path, start, false)
-    }
-
     pub fn load_file_controlled(&mut self, path: &str, start: f64, autoplay: bool) -> Result<(), MpvError> {
         self.with_conn(|c| c.loadfile_controlled(path, start, autoplay))
     }

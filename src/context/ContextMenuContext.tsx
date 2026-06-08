@@ -6,6 +6,7 @@ import {
   useLayoutEffect,
   useRef,
   useState,
+  type KeyboardEvent as ReactKeyboardEvent,
   type MouseEvent,
   type ReactNode,
 } from "react";
@@ -43,9 +44,16 @@ export function useContextMenu() {
   return ctx;
 }
 
+function actionableItems(items: ContextMenuEntry[]) {
+  return items.filter((it): it is Extract<ContextMenuEntry, { id: string }> => it.type !== "separator");
+}
+
 function ContextMenuPanel({ state, onClose }: { state: MenuState; onClose: () => void }) {
   const ref = useRef<HTMLDivElement>(null);
   const [pos, setPos] = useState({ left: state.x, top: state.y });
+  const [focusIndex, setFocusIndex] = useState(0);
+
+  const entries = actionableItems(state.items);
 
   useLayoutEffect(() => {
     const el = ref.current;
@@ -61,6 +69,14 @@ function ContextMenuPanel({ state, onClose }: { state: MenuState; onClose: () =>
     }
     setPos({ left, top });
   }, [state.x, state.y, state.items]);
+
+  useEffect(() => {
+    setFocusIndex(0);
+    const first = ref.current?.querySelector<HTMLButtonElement>(
+      'button[role="menuitem"]:not([disabled])',
+    );
+    first?.focus();
+  }, [state.items]);
 
   useEffect(() => {
     const onPointer = (e: PointerEvent) => {
@@ -81,21 +97,63 @@ function ContextMenuPanel({ state, onClose }: { state: MenuState; onClose: () =>
     };
   }, [onClose]);
 
+  const onMenuKeyDown = (e: ReactKeyboardEvent<HTMLDivElement>) => {
+    if (entries.length === 0) return;
+    if (e.key === "ArrowDown") {
+      e.preventDefault();
+      setFocusIndex((i) => {
+        let next = (i + 1) % entries.length;
+        while (entries[next]?.disabled && next !== i) {
+          next = (next + 1) % entries.length;
+        }
+        return next;
+      });
+    } else if (e.key === "ArrowUp") {
+      e.preventDefault();
+      setFocusIndex((i) => {
+        let next = (i - 1 + entries.length) % entries.length;
+        while (entries[next]?.disabled && next !== i) {
+          next = (next - 1 + entries.length) % entries.length;
+        }
+        return next;
+      });
+    } else if (e.key === "Home") {
+      e.preventDefault();
+      setFocusIndex(0);
+    } else if (e.key === "End") {
+      e.preventDefault();
+      setFocusIndex(entries.length - 1);
+    }
+  };
+
+  useEffect(() => {
+    const buttons = ref.current?.querySelectorAll<HTMLButtonElement>(
+      'button[role="menuitem"]:not([disabled])',
+    );
+    buttons?.[focusIndex]?.focus();
+  }, [focusIndex, state.items]);
+
+  let actionableIdx = -1;
+
   return createPortal(
     <div
       ref={ref}
       className="context-menu"
       role="menu"
       style={{ left: pos.left, top: pos.top }}
+      onKeyDown={onMenuKeyDown}
     >
-      {state.items.map((item, i) =>
-        item.type === "separator" ? (
-          <div key={`sep-${i}`} className="context-menu-sep" role="separator" />
-        ) : (
+      {state.items.map((item, i) => {
+        if (item.type === "separator") {
+          return <div key={`sep-${i}`} className="context-menu-sep" role="separator" />;
+        }
+        actionableIdx += 1;
+        return (
           <button
             key={item.id}
             type="button"
             role="menuitem"
+            tabIndex={actionableIdx === focusIndex ? 0 : -1}
             className={`context-menu-item${item.danger ? " context-menu-item--danger" : ""}`}
             disabled={item.disabled}
             onClick={() => {
@@ -106,8 +164,8 @@ function ContextMenuPanel({ state, onClose }: { state: MenuState; onClose: () =>
           >
             {item.label}
           </button>
-        ),
-      )}
+        );
+      })}
     </div>,
     document.body,
   );
@@ -119,7 +177,7 @@ export function ContextMenuProvider({ children }: { children: ReactNode }) {
   const closeContextMenu = useCallback(() => setState(null), []);
 
   const openContextMenuAt = useCallback((x: number, y: number, items: ContextMenuEntry[]) => {
-    const actionable = items.filter((it) => it.type !== "separator");
+    const actionable = actionableItems(items);
     if (actionable.length === 0) return;
     setState({ x, y, items });
   }, []);

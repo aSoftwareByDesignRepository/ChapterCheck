@@ -17,7 +17,7 @@ type ConfirmCfg = {
 };
 
 type Props = {
-  onPlayPlaylist: (id: number) => void;
+  onPlayPlaylist: (id: number, shuffle?: boolean) => void;
   openConfirm: (cfg: ConfirmCfg) => void;
   onLibraryChanged?: () => void;
 };
@@ -84,9 +84,15 @@ export function PlaylistsView({ onPlayPlaylist, openConfirm, onLibraryChanged }:
     },
     {
       id: "play",
-      label: t("home.play"),
+      label: t("playlists.playInOrder"),
       disabled: pl.track_count === 0,
-      onClick: () => onPlayPlaylist(pl.id),
+      onClick: () => onPlayPlaylist(pl.id, false),
+    },
+    {
+      id: "shuffle",
+      label: t("catalog.shuffleAll"),
+      disabled: pl.track_count < 2,
+      onClick: () => onPlayPlaylist(pl.id, true),
     },
     {
       id: "pin",
@@ -208,6 +214,7 @@ export function PlaylistsView({ onPlayPlaylist, openConfirm, onLibraryChanged }:
                 disabled={pl.track_count === 0}
                 aria-label={t("home.play")}
                 onClick={() => onPlayPlaylist(pl.id)}
+                title={t("playlists.playInOrder")}
               >
                 <IconPlaySm />
               </button>

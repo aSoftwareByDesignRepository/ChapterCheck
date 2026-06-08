@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import type { MouseEvent } from "react";
 import { IconPlaySm, IconQueueAdd } from "./PlayerIcons";
 import { CoverImage } from "./CoverImage";
 import { useContextMenu, type ContextMenuEntry } from "../context/ContextMenuContext";
@@ -10,12 +11,15 @@ import { coverUrl } from "../utils/coverUrl";
 
 type Props = {
   item: CollectionSummaryDto;
-  onPlay: (id: number, mode: "continue" | "start") => void;
+  onPlay: (id: number, mode: "continue" | "start", shuffle?: boolean) => void;
   onAddToQueue?: (id: number, position: "next" | "end") => void;
   onOpen: (id: number) => void;
   onChanged?: () => void;
   onRemoveCollection?: (id: number, title: string) => void;
   featured?: boolean;
+  selectMode?: boolean;
+  selected?: boolean;
+  onSelectToggle?: (id: number) => void;
 };
 
 export function MediaRow({
@@ -26,6 +30,9 @@ export function MediaRow({
   onChanged,
   onRemoveCollection,
   featured,
+  selectMode = false,
+  selected = false,
+  onSelectToggle,
 }: Props) {
   const { t } = useI18n();
   const { openContextMenu } = useContextMenu();
@@ -63,9 +70,9 @@ export function MediaRow({
       onRemoveCollection(item.id, item.title);
       return;
     }
-    void invoke("remove_collection_from_library", { collectionId: item.id }).then(() => {
-      onChanged?.();
-    });
+    void invoke("remove_collection_from_library", { collectionId: item.id })
+      .then(() => onChanged?.())
+      .catch(() => onChanged?.());
   };
 
   const contextItems = (): ContextMenuEntry[] => {
@@ -81,6 +88,13 @@ export function MediaRow({
           id: "start",
           label: t("contextMenu.playFromStart"),
           onClick: () => onPlay(item.id, "start"),
+        });
+      }
+      if (item.kind === "music" && item.playable_file_count >= 2) {
+        items.push({
+          id: "shuffle",
+          label: t("catalog.shuffleAll"),
+          onClick: () => onPlay(item.id, "start", true),
         });
       }
       if (onAddToQueue) {
@@ -129,12 +143,30 @@ export function MediaRow({
     return items;
   };
 
+  const openRowMenu = (event: MouseEvent<HTMLElement>) => {
+    const base = contextItems();
+    const items = needsAttention
+      ? base
+      : appendPlaylistContextEntries(base, {
+          collectionId: item.id,
+          title: item.title,
+        });
+    openContextMenu(event, items);
+  };
+
   const rowClass = [
     "media-row",
     featured ? "media-row--featured" : "",
     status === "drive_away" ? "media-row--away" : "",
     status === "tracks_missing" || status === "empty" ? "media-row--missing" : "",
-    onAddToQueue ? "" : "media-row--no-queue",
+    selectMode
+      ? "media-row--select"
+      : needsAttention && onRemoveCollection
+        ? "media-row--attention"
+        : onAddToQueue
+          ? ""
+          : "media-row--no-queue",
+    selectMode && selected ? "media-row--selected" : "",
   ]
     .filter(Boolean)
     .join(" ");
@@ -160,19 +192,39 @@ export function MediaRow({
         openContextMenu(e, items);
       }}
     >
-      <button
-        type="button"
-        className="media-row-play"
-        aria-label={needsAttention ? t("catalog.fixMissingFiles") : playLabel}
-        onClick={handlePlay}
-      >
-        <IconPlaySm />
-      </button>
+      {selectMode ? (
+        <label className="media-row-select">
+          <input
+            type="checkbox"
+            className="media-row-select-input"
+            checked={selected}
+            aria-label={t("catalog.selectItem", { title: item.title })}
+            onChange={() => onSelectToggle?.(item.id)}
+          />
+        </label>
+      ) : (
+        <button
+          type="button"
+          className="media-row-play"
+          aria-label={
+            needsAttention ? t("catalog.openToFixMissing", { title: item.title }) : playLabel
+          }
+          onClick={handlePlay}
+        >
+          <IconPlaySm />
+        </button>
+      )}
 
       <button
         type="button"
         className="media-row-main"
-        onClick={handlePlay}
+        onClick={() => {
+          if (selectMode) {
+            onSelectToggle?.(item.id);
+            return;
+          }
+          handlePlay();
+        }}
       >
         <div className="media-row-cover" aria-hidden="true">
           <CoverImage src={src} kind={item.kind} className="media-row-cover-img" />
@@ -180,6 +232,11 @@ export function MediaRow({
         <div className="media-row-text">
           <span className="media-row-title">{item.title}</span>
           {item.subtitle ? <span className="media-row-sub">{item.subtitle}</span> : null}
+          {item.kind === "music" && item.playable_file_count > 0 ? (
+            <span className="media-row-sub media-row-sub--tracks">
+              {t("catalog.trackCount", { count: item.playable_file_count })}
+            </span>
+          ) : null}
           {needsAttention ? (
             <span className={badgeClass}>{statusBadge()}</span>
           ) : item.listened ? (
@@ -197,7 +254,17 @@ export function MediaRow({
         ) : null}
       </button>
 
-      {onAddToQueue ? (
+      {!selectMode && needsAttention && onRemoveCollection ? (
+        <button
+          type="button"
+          className="media-row-remove"
+          aria-label={t("catalog.removeCollection")}
+          title={t("catalog.removeCollection")}
+          onClick={() => onRemoveCollection(item.id, item.title)}
+        >
+          {t("catalog.removeShort")}
+        </button>
+      ) : !selectMode && onAddToQueue ? (
         <button
           type="button"
           className="media-row-queue"
@@ -213,8 +280,9 @@ export function MediaRow({
       <button
         type="button"
         className="media-row-more"
-        aria-label={t("media.details", { title: item.title })}
-        onClick={() => onOpen(item.id)}
+        aria-label={t("media.moreActions", { title: item.title })}
+        aria-haspopup="menu"
+        onClick={(e) => openRowMenu(e)}
       >
         <span aria-hidden="true">⋯</span>
       </button>

@@ -1,5 +1,23 @@
 export type AppView = "home" | "audiobooks" | "music" | "playlists" | "library" | "nowPlaying";
 
+export type CollectionListPageDto = {
+  items: CollectionSummaryDto[];
+  total: number;
+  offset: number;
+  limit: number;
+};
+
+export type SetCollectionsKindFailure = {
+  collection_id: number;
+  title: string;
+  error: string;
+};
+
+export type SetCollectionsKindResult = {
+  updated: number;
+  failures: SetCollectionsKindFailure[];
+};
+
 export type CollectionSummaryDto = {
   id: number;
   root_id: number;
@@ -77,6 +95,18 @@ export type LibraryRootDto = {
   last_scan_at: number | null;
   last_scan_status: string | null;
   collection_count: number;
+  track_count: number;
+};
+
+export type ScanStatusDto = {
+  root_id: number;
+  scanning: boolean;
+  last_scan_at: number | null;
+  last_scan_status: string | null;
+  collections_found: number;
+  collections_total: number;
+  tracks_total: number;
+  tracks_updated: number;
 };
 
 export type PlaylistSummaryDto = {

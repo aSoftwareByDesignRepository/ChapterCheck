@@ -41,6 +41,7 @@ const SESSION_LAST_PLAYING: &str = "session.last_playing";
 const SESSION_RECENT_JSON: &str = "session.recent_json";
 const PREF_RESUME_PLAYING_ON_LAUNCH: &str = "pref.resume_playing_on_launch";
 const PREF_SCAN_SUBFOLDERS: &str = "pref.scan_subfolders";
+const PREF_PLAYLIST_SHUFFLE: &str = "pref.playlist_shuffle";
 const PREF_UI_LOCALE: &str = "pref.ui_locale";
 
 /// Headphones / MPRIS "Previous" restart the current track when playback is past this point.
@@ -61,6 +62,16 @@ fn parse_bool_pref(v: Option<String>) -> bool {
         t == "1" || t.eq_ignore_ascii_case("true") || t.eq_ignore_ascii_case("yes")
     })
     .unwrap_or(false)
+}
+
+fn resolve_playlist_shuffle(shuffle: Option<bool>, db: &LibraryDb) -> bool {
+    shuffle.unwrap_or_else(|| {
+        parse_bool_pref(
+            db.get_setting(PREF_PLAYLIST_SHUFFLE)
+                .ok()
+                .flatten(),
+        )
+    })
 }
 
 fn parse_chapter_list_value(data: &Value) -> Vec<ChapterDto> {
@@ -240,6 +251,7 @@ pub struct ChapterDto {
 pub struct AppPrefsDto {
     pub resume_playing_on_launch: bool,
     pub scan_subfolders: bool,
+    pub playlist_shuffle_on_play: bool,
     pub online_metadata_enabled: bool,
     /// `"en"` or `"de"`.
     pub ui_locale: String,
@@ -258,6 +270,10 @@ pub struct EnqueueCollectionResult {
     pub playlist: PlaylistDto,
     pub tracks_added: usize,
     pub collection_title: String,
+    /// True when there was no active queue and a new session was created.
+    pub session_started: bool,
+    /// True when playback began automatically (new session + play-next).
+    pub autoplay_started: bool,
 }
 
 struct InnerState {
@@ -281,6 +297,17 @@ struct InnerState {
 
 pub struct AppState {
     inner: Mutex<InnerState>,
+    scan_in_progress: AtomicBool,
+}
+
+fn with_scan_flag<R>(app: &AppHandle, f: impl FnOnce() -> Result<R, String>) -> Result<R, String> {
+    let state = app.state::<AppState>();
+    state.scan_in_progress.store(true, Ordering::SeqCst);
+    let _ = app.emit("abp:scan-status", true);
+    let result = f();
+    state.scan_in_progress.store(false, Ordering::SeqCst);
+    let _ = app.emit("abp:scan-status", false);
+    result
 }
 
 impl AppState {
@@ -323,6 +350,7 @@ impl AppState {
                 active_playlist_id,
                 playback_kind,
             }),
+            scan_in_progress: AtomicBool::new(false),
         }
     }
 
@@ -881,12 +909,22 @@ impl InnerState {
                 None,
                 &detail.kind,
             );
+            let autoplay_started = position == "next";
+            if autoplay_started {
+                self.mpv
+                    .ensure_running()
+                    .map_err(|e: MpvError| e.to_string())?;
+                self.play_path_at_index_with_autoplay(0, true)?;
+                self.touch_session_track_after_play()?;
+            }
             self.persist_session_meta_checkpoint()?;
             let playlist = self.build_playlist_dto()?;
             return Ok(EnqueueCollectionResult {
                 playlist,
                 tracks_added: paths.len(),
                 collection_title: detail.title,
+                session_started: true,
+                autoplay_started,
             });
         }
 
@@ -920,6 +958,118 @@ impl InnerState {
             playlist,
             tracks_added: added,
             collection_title: detail.title,
+            session_started: false,
+            autoplay_started: false,
+        })
+    }
+
+    fn play_kind_inner(
+        &mut self,
+        kind: &str,
+        filter: Option<&str>,
+        search: Option<&str>,
+        shuffle: bool,
+        autoplay: bool,
+    ) -> Result<PlaylistDto, String> {
+        let mut paths =
+            CatalogService::new(&mut self.db).kind_playback_paths(kind, filter, search)?;
+        if shuffle && paths.len() >= 2 {
+            paths.shuffle(&mut thread_rng());
+        }
+        self.mpv.ensure_running().map_err(|e: MpvError| e.to_string())?;
+        let _ = self.persist_current();
+        let root = paths[0]
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| paths[0].clone());
+        let root = InnerState::canonicalize_allowed(&root)?;
+        self.set_session_paths_ordered(root, paths, false, None, None, kind);
+        self.play_path_at_index_with_autoplay(0, autoplay)?;
+        self.touch_session_track_after_play()?;
+        self.persist_session_meta_checkpoint()?;
+        self.build_playlist_dto()
+    }
+
+    fn enqueue_kind_inner(
+        &mut self,
+        kind: &str,
+        filter: Option<&str>,
+        search: Option<&str>,
+        position: &str,
+    ) -> Result<EnqueueCollectionResult, String> {
+        let mut paths =
+            CatalogService::new(&mut self.db).kind_playback_paths(kind, filter, search)?;
+        paths = paths.into_iter().filter(|p| p.exists()).collect();
+        if paths.is_empty() {
+            return Err("No playable tracks in your library".into());
+        }
+
+        let source_title = match kind {
+            "music" => "Music",
+            "audiobook" => "Audiobooks",
+            _ => kind,
+        }
+        .to_string();
+
+        let has_active_queue = self.session_root.is_some() && !self.playlist.is_empty();
+        if !has_active_queue {
+            let root = paths[0]
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| paths[0].clone());
+            let root = InnerState::canonicalize_allowed(&root)?;
+            self.set_session_paths_ordered(root, paths.clone(), false, None, None, kind);
+            let autoplay_started = position == "next";
+            if autoplay_started {
+                self.mpv
+                    .ensure_running()
+                    .map_err(|e: MpvError| e.to_string())?;
+                self.play_path_at_index_with_autoplay(0, true)?;
+                self.touch_session_track_after_play()?;
+            }
+            self.persist_session_meta_checkpoint()?;
+            let playlist = self.build_playlist_dto()?;
+            return Ok(EnqueueCollectionResult {
+                playlist,
+                tracks_added: paths.len(),
+                collection_title: source_title,
+                session_started: true,
+                autoplay_started,
+            });
+        }
+
+        let existing: HashSet<PathBuf> = self.playlist.iter().cloned().collect();
+        paths.retain(|p| !existing.contains(p));
+        if paths.is_empty() {
+            return Err("This item is already in your queue".into());
+        }
+
+        let insert_at = match position {
+            "next" => self
+                .current_index
+                .map(|i| i.saturating_add(1))
+                .unwrap_or(0),
+            _ => self.playlist.len(),
+        };
+        let added = paths.len();
+        for (offset, path) in paths.iter().enumerate() {
+            self.playlist.insert(insert_at + offset, path.clone());
+            self.allowed_files.insert(path.clone());
+        }
+        if let Some(cur) = self.current_index {
+            if insert_at <= cur {
+                self.current_index = Some(cur + added);
+            }
+        }
+
+        self.persist_session_meta_checkpoint()?;
+        let playlist = self.build_playlist_dto()?;
+        Ok(EnqueueCollectionResult {
+            playlist,
+            tracks_added: added,
+            collection_title: source_title,
+            session_started: false,
+            autoplay_started: false,
         })
     }
 
@@ -1867,6 +2017,12 @@ impl InnerState {
                     .flatten(),
             ),
             scan_subfolders: self.scan_subfolders,
+            playlist_shuffle_on_play: parse_bool_pref(
+                self.db
+                    .get_setting(PREF_PLAYLIST_SHUFFLE)
+                    .ok()
+                    .flatten(),
+            ),
             online_metadata_enabled: parse_bool_pref(
                 self.db
                     .get_setting(PREF_ONLINE_METADATA)
@@ -2648,9 +2804,11 @@ fn list_library_roots(app: AppHandle) -> Result<Vec<catalog::LibraryRootDto>, St
 
 #[tauri::command]
 fn add_library_root(app: AppHandle, input: AddLibraryRootInput) -> Result<catalog::LibraryRootDto, String> {
-    let state = app.state::<AppState>();
-    let mut g = state.inner.lock().map_err(|e| e.to_string())?;
-    CatalogService::new(&mut g.db).add_root(input)
+    with_scan_flag(&app, || {
+        let state = app.state::<AppState>();
+        let mut g = state.inner.lock().map_err(|e| e.to_string())?;
+        CatalogService::new(&mut g.db).add_root(input)
+    })
 }
 
 #[tauri::command]
@@ -2662,16 +2820,20 @@ fn remove_library_root(app: AppHandle, root_id: i64) -> Result<(), String> {
 
 #[tauri::command]
 fn scan_library_root(app: AppHandle, root_id: i64) -> Result<catalog::ScanStatusDto, String> {
-    let state = app.state::<AppState>();
-    let mut g = state.inner.lock().map_err(|e| e.to_string())?;
-    CatalogService::new(&mut g.db).scan_root(root_id)
+    with_scan_flag(&app, || {
+        let state = app.state::<AppState>();
+        let mut g = state.inner.lock().map_err(|e| e.to_string())?;
+        CatalogService::new(&mut g.db).scan_root(root_id)
+    })
 }
 
 #[tauri::command]
 fn refresh_library_roots(app: AppHandle) -> Result<(), String> {
-    let state = app.state::<AppState>();
-    let mut g = state.inner.lock().map_err(|e| e.to_string())?;
-    CatalogService::new(&mut g.db).refresh_roots_availability()
+    with_scan_flag(&app, || {
+        let state = app.state::<AppState>();
+        let mut g = state.inner.lock().map_err(|e| e.to_string())?;
+        CatalogService::new(&mut g.db).refresh_roots_availability()
+    })
 }
 
 #[tauri::command]
@@ -2683,7 +2845,7 @@ fn list_collections(
     series: Option<String>,
     limit: Option<i64>,
     offset: Option<i64>,
-) -> Result<Vec<catalog::CollectionSummaryDto>, String> {
+) -> Result<catalog::CollectionListPageDto, String> {
     let state = app.state::<AppState>();
     let mut g = state.inner.lock().map_err(|e| e.to_string())?;
     CatalogService::new(&mut g.db).list_collections(
@@ -2727,8 +2889,9 @@ fn find_relax_playlist(app: AppHandle) -> Result<Option<i64>, String> {
 #[tauri::command]
 fn get_home_summary(app: AppHandle) -> Result<catalog::HomeSummaryDto, String> {
     let state = app.state::<AppState>();
+    let scanning = state.scan_in_progress.load(Ordering::SeqCst);
     let mut g = state.inner.lock().map_err(|e| e.to_string())?;
-    CatalogService::new(&mut g.db).get_home_summary()
+    CatalogService::new(&mut g.db).get_home_summary(scanning)
 }
 
 #[tauri::command]
@@ -2763,6 +2926,53 @@ fn enqueue_collection(
 }
 
 #[tauri::command]
+fn play_kind(
+    app: AppHandle,
+    kind: String,
+    filter: Option<String>,
+    search: Option<String>,
+    shuffle: Option<bool>,
+) -> Result<PlaylistDto, String> {
+    catalog::validate_playback_kind(&kind)?;
+    let state = app.state::<AppState>();
+    let dto = {
+        let mut g = state.inner.lock().map_err(|e| e.to_string())?;
+        g.play_kind_inner(
+            &kind,
+            filter.as_deref(),
+            search.as_deref(),
+            shuffle.unwrap_or(false),
+            true,
+        )?
+    };
+    let _ = app.emit("abp:playlist-update", &dto);
+    Ok(dto)
+}
+
+#[tauri::command]
+fn enqueue_kind(
+    app: AppHandle,
+    kind: String,
+    filter: Option<String>,
+    search: Option<String>,
+    position: Option<String>,
+) -> Result<EnqueueCollectionResult, String> {
+    catalog::validate_playback_kind(&kind)?;
+    let state = app.state::<AppState>();
+    let result = {
+        let mut g = state.inner.lock().map_err(|e| e.to_string())?;
+        g.enqueue_kind_inner(
+            &kind,
+            filter.as_deref(),
+            search.as_deref(),
+            position.as_deref().unwrap_or("end"),
+        )?
+    };
+    let _ = app.emit("abp:playlist-update", &result.playlist);
+    Ok(result)
+}
+
+#[tauri::command]
 fn update_collection_metadata(
     app: AppHandle,
     collection_id: i64,
@@ -2773,15 +2983,15 @@ fn update_collection_metadata(
     CatalogService::new(&mut g.db).update_collection_metadata(collection_id, metadata)
 }
 
-#[tauri::command]
-fn set_collection_kind(app: AppHandle, collection_id: i64, kind: String) -> Result<(), String> {
-    let state = app.state::<AppState>();
-    let mut g = state.inner.lock().map_err(|e| e.to_string())?;
-    CatalogService::new(&mut g.db).set_collection_kind(collection_id, &kind)?;
+fn apply_collection_kind_playback_effects(
+    g: &mut InnerState,
+    collection_id: i64,
+    kind: &str,
+) -> Result<(), String> {
     let playing_collection = g.resolved_collection_id() == Some(collection_id);
     if playing_collection {
-        g.playback_kind = kind.clone();
-        let _ = g.db.set_setting(SESSION_PLAYBACK_KIND, &kind);
+        g.playback_kind = kind.to_string();
+        let _ = g.db.set_setting(SESSION_PLAYBACK_KIND, kind);
     }
     let paths = CatalogService::new(&mut g.db).collection_file_paths(collection_id)?;
     let now = InnerState::now_unix();
@@ -2798,6 +3008,56 @@ fn set_collection_kind(app: AppHandle, collection_id: i64, kind: String) -> Resu
         }
     }
     Ok(())
+}
+
+#[tauri::command]
+fn set_collection_kind(app: AppHandle, collection_id: i64, kind: String) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    let mut g = state.inner.lock().map_err(|e| e.to_string())?;
+    CatalogService::new(&mut g.db).set_collection_kind(collection_id, &kind)?;
+    apply_collection_kind_playback_effects(&mut g, collection_id, &kind)?;
+    Ok(())
+}
+
+#[tauri::command]
+fn set_collections_kind(
+    app: AppHandle,
+    collection_ids: Vec<i64>,
+    kind: String,
+) -> Result<catalog::SetCollectionsKindResult, String> {
+    let state = app.state::<AppState>();
+    let mut g = state.inner.lock().map_err(|e| e.to_string())?;
+    let result = CatalogService::new(&mut g.db).set_collections_kind(&collection_ids, &kind)?;
+    for &id in &collection_ids {
+        if result
+            .failures
+            .iter()
+            .any(|failure| failure.collection_id == id)
+        {
+            continue;
+        }
+        let _ = apply_collection_kind_playback_effects(&mut g, id, &kind);
+    }
+    Ok(result)
+}
+
+#[tauri::command]
+fn list_collection_ids(
+    app: AppHandle,
+    kind: Option<String>,
+    filter: Option<String>,
+    search: Option<String>,
+) -> Result<Vec<i64>, String> {
+    if let Some(ref k) = kind {
+        catalog::validate_playback_kind(k)?;
+    }
+    let state = app.state::<AppState>();
+    let mut g = state.inner.lock().map_err(|e| e.to_string())?;
+    CatalogService::new(&mut g.db).list_collection_ids(
+        kind.as_deref(),
+        filter.as_deref(),
+        search.as_deref(),
+    )
 }
 
 #[tauri::command]
@@ -3247,8 +3507,16 @@ fn play_playlist(
         let kind = "music".to_string();
         (paths, kind)
     };
+    if paths.is_empty() {
+        return Err("This playlist has no playable tracks".into());
+    }
+    let shuffle_play = {
+        let state = app.state::<AppState>();
+        let g = state.inner.lock().map_err(|e| e.to_string())?;
+        resolve_playlist_shuffle(shuffle, &g.db)
+    };
     let mut paths = paths;
-    if shuffle.unwrap_or(true) && paths.len() >= 2 {
+    if shuffle_play && paths.len() >= 2 {
         paths.shuffle(&mut thread_rng());
     }
     let dto = {
@@ -3381,6 +3649,16 @@ fn set_resume_playing_on_launch(app: AppHandle, enabled: bool) -> Result<AppPref
             .set_setting(SESSION_LAST_PLAYING, "0")
             .map_err(|e| e.to_string())?;
     }
+    Ok(g.app_prefs())
+}
+
+#[tauri::command]
+fn set_playlist_shuffle_on_play(app: AppHandle, enabled: bool) -> Result<AppPrefsDto, String> {
+    let state = app.state::<AppState>();
+    let mut g = state.inner.lock().map_err(|e| e.to_string())?;
+    g.db
+        .set_setting(PREF_PLAYLIST_SHUFFLE, if enabled { "1" } else { "0" })
+        .map_err(|e| e.to_string())?;
     Ok(g.app_prefs())
 }
 
@@ -3589,6 +3867,7 @@ pub fn run() {
             reopen_recent,
             get_app_prefs,
             set_resume_playing_on_launch,
+            set_playlist_shuffle_on_play,
             set_scan_subfolders,
             set_ui_locale,
             recover_mpv,
@@ -3611,8 +3890,12 @@ pub fn run() {
             get_home_summary,
             play_collection,
             enqueue_collection,
+            play_kind,
+            enqueue_kind,
             update_collection_metadata,
             set_collection_kind,
+            set_collections_kind,
+            list_collection_ids,
             mark_collection_listened,
             list_playlists,
             create_playlist,
@@ -3657,4 +3940,129 @@ pub fn run() {
                 }
             }
         });
+}
+
+#[cfg(test)]
+mod playback_tests {
+    use super::*;
+    use rusqlite::params;
+    use std::fs;
+    use std::path::PathBuf;
+
+    fn test_inner(db: LibraryDb) -> InnerState {
+        InnerState {
+            db,
+            mpv: MpvController::default(),
+            session_root: None,
+            allowed_files: HashSet::new(),
+            playlist: Vec::new(),
+            sort_key: SortKey::default(),
+            current_index: None,
+            single_file_session: false,
+            scan_subfolders: false,
+            repeat_mode: RepeatMode::Off,
+            active_collection_id: None,
+            active_playlist_id: None,
+            playback_kind: "audiobook".into(),
+        }
+    }
+
+    fn seed_enqueue_fixture() -> (LibraryDb, i64, PathBuf) {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!("cc_enqueue_test_{stamp}"));
+        fs::create_dir_all(&base).unwrap();
+        let track1 = base.join("track1.m4b");
+        let track2 = base.join("track2.m4b");
+        fs::write(&track1, b"x").unwrap();
+        fs::write(&track2, b"x").unwrap();
+        let root_path = base.to_string_lossy().to_string();
+        let track1_s = track1.to_string_lossy().to_string();
+        let track2_s = track2.to_string_lossy().to_string();
+
+        let mut db = LibraryDb::open_in_memory().unwrap();
+        let now = InnerState::now_unix();
+        db.connection_mut()
+            .execute(
+                "INSERT INTO library_roots (path, label, content_kind, scan_rule, scan_subfolders, is_available, created_at, updated_at)
+                 VALUES (?1, 'Test', 'audiobook', 'subfolder-is-item', 1, 1, ?2, ?2)",
+                params![root_path.as_str(), now],
+            )
+            .unwrap();
+        let root_id = db.connection().last_insert_rowid();
+        db.connection_mut()
+            .execute(
+                "INSERT INTO collections (root_id, kind, title, sort_title, layout_kind, created_at, updated_at)
+                 VALUES (?1, 'audiobook', 'Book', 'Book', 'flat_multi', ?2, ?2)",
+                params![root_id, now],
+            )
+            .unwrap();
+        let collection_id = db.connection().last_insert_rowid();
+        for (order, path) in [(0, &track1_s), (1, &track2_s)] {
+            db.connection_mut()
+                .execute(
+                    "INSERT INTO collection_files (collection_id, path, display_title, label, track_order, created_at, updated_at)
+                     VALUES (?1, ?2, 'Track', 'Track', ?3, ?4, ?4)",
+                    params![collection_id, path.as_str(), order, now],
+                )
+                .unwrap();
+        }
+        (db, collection_id, base)
+    }
+
+    #[test]
+    fn resolve_playlist_shuffle_pref() {
+        let db = LibraryDb::open_in_memory().unwrap();
+        assert!(!resolve_playlist_shuffle(None, &db));
+        assert!(!resolve_playlist_shuffle(Some(false), &db));
+        assert!(resolve_playlist_shuffle(Some(true), &db));
+
+        let mut db = LibraryDb::open_in_memory().unwrap();
+        db.set_setting(PREF_PLAYLIST_SHUFFLE, "true").unwrap();
+        assert!(resolve_playlist_shuffle(None, &db));
+        assert!(!resolve_playlist_shuffle(Some(false), &db));
+    }
+
+    #[test]
+    fn enqueue_empty_queue_end_starts_session_without_autoplay() {
+        let (db, collection_id, tmp) = seed_enqueue_fixture();
+        let mut state = test_inner(db);
+        let result = state
+            .enqueue_collection_inner(collection_id, "end")
+            .expect("enqueue");
+        assert!(result.session_started);
+        assert!(!result.autoplay_started);
+        assert_eq!(result.tracks_added, 2);
+        assert_eq!(state.playlist.len(), 2);
+        let _ = fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn enqueue_duplicate_collection_errors() {
+        let (db, collection_id, tmp) = seed_enqueue_fixture();
+        let mut state = test_inner(db);
+        state.enqueue_collection_inner(collection_id, "end").unwrap();
+        match state.enqueue_collection_inner(collection_id, "end") {
+            Err(msg) => assert!(msg.contains("already in your queue")),
+            Ok(_) => panic!("expected duplicate enqueue to fail"),
+        }
+        let _ = fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn enqueue_empty_playlist_with_session_root_starts_fresh_session() {
+        let (db, collection_id, tmp) = seed_enqueue_fixture();
+        let mut state = test_inner(db);
+        state.session_root = Some(tmp.join("track1.m4b"));
+        state.playlist = vec![];
+        let result = state
+            .enqueue_collection_inner(collection_id, "end")
+            .expect("enqueue");
+        assert!(result.session_started);
+        assert!(!result.autoplay_started);
+        assert_eq!(state.playlist.len(), 2);
+        let _ = fs::remove_dir_all(tmp);
+    }
 }

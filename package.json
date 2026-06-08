@@ -27,7 +27,9 @@
     "build": "vite build",
     "preview": "vite preview",
     "tauri": "tauri",
-    "install:deb": "bash scripts/install-deb.sh"
+    "install:deb": "bash scripts/install-deb.sh",
+    "ship": "npm run tauri build && npm run install:deb",
+    "run:release": "src-tauri/target/release/audioplayer"
   },
   "dependencies": {
     "@fontsource/fraunces": "^5.2.9",

@@ -20,7 +20,7 @@ type ConfirmCfg = {
 type Props = {
   playlistId: number;
   onBack: () => void;
-  onPlayPlaylist: (id: number) => void;
+  onPlayPlaylist: (id: number, shuffle?: boolean) => void;
   onDeleted: () => void;
   openConfirm: (cfg: ConfirmCfg) => void;
   onLibraryChanged?: () => void;
@@ -286,15 +286,25 @@ export function PlaylistDetailView({
             </>
           )}
         </div>
-        <button
-          type="button"
-          className="playlist-detail-hero-play btn btn-primary"
-          disabled={!canPlay}
-          onClick={() => onPlayPlaylist(detail.id)}
-        >
-          <IconPlaySm />
-          <span>{t("home.play")}</span>
-        </button>
+        <div className="playlist-detail-hero-playback">
+          <button
+            type="button"
+            className="btn btn-primary playlist-detail-hero-play"
+            disabled={!canPlay}
+            onClick={() => onPlayPlaylist(detail.id, false)}
+          >
+            <IconPlaySm />
+            <span>{t("playlists.playInOrder")}</span>
+          </button>
+          <button
+            type="button"
+            className="btn btn-secondary playlist-detail-hero-play"
+            disabled={!canPlay || detail.items.length < 2}
+            onClick={() => onPlayPlaylist(detail.id, true)}
+          >
+            <span>{t("catalog.shuffleAll")}</span>
+          </button>
+        </div>
       </header>
 
       <section className="playlist-detail-add" aria-labelledby="playlist-add-heading">

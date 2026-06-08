@@ -30,12 +30,91 @@ fn show_in_progress_list(in_progress: bool, listened: bool, progress_pct: f64) -
     in_progress && !listened && progress_pct >= IN_PROGRESS_LIST_MIN_PCT
 }
 
+/// SQL fragment: collection marked finished (manual flag or every playable track listened).
+const FILTER_FINISHED_SQL: &str = "
+ AND (
+   c.listened_at IS NOT NULL
+   OR (
+     EXISTS (SELECT 1 FROM collection_files cf WHERE cf.collection_id = c.id AND cf.unavailable = 0)
+     AND NOT EXISTS (
+       SELECT 1 FROM collection_files cf
+       WHERE cf.collection_id = c.id AND cf.unavailable = 0
+         AND NOT EXISTS (
+           SELECT 1 FROM media_state ms WHERE ms.file_key = cf.path AND ms.listened_at IS NOT NULL
+         )
+     )
+   )
+ )";
+
+/// SQL fragment: root away or no playable files on disk.
+const FILTER_AWAY_SQL: &str = "
+ AND (
+   r.is_available = 0
+   OR NOT EXISTS (
+     SELECT 1 FROM collection_files cf WHERE cf.collection_id = c.id AND cf.unavailable = 0
+   )
+ )";
+
+/// SQL fragment: started but not finished, at least 1% progress (matches collection_progress).
+const FILTER_IN_PROGRESS_SQL: &str = "
+ AND c.listened_at IS NULL
+ AND NOT (
+   EXISTS (SELECT 1 FROM collection_files cf WHERE cf.collection_id = c.id AND cf.unavailable = 0)
+   AND NOT EXISTS (
+     SELECT 1 FROM collection_files cf
+     WHERE cf.collection_id = c.id AND cf.unavailable = 0
+       AND NOT EXISTS (
+         SELECT 1 FROM media_state ms WHERE ms.file_key = cf.path AND ms.listened_at IS NOT NULL
+       )
+   )
+ )
+ AND EXISTS (
+   SELECT 1 FROM collection_files cf
+   INNER JOIN media_state ms ON ms.file_key = cf.path
+   WHERE cf.collection_id = c.id AND cf.unavailable = 0 AND ms.position_sec > 1.0
+ )
+ AND COALESCE((
+   SELECT SUM(
+     CASE WHEN cf.unavailable = 0 AND ms.duration_sec IS NOT NULL AND ms.duration_sec > 0
+       THEN MIN(ms.position_sec, ms.duration_sec) ELSE 0 END
+   ) * 100.0 / NULLIF(SUM(
+     CASE WHEN cf.unavailable = 0 AND ms.duration_sec IS NOT NULL AND ms.duration_sec > 0
+       THEN ms.duration_sec ELSE 0 END
+   ), 0)
+   FROM collection_files cf
+   LEFT JOIN media_state ms ON ms.file_key = cf.path
+   WHERE cf.collection_id = c.id
+ ), 0) >= 1.0";
+
+fn append_collection_filter_sql(base_sql: &mut String, filter: Option<&str>) {
+    let Some(f) = filter else {
+        return;
+    };
+    match f {
+        "finished" => base_sql.push_str(FILTER_FINISHED_SQL),
+        "away" => base_sql.push_str(FILTER_AWAY_SQL),
+        "in-progress" => base_sql.push_str(FILTER_IN_PROGRESS_SQL),
+        "series" => base_sql.push_str(" AND c.series IS NOT NULL AND TRIM(c.series) != ''"),
+        _ => {}
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ContentKind {
     Audiobook,
     Music,
     Mixed,
+}
+
+const MAX_BULK_KIND_BATCH: usize = 5_000;
+
+pub fn validate_playback_kind(kind: &str) -> Result<(), String> {
+    match ContentKind::parse(kind) {
+        Some(ContentKind::Audiobook) | Some(ContentKind::Music) => Ok(()),
+        Some(ContentKind::Mixed) => Err("Choose audiobook or music".into()),
+        None => Err("Invalid content kind".into()),
+    }
 }
 
 impl ContentKind {
@@ -125,6 +204,7 @@ pub struct LibraryRootDto {
     pub last_scan_at: Option<i64>,
     pub last_scan_status: Option<String>,
     pub collection_count: i64,
+    pub track_count: i64,
 }
 
 #[derive(Clone, Serialize)]
@@ -148,6 +228,14 @@ pub struct CollectionSummaryDto {
     pub last_played_at: Option<i64>,
     pub series: Option<String>,
     pub series_index: Option<i32>,
+}
+
+#[derive(Clone, Serialize)]
+pub struct CollectionListPageDto {
+    pub items: Vec<CollectionSummaryDto>,
+    pub total: i64,
+    pub offset: i64,
+    pub limit: i64,
 }
 
 #[derive(Clone, Serialize)]
@@ -235,7 +323,14 @@ pub struct ScanStatusDto {
     pub scanning: bool,
     pub last_scan_at: Option<i64>,
     pub last_scan_status: Option<String>,
+    /// Collections touched during this scan (one per upsert).
     pub collections_found: i64,
+    /// Total collections in this root after the scan.
+    pub collections_total: i64,
+    /// Playable tracks in this root after the scan.
+    pub tracks_total: i64,
+    /// Tracks added or updated during this scan.
+    pub tracks_updated: i64,
 }
 
 #[derive(Clone, Serialize)]
@@ -251,6 +346,19 @@ pub struct ImportFolderToPlaylistResult {
 pub struct AddToPlaylistBulkResult {
     pub tracks_added: i64,
     pub tracks_skipped: i64,
+}
+
+#[derive(Clone, Serialize)]
+pub struct SetCollectionsKindFailure {
+    pub collection_id: i64,
+    pub title: String,
+    pub error: String,
+}
+
+#[derive(Clone, Serialize)]
+pub struct SetCollectionsKindResult {
+    pub updated: usize,
+    pub failures: Vec<SetCollectionsKindFailure>,
 }
 
 #[derive(Clone, Serialize)]
@@ -683,7 +791,10 @@ impl<'a> CatalogService<'a> {
             .prepare(
                 "SELECT r.id, r.path, r.label, r.content_kind, r.scan_rule, r.scan_subfolders,
                         r.is_available, r.last_scan_at, r.last_scan_status,
-                        (SELECT COUNT(*) FROM collections c WHERE c.root_id = r.id)
+                        (SELECT COUNT(*) FROM collections c WHERE c.root_id = r.id),
+                        (SELECT COUNT(*) FROM collection_files cf
+                         INNER JOIN collections c ON c.id = cf.collection_id
+                         WHERE c.root_id = r.id AND cf.unavailable = 0)
                  FROM library_roots r ORDER BY r.label",
             )
             .map_err(|e| e.to_string())?;
@@ -700,6 +811,7 @@ impl<'a> CatalogService<'a> {
                     last_scan_at: r.get(7)?,
                     last_scan_status: r.get(8)?,
                     collection_count: r.get(9)?,
+                    track_count: r.get(10)?,
                 })
             })
             .map_err(|e| e.to_string())?;
@@ -880,6 +992,9 @@ impl<'a> CatalogService<'a> {
                 last_scan_at: Some(now),
                 last_scan_status: Some("away".into()),
                 collections_found: 0,
+                collections_total: 0,
+                tracks_total: 0,
+                tracks_updated: 0,
             });
         }
 
@@ -1131,12 +1246,44 @@ impl<'a> CatalogService<'a> {
             )
             .map_err(|e| e.to_string())?;
 
+        let collections_total: i64 = self
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM collections WHERE root_id = ?1",
+                [root_id],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        let tracks_total: i64 = self
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM collection_files cf
+                 INNER JOIN collections c ON c.id = cf.collection_id
+                 WHERE c.root_id = ?1 AND cf.unavailable = 0",
+                [root_id],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        let tracks_updated: i64 = self
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM collection_files cf
+                 INNER JOIN collections c ON c.id = cf.collection_id
+                 WHERE c.root_id = ?1 AND cf.updated_at >= ?2",
+                params![root_id, scan_started],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+
         Ok(ScanStatusDto {
             root_id,
             scanning: false,
             last_scan_at: Some(now),
             last_scan_status: Some("ok".into()),
             collections_found: found,
+            collections_total,
+            tracks_total,
+            tracks_updated,
         })
     }
 
@@ -1467,6 +1614,95 @@ impl<'a> CatalogService<'a> {
         self.reconcile_superseded_unavailable_files_in_root(root_id)?;
         self.prune_empty_collections_in_root(root_id)?;
         Ok(())
+    }
+
+    pub fn list_collection_ids(
+        &mut self,
+        kind: Option<&str>,
+        filter: Option<&str>,
+        search: Option<&str>,
+    ) -> Result<Vec<i64>, String> {
+        self.reconcile_library_health()?;
+
+        let mut base_sql = String::from(
+            " FROM collections c
+             JOIN library_roots r ON r.id = c.root_id WHERE 1=1",
+        );
+        let mut params_vec: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+        if let Some(k) = kind {
+            base_sql.push_str(" AND c.kind = ?");
+            params_vec.push(Box::new(k.to_string()));
+        }
+        if let Some(s) = search {
+            let q = format!("%{}%", s.trim().to_lowercase());
+            base_sql.push_str(
+                " AND (LOWER(c.title) LIKE ? OR LOWER(COALESCE(c.author,'')) LIKE ?
+                 OR LOWER(COALESCE(c.artist,'')) LIKE ? OR LOWER(COALESCE(c.series,'')) LIKE ?)",
+            );
+            params_vec.push(Box::new(q.clone()));
+            params_vec.push(Box::new(q.clone()));
+            params_vec.push(Box::new(q.clone()));
+            params_vec.push(Box::new(q));
+        }
+        append_collection_filter_sql(&mut base_sql, filter);
+
+        let list_sql = format!("SELECT c.id {base_sql} ORDER BY c.sort_title");
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+            params_vec.iter().map(|p| p.as_ref()).collect();
+
+        let conn = self.conn();
+        let mut stmt = conn.prepare(&list_sql).map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(param_refs.as_slice(), |r| r.get::<_, i64>(0))
+            .map_err(|e| e.to_string())?;
+        Ok(rows.filter_map(|row| row.ok()).collect())
+    }
+
+    pub fn set_collections_kind(
+        &mut self,
+        collection_ids: &[i64],
+        kind_str: &str,
+    ) -> Result<SetCollectionsKindResult, String> {
+        let new_kind = ContentKind::parse(kind_str).ok_or("Invalid content kind")?;
+        if new_kind == ContentKind::Mixed {
+            return Err("Choose audiobook or music".into());
+        }
+        if collection_ids.is_empty() {
+            return Err("No items selected".into());
+        }
+        if collection_ids.len() > MAX_BULK_KIND_BATCH {
+            return Err(format!(
+                "Too many items selected (max {MAX_BULK_KIND_BATCH})"
+            ));
+        }
+
+        let mut unique_ids: Vec<i64> = collection_ids.to_vec();
+        unique_ids.sort_unstable();
+        unique_ids.dedup();
+
+        let mut updated = 0usize;
+        let mut failures = Vec::new();
+        for &id in &unique_ids {
+            match self.set_collection_kind(id, kind_str) {
+                Ok(()) => updated += 1,
+                Err(error) => {
+                    let title = self
+                        .conn()
+                        .query_row(
+                            "SELECT title FROM collections WHERE id = ?1",
+                            [id],
+                            |r| r.get::<_, String>(0),
+                        )
+                        .unwrap_or_else(|_| format!("#{id}"));
+                    failures.push(SetCollectionsKindFailure {
+                        collection_id: id,
+                        title,
+                        error,
+                    });
+                }
+            }
+        }
+        Ok(SetCollectionsKindResult { updated, failures })
     }
 
     /// Prefer a manually classified collection (e.g. after type change) over an auto-detected duplicate.
@@ -2175,6 +2411,84 @@ impl<'a> CatalogService<'a> {
         Ok((pct, finished, any_progress && !finished, last_played))
     }
 
+    fn collection_summary_from_row(
+        &mut self,
+        row: (
+            i64,
+            i64,
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            String,
+            Option<String>,
+            Option<i64>,
+            bool,
+            Option<String>,
+            Option<i32>,
+        ),
+    ) -> Result<CollectionSummaryDto, String> {
+        let (
+            id,
+            root_id,
+            kind_s,
+            title,
+            author,
+            artist,
+            _album,
+            layout,
+            cover,
+            _listened_at,
+            root_avail,
+            series_name,
+            series_index,
+        ) = row;
+        let (progress_pct, listened, in_progress, last_played) = self.collection_progress(id)?;
+        let playable_file_count: i64 = self
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM collection_files WHERE collection_id = ?1 AND unavailable = 0",
+                [id],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        let track_count: i64 = self
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM collection_files WHERE collection_id = ?1",
+                [id],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        let missing_file_count = track_count - playable_file_count;
+        let root_unavailable = !root_avail;
+        let tracks_missing = root_avail && playable_file_count == 0 && track_count > 0;
+        let unavailable = root_unavailable || playable_file_count == 0;
+        let subtitle = author.or(artist);
+        Ok(CollectionSummaryDto {
+            id,
+            root_id,
+            kind: kind_s,
+            title,
+            subtitle,
+            layout_kind: layout,
+            cover_path: cover,
+            progress_pct,
+            listened,
+            in_progress,
+            unavailable,
+            root_unavailable,
+            playable_file_count,
+            missing_file_count,
+            location_hint: self.location_hint_for_root(root_id, root_unavailable, tracks_missing),
+            track_count,
+            last_played_at: if last_played > 0 { Some(last_played) } else { None },
+            series: series_name,
+            series_index,
+        })
+    }
+
     pub fn list_collections(
         &mut self,
         kind: Option<&str>,
@@ -2183,146 +2497,96 @@ impl<'a> CatalogService<'a> {
         series: Option<&str>,
         limit: i64,
         offset: i64,
-    ) -> Result<Vec<CollectionSummaryDto>, String> {
+    ) -> Result<CollectionListPageDto, String> {
         self.reconcile_library_health()?;
-        let mut sql = String::from(
-            "SELECT c.id, c.root_id, c.kind, c.title, c.author, c.artist, c.album, c.layout_kind,
-                    c.cover_path, c.listened_at, r.is_available, c.series, c.series_index
-             FROM collections c
+        let limit = limit.clamp(1, 200);
+        let offset = offset.max(0);
+
+        let mut base_sql = String::from(
+            " FROM collections c
              JOIN library_roots r ON r.id = c.root_id WHERE 1=1",
         );
         let mut params_vec: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
         if let Some(k) = kind {
-            sql.push_str(" AND c.kind = ?");
+            base_sql.push_str(" AND c.kind = ?");
             params_vec.push(Box::new(k.to_string()));
         }
         if let Some(s) = search {
             let q = format!("%{}%", s.trim().to_lowercase());
-            sql.push_str(" AND (LOWER(c.title) LIKE ? OR LOWER(COALESCE(c.author,'')) LIKE ? OR LOWER(COALESCE(c.artist,'')) LIKE ? OR LOWER(COALESCE(c.series,'')) LIKE ?)");
+            base_sql.push_str(
+                " AND (LOWER(c.title) LIKE ? OR LOWER(COALESCE(c.author,'')) LIKE ?
+                 OR LOWER(COALESCE(c.artist,'')) LIKE ? OR LOWER(COALESCE(c.series,'')) LIKE ?)",
+            );
             params_vec.push(Box::new(q.clone()));
             params_vec.push(Box::new(q.clone()));
             params_vec.push(Box::new(q.clone()));
             params_vec.push(Box::new(q));
         }
         if let Some(ser) = series.filter(|s| !s.trim().is_empty()) {
-            sql.push_str(" AND LOWER(c.series) = LOWER(?)");
+            base_sql.push_str(" AND LOWER(c.series) = LOWER(?)");
             params_vec.push(Box::new(ser.trim().to_string()));
         }
+        append_collection_filter_sql(&mut base_sql, filter);
         let order = if series.is_some() {
             " ORDER BY c.series_index, c.sort_title"
         } else {
             " ORDER BY c.sort_title"
         };
-        sql.push_str(order);
-        let fetch_limit = if filter.is_some() {
-            (limit * 8).clamp(limit, 4000)
-        } else {
-            limit
-        };
-        sql.push_str(" LIMIT ? OFFSET ?");
-        params_vec.push(Box::new(fetch_limit));
-        params_vec.push(Box::new(offset));
 
         let conn = self.conn();
-        let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
         let param_refs: Vec<&dyn rusqlite::types::ToSql> =
             params_vec.iter().map(|p| p.as_ref()).collect();
-        let mut out = Vec::new();
-        let rows = stmt
-            .query_map(param_refs.as_slice(), |r| {
-                Ok((
-                    r.get::<_, i64>(0)?,
-                    r.get::<_, i64>(1)?,
-                    r.get::<_, String>(2)?,
-                    r.get::<_, String>(3)?,
-                    r.get::<_, Option<String>>(4)?,
-                    r.get::<_, Option<String>>(5)?,
-                    r.get::<_, Option<String>>(6)?,
-                    r.get::<_, String>(7)?,
-                    r.get::<_, Option<String>>(8)?,
-                    r.get::<_, Option<i64>>(9)?,
-                    r.get::<_, i32>(10)? != 0,
-                    r.get::<_, Option<String>>(11)?,
-                    r.get::<_, Option<i32>>(12)?,
-                ))
-            })
+
+        let count_sql = format!("SELECT COUNT(*){base_sql}");
+        let total: i64 = conn
+            .query_row(&count_sql, param_refs.as_slice(), |r| r.get(0))
             .map_err(|e| e.to_string())?;
 
-        for row in rows.flatten() {
-            let (
-                id,
-                root_id,
-                kind_s,
-                title,
-                author,
-                artist,
-                _album,
-                layout,
-                cover,
-                _listened_at,
-                root_avail,
-                series_name,
-                series_index,
-            ) = row;
-            let (progress_pct, listened, in_progress, last_played) = self.collection_progress(id)?;
-            let playable_file_count: i64 = self
-                .conn()
-                .query_row(
-                    "SELECT COUNT(*) FROM collection_files WHERE collection_id = ?1 AND unavailable = 0",
-                    [id],
-                    |r| r.get(0),
-                )
-                .unwrap_or(0);
-            let track_count: i64 = self
-                .conn()
-                .query_row(
-                    "SELECT COUNT(*) FROM collection_files WHERE collection_id = ?1",
-                    [id],
-                    |r| r.get(0),
-                )
-                .unwrap_or(0);
-            let missing_file_count = track_count - playable_file_count;
-            let root_unavailable = !root_avail;
-            let tracks_missing = root_avail && playable_file_count == 0 && track_count > 0;
-            let unavailable = root_unavailable || playable_file_count == 0;
-            let subtitle = author.or(artist);
-            if let Some(f) = filter {
-                match f {
-                    "in-progress" if !show_in_progress_list(in_progress, listened, progress_pct) => {
-                        continue
-                    }
-                    "finished" if !listened => continue,
-                    "away" if !unavailable => continue,
-                    "series" if series_name.is_none() => continue,
-                    "all" | _ => {}
-                }
-            }
-            out.push(CollectionSummaryDto {
-                id,
-                root_id,
-                kind: kind_s,
-                title,
-                subtitle,
-                layout_kind: layout,
-                cover_path: cover,
-                progress_pct,
-                listened,
-                in_progress,
-                unavailable,
-                root_unavailable,
-                playable_file_count,
-                missing_file_count,
-                location_hint: self.location_hint_for_root(root_id, root_unavailable, tracks_missing),
-                track_count,
-                last_played_at: if last_played > 0 { Some(last_played) } else { None },
-                series: series_name,
-                series_index,
-            });
-            if out.len() as i64 >= limit {
-                break;
-            }
+        let list_sql = format!(
+            "SELECT c.id, c.root_id, c.kind, c.title, c.author, c.artist, c.album, c.layout_kind,
+                    c.cover_path, c.listened_at, r.is_available, c.series, c.series_index
+             {base_sql}{order} LIMIT ? OFFSET ?"
+        );
+        let mut list_params: Vec<Box<dyn rusqlite::types::ToSql>> = params_vec;
+        list_params.push(Box::new(limit));
+        list_params.push(Box::new(offset));
+        let list_refs: Vec<&dyn rusqlite::types::ToSql> =
+            list_params.iter().map(|p| p.as_ref()).collect();
+
+        let row_data: Vec<_> = {
+            let mut stmt = conn.prepare(&list_sql).map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map(list_refs.as_slice(), |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, i64>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, String>(3)?,
+                        r.get::<_, Option<String>>(4)?,
+                        r.get::<_, Option<String>>(5)?,
+                        r.get::<_, Option<String>>(6)?,
+                        r.get::<_, String>(7)?,
+                        r.get::<_, Option<String>>(8)?,
+                        r.get::<_, Option<i64>>(9)?,
+                        r.get::<_, i32>(10)? != 0,
+                        r.get::<_, Option<String>>(11)?,
+                        r.get::<_, Option<i32>>(12)?,
+                    ))
+                })
+                .map_err(|e| e.to_string())?;
+            rows.filter_map(|row| row.ok()).collect()
+        };
+
+        let mut items = Vec::new();
+        for row in row_data {
+            items.push(self.collection_summary_from_row(row)?);
         }
-        Ok(out)
+        Ok(CollectionListPageDto {
+            items,
+            total,
+            offset,
+            limit,
+        })
     }
 
     pub fn get_collection_detail(&mut self, collection_id: i64) -> Result<CollectionDetailDto, String> {
@@ -2336,7 +2600,6 @@ impl<'a> CatalogService<'a> {
             .map_err(|_| "Collection not found".to_string())?;
         self.reconcile_false_unavailable_in_root(root_id)?;
         self.reconcile_superseded_unavailable_files_in_root(root_id)?;
-        self.prune_empty_collections_in_root(root_id)?;
         let conn = self.conn();
         let row = conn
             .query_row(
@@ -2442,11 +2705,15 @@ impl<'a> CatalogService<'a> {
         })
     }
 
-    pub fn get_home_summary(&mut self) -> Result<HomeSummaryDto, String> {
+    pub fn get_home_summary(&mut self, scan_in_progress: bool) -> Result<HomeSummaryDto, String> {
         let roots = self.list_roots()?;
         let has_library = !roots.is_empty();
-        let audiobooks = self.list_collections(Some("audiobook"), None, None, None, 200, 0)?;
-        let music = self.list_collections(Some("music"), None, None, None, 20, 0)?;
+        let audiobooks = self
+            .list_collections(Some("audiobook"), None, None, None, 200, 0)?
+            .items;
+        let music = self
+            .list_collections(Some("music"), None, None, None, 20, 0)?
+            .items;
 
         let continue_item = audiobooks
             .iter()
@@ -2483,7 +2750,7 @@ impl<'a> CatalogService<'a> {
             in_progress,
             music_shelf: music.into_iter().take(4).collect(),
             has_library,
-            scan_in_progress: false,
+            scan_in_progress,
         })
     }
 
@@ -2579,6 +2846,81 @@ impl<'a> CatalogService<'a> {
             return Err("No playable files in this collection".into());
         }
         Ok((playable, root_canon))
+    }
+
+    /// All playable tracks for a catalog kind, optionally filtered like `list_collections`.
+    pub fn kind_playback_paths(
+        &mut self,
+        kind: &str,
+        filter: Option<&str>,
+        search: Option<&str>,
+    ) -> Result<Vec<PathBuf>, String> {
+        validate_playback_kind(kind)?;
+        self.reconcile_library_health()?;
+        let roots = self.registered_root_paths()?;
+
+        let mut base_sql = String::from(
+            " FROM collections c
+             JOIN library_roots r ON r.id = c.root_id AND r.is_available = 1
+             JOIN collection_files cf ON cf.collection_id = c.id AND cf.unavailable = 0
+             WHERE c.kind = ?",
+        );
+        let mut params_vec: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+        params_vec.push(Box::new(kind.to_string()));
+        if let Some(s) = search {
+            let q = format!("%{}%", s.trim().to_lowercase());
+            base_sql.push_str(
+                " AND (LOWER(c.title) LIKE ? OR LOWER(COALESCE(c.author,'')) LIKE ?
+                 OR LOWER(COALESCE(c.artist,'')) LIKE ? OR LOWER(COALESCE(c.series,'')) LIKE ?)",
+            );
+            params_vec.push(Box::new(q.clone()));
+            params_vec.push(Box::new(q.clone()));
+            params_vec.push(Box::new(q.clone()));
+            params_vec.push(Box::new(q));
+        }
+        append_collection_filter_sql(&mut base_sql, filter);
+
+        let list_sql = format!("SELECT cf.path {base_sql} ORDER BY c.sort_title, cf.track_order");
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+            params_vec.iter().map(|p| p.as_ref()).collect();
+
+        let raw: Vec<PathBuf> = {
+            let conn = self.conn();
+            let mut stmt = conn.prepare(&list_sql).map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map(param_refs.as_slice(), |r| r.get::<_, String>(0))
+                .map_err(|e| e.to_string())?;
+            rows.filter_map(|x| x.ok())
+                .map(PathBuf::from)
+                .collect()
+        };
+
+        let mut playable = Vec::new();
+        for path in raw {
+            let Some(on_disk) = tracked_file_on_disk(&path) else {
+                let _ = self.mark_file_unavailable_by_path(&path);
+                continue;
+            };
+            if !is_under_any_root(&on_disk, &roots) {
+                continue;
+            }
+            if on_disk.to_string_lossy() != path.to_string_lossy() {
+                let now = now_unix();
+                let path_s = on_disk.to_string_lossy().to_string();
+                let old_s = path.to_string_lossy().to_string();
+                let _ = self.conn_mut().execute(
+                    "UPDATE collection_files SET path = ?1, unavailable = 0, updated_at = ?2 WHERE path = ?3",
+                    params![path_s, now, old_s],
+                );
+                let _ = self.db.update_media_path(&old_s, &path_s);
+            }
+            playable.push(on_disk);
+        }
+
+        if playable.is_empty() {
+            return Err("No playable tracks in your library".into());
+        }
+        Ok(playable)
     }
 
     pub fn find_collection_file_ref_by_stored_path(
@@ -4318,6 +4660,9 @@ impl<'a> CatalogService<'a> {
                 last_scan_at: r.last_scan_at,
                 last_scan_status: r.last_scan_status,
                 collections_found: r.collection_count,
+                collections_total: r.collection_count,
+                tracks_total: r.track_count,
+                tracks_updated: 0,
             })
             .collect())
     }
@@ -4903,4 +5248,193 @@ fn extract_cover_from_file(
     let dest = covers_dir.join(format!("{collection_id}.{ext}"));
     fs::write(&dest, picture.data()).ok()?;
     Some(dest)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::LibraryDb;
+    use rusqlite::params;
+    use std::fs;
+    use std::path::PathBuf;
+
+    fn seed_collection(
+        db: &mut LibraryDb,
+        root_id: i64,
+        title: &str,
+        kind: &str,
+        listened_at: Option<i64>,
+        root_available: bool,
+        files: &[(&str, f64, Option<f64>, Option<i64>)],
+    ) -> i64 {
+        let now = 1_i64;
+        db.connection_mut()
+            .execute(
+                "UPDATE library_roots SET is_available = ?1 WHERE id = ?2",
+                params![root_available as i32, root_id],
+            )
+            .unwrap();
+        db.connection_mut()
+            .execute(
+                "INSERT INTO collections (root_id, kind, title, sort_title, layout_kind, listened_at, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?3, 'flat_multi', ?4, ?5, ?5)",
+                params![root_id, kind, title, listened_at, now],
+            )
+            .unwrap();
+        let collection_id = db.connection().last_insert_rowid();
+        for (order, (path, position, duration, listened)) in files.iter().enumerate() {
+            db.connection_mut()
+                .execute(
+                    "INSERT INTO collection_files (collection_id, path, display_title, label, track_order, created_at, updated_at)
+                     VALUES (?1, ?2, ?3, ?3, ?4, ?5, ?5)",
+                    params![collection_id, path, title, order as i32, now],
+                )
+                .unwrap();
+            db.connection_mut()
+                .execute(
+                    "INSERT INTO media_state (file_key, position_sec, duration_sec, listened_at, updated_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![path, position, duration, listened, now],
+                )
+                .unwrap();
+        }
+        collection_id
+    }
+
+    fn test_library() -> (LibraryDb, PathBuf) {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!("cc_catalog_test_{stamp}"));
+        fs::create_dir_all(&base).unwrap();
+        let track_a = base.join("alpha.m4b");
+        let track_b = base.join("beta.m4b");
+        let track_c = base.join("gamma.m4b");
+        fs::write(&track_a, b"x").unwrap();
+        fs::write(&track_b, b"x").unwrap();
+        fs::write(&track_c, b"x").unwrap();
+        let root_path = base.to_string_lossy().to_string();
+
+        let mut db = LibraryDb::open_in_memory().unwrap();
+        let now = 1_i64;
+        db.connection_mut()
+            .execute(
+                "INSERT INTO library_roots (path, label, content_kind, scan_rule, scan_subfolders, is_available, created_at, updated_at)
+                 VALUES (?1, 'Test', 'audiobook', 'subfolder-is-item', 1, 1, ?2, ?2)",
+                params![root_path.as_str(), now],
+            )
+            .unwrap();
+        let root_id = db.connection().last_insert_rowid();
+
+        seed_collection(
+            &mut db,
+            root_id,
+            "Alpha",
+            "audiobook",
+            None,
+            true,
+            &[(
+                track_a.to_string_lossy().as_ref(),
+                120.0,
+                Some(3600.0),
+                None,
+            )],
+        );
+        seed_collection(
+            &mut db,
+            root_id,
+            "Beta",
+            "audiobook",
+            Some(now),
+            true,
+            &[(
+                track_b.to_string_lossy().as_ref(),
+                3600.0,
+                Some(3600.0),
+                Some(now),
+            )],
+        );
+        let away_root = base.join("away-root");
+        fs::create_dir_all(&away_root).unwrap();
+        db.connection_mut()
+            .execute(
+                "INSERT INTO library_roots (path, label, content_kind, scan_rule, scan_subfolders, is_available, created_at, updated_at)
+                 VALUES (?1, 'Away', 'audiobook', 'subfolder-is-item', 1, 0, ?2, ?2)",
+                params![away_root.to_string_lossy().as_ref(), now],
+            )
+            .unwrap();
+        let away_root_id = db.connection().last_insert_rowid();
+        seed_collection(
+            &mut db,
+            away_root_id,
+            "Gamma",
+            "audiobook",
+            None,
+            false,
+            &[(
+                track_c.to_string_lossy().as_ref(),
+                0.0,
+                Some(3600.0),
+                None,
+            )],
+        );
+
+        (db, base)
+    }
+
+    #[test]
+    fn show_in_progress_list_requires_one_percent() {
+        assert!(!show_in_progress_list(true, false, 0.5));
+        assert!(show_in_progress_list(true, false, 1.0));
+        assert!(!show_in_progress_list(true, true, 50.0));
+    }
+
+    #[test]
+    fn list_collections_paginates_all_filter() {
+        let (mut db, tmp) = test_library();
+        let mut cat = CatalogService::new(&mut db);
+        let page1 = cat
+            .list_collections(Some("audiobook"), None, None, None, 2, 0)
+            .unwrap();
+        assert_eq!(page1.total, 3);
+        assert_eq!(page1.items.len(), 2);
+        let page2 = cat
+            .list_collections(Some("audiobook"), None, None, None, 2, 2)
+            .unwrap();
+        assert_eq!(page2.items.len(), 1);
+        let _ = fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn validate_playback_kind_rejects_mixed_and_unknown() {
+        assert!(validate_playback_kind("music").is_ok());
+        assert!(validate_playback_kind("audiobook").is_ok());
+        assert!(validate_playback_kind("mixed").is_err());
+        assert!(validate_playback_kind("podcast").is_err());
+    }
+
+    #[test]
+    fn list_collections_filters_finished_and_away() {
+        let (mut db, tmp) = test_library();
+        let mut cat = CatalogService::new(&mut db);
+        let finished = cat
+            .list_collections(Some("audiobook"), Some("finished"), None, None, 50, 0)
+            .unwrap();
+        assert_eq!(finished.total, 1);
+        assert_eq!(finished.items[0].title, "Beta");
+
+        let away = cat
+            .list_collections(Some("audiobook"), Some("away"), None, None, 50, 0)
+            .unwrap();
+        assert_eq!(away.total, 1);
+        assert_eq!(away.items[0].title, "Gamma");
+
+        let in_progress = cat
+            .list_collections(Some("audiobook"), Some("in-progress"), None, None, 50, 0)
+            .unwrap();
+        assert_eq!(in_progress.total, 1);
+        assert_eq!(in_progress.items[0].title, "Alpha");
+        let _ = fs::remove_dir_all(tmp);
+    }
 }

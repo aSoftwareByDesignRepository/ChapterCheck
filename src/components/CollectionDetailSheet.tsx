@@ -28,6 +28,17 @@ function metaFromDetail(d: CollectionDetailDto): MetaForm {
   };
 }
 
+function metaIsDirty(detail: CollectionDetailDto, form: MetaForm): boolean {
+  const base = metaFromDetail(detail);
+  return (
+    form.title !== base.title ||
+    form.author !== base.author ||
+    form.narrator !== base.narrator ||
+    form.artist !== base.artist ||
+    form.album !== base.album
+  );
+}
+
 type ConfirmCfg = {
   title: string;
   body: string;
@@ -38,22 +49,26 @@ type ConfirmCfg = {
 
 type Props = {
   collectionId: number | null;
+  refreshKey?: number;
   onlineMetadataEnabled?: boolean;
   onClose: () => void;
-  onPlayCollection: (id: number, mode: "continue" | "start") => void;
+  onPlayCollection: (id: number, mode: "continue" | "start", shuffle?: boolean) => void;
   onAddToQueue?: (id: number, position: "next" | "end") => void;
   onChanged?: () => void;
   openConfirm?: (cfg: ConfirmCfg) => void;
+  dialogSuspended?: boolean;
 };
 
 export function CollectionDetailSheet({
   collectionId,
+  refreshKey = 0,
   onlineMetadataEnabled = false,
   onClose,
   onPlayCollection,
   onAddToQueue,
   onChanged,
   openConfirm,
+  dialogSuspended = false,
 }: Props) {
   const { t } = useI18n();
   const { openContextMenu } = useContextMenu();
@@ -72,6 +87,7 @@ export function CollectionDetailSheet({
   const [suggestionApplied, setSuggestionApplied] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [kindError, setKindError] = useState<string | null>(null);
+  const [actionError, setActionError] = useState<string | null>(null);
   const formRef = useRef<HTMLDivElement>(null);
 
   const resetLookup = useCallback(() => {
@@ -90,10 +106,30 @@ export function CollectionDetailSheet({
     resetLookup();
     setLoadError(null);
     setKindError(null);
+    setActionError(null);
     onClose();
   }, [onClose, resetLookup]);
 
-  const { sheetRef, closeRef } = useDialogTrap(collectionId != null, closeDetail);
+  const requestClose = useCallback(() => {
+    if (detail && metaForm && editing && metaIsDirty(detail, metaForm)) {
+      const run = () => closeDetail();
+      if (openConfirm) {
+        openConfirm({
+          title: t("catalog.discardEditsTitle"),
+          body: t("catalog.discardEditsBody"),
+          confirmLabel: t("catalog.discardEditsConfirm"),
+          danger: true,
+          onConfirm: run,
+        });
+      } else {
+        run();
+      }
+      return;
+    }
+    closeDetail();
+  }, [detail, metaForm, editing, closeDetail, openConfirm, t]);
+
+  const { sheetRef, closeRef } = useDialogTrap(collectionId != null, requestClose);
 
   const refreshDetail = useCallback(async (id: number) => {
     const d = await invoke<CollectionDetailDto>("get_collection_detail", { collectionId: id });
@@ -127,24 +163,34 @@ export function CollectionDetailSheet({
     };
   }, [collectionId, resetLookup]);
 
+  useEffect(() => {
+    if (collectionId == null || refreshKey === 0) return;
+    void refreshDetail(collectionId).catch((e) => setLoadError(String(e)));
+  }, [collectionId, refreshKey, refreshDetail]);
+
   const saveMetadata = async () => {
     if (!detail || !metaForm) return;
-    await invoke("update_collection_metadata", {
-      collectionId: detail.id,
-      metadata: {
-        title: metaForm.title.trim() || null,
-        author: metaForm.author.trim() || null,
-        narrator: metaForm.narrator.trim() || null,
-        artist: metaForm.artist.trim() || null,
-        album: metaForm.album.trim() || null,
-        series: null,
-        series_index: null,
-      },
-    });
-    await refreshDetail(detail.id);
-    setEditing(false);
-    setMetaSaved(true);
-    setSuggestionApplied(false);
+    setActionError(null);
+    try {
+      await invoke("update_collection_metadata", {
+        collectionId: detail.id,
+        metadata: {
+          title: metaForm.title.trim() || null,
+          author: metaForm.author.trim() || null,
+          narrator: metaForm.narrator.trim() || null,
+          artist: metaForm.artist.trim() || null,
+          album: metaForm.album.trim() || null,
+          series: null,
+          series_index: null,
+        },
+      });
+      await refreshDetail(detail.id);
+      setEditing(false);
+      setMetaSaved(true);
+      setSuggestionApplied(false);
+    } catch (e) {
+      setActionError(String(e));
+    }
   };
 
   const moveTrack = async (fileId: number, direction: -1 | 1) => {
@@ -157,16 +203,26 @@ export function CollectionDetailSheet({
     const tmp = ids[idx]!;
     ids[idx] = ids[target]!;
     ids[target] = tmp;
-    await invoke("reorder_collection_files", { collectionId: detail.id, fileIds: ids });
-    await refreshDetail(detail.id);
+    setActionError(null);
+    try {
+      await invoke("reorder_collection_files", { collectionId: detail.id, fileIds: ids });
+      await refreshDetail(detail.id);
+    } catch (e) {
+      setActionError(String(e));
+    }
   };
 
   const saveTrackTitle = async (fileId: number) => {
     const title = editTrackTitle.trim();
     if (!title || !detail) return;
-    await invoke("update_file_display_title", { fileId, displayTitle: title });
-    setEditingTrackId(null);
-    await refreshDetail(detail.id);
+    setActionError(null);
+    try {
+      await invoke("update_file_display_title", { fileId, displayTitle: title });
+      setEditingTrackId(null);
+      await refreshDetail(detail.id);
+    } catch (e) {
+      setActionError(String(e));
+    }
   };
 
   const relinkFile = async (fileId: number) => {
@@ -184,17 +240,26 @@ export function CollectionDetailSheet({
     }
   };
 
-  const removeCollectionFromLibrary = () => {
-    if (!detail) return;
-    const run = async () => {
-      await invoke("remove_collection_from_library", { collectionId: detail.id });
+  const removeCollectionById = async (id: number) => {
+    setActionError(null);
+    try {
+      await invoke("remove_collection_from_library", { collectionId: id });
       onChanged?.();
       closeDetail();
-    };
+    } catch (e) {
+      setActionError(String(e));
+      onChanged?.();
+    }
+  };
+
+  const removeCollectionFromLibrary = (id = detail?.id) => {
+    if (id == null) return;
+    const title = detail?.title ?? `#${id}`;
+    const run = async () => removeCollectionById(id);
     if (openConfirm) {
       openConfirm({
         title: t("catalog.removeCollectionConfirmTitle"),
-        body: t("catalog.removeCollectionConfirmBody", { title: detail.title }),
+        body: t("catalog.removeCollectionConfirmBody", { title }),
         confirmLabel: t("catalog.removeCollectionConfirmBtn"),
         danger: true,
         onConfirm: run,
@@ -206,16 +271,22 @@ export function CollectionDetailSheet({
 
   const removeFileFromLibrary = (fileId: number, title: string) => {
     const run = async () => {
-      const result = await invoke<{ collection_removed: boolean }>(
-        "remove_collection_file_from_library",
-        { fileId },
-      );
-      if (!detail) return;
-      if (result.collection_removed) {
-        onChanged?.();
-        closeDetail();
-      } else {
-        await refreshDetail(detail.id);
+      setActionError(null);
+      try {
+        const result = await invoke<{ collection_removed: boolean }>(
+          "remove_collection_file_from_library",
+          { fileId },
+        );
+        if (!detail) return;
+        if (result.collection_removed) {
+          onChanged?.();
+          closeDetail();
+        } else {
+          await refreshDetail(detail.id);
+          onChanged?.();
+        }
+      } catch (e) {
+        setActionError(String(e));
         onChanged?.();
       }
     };
@@ -305,13 +376,16 @@ export function CollectionDetailSheet({
   const rootUnavailable = detail?.root_unavailable ?? false;
   const relinkDisabled = rootUnavailable;
   const relinkDisabledHint = rootUnavailable ? t("catalog.relinkRootUnavailable") : undefined;
-  const showRemoveCollection =
-    detail != null && !canPlay && !rootUnavailable && detail.files.length > 0;
-  const showEmptyCollection =
-    detail != null && !rootUnavailable && detail.files.length === 0;
+  const showRemoveCollection = detail != null && !canPlay && detail.files.length > 0;
+  const showEmptyCollection = detail != null && detail.files.length === 0;
 
   return (
-    <div className="detail-sheet-backdrop" role="presentation" onClick={closeDetail}>
+    <div
+      className="detail-sheet-backdrop"
+      role="presentation"
+      {...(dialogSuspended ? { inert: "" as const } : {})}
+      onClick={dialogSuspended ? undefined : requestClose}
+    >
       <div
         className="detail-sheet"
         ref={sheetRef}
@@ -344,6 +418,16 @@ export function CollectionDetailSheet({
                 },
               });
             }
+            if (detail.kind === "music" && detail.playable_file_count >= 2) {
+              items.push({
+                id: "shuffle",
+                label: t("catalog.shuffleAll"),
+                onClick: () => {
+                  onPlayCollection(detail.id, "start", true);
+                  closeDetail();
+                },
+              });
+            }
             if (onAddToQueue) {
               items.push({ type: "separator" });
               items.push({
@@ -356,7 +440,7 @@ export function CollectionDetailSheet({
               });
               items.push({
                 id: "queue",
-                label: t("queue.addToQueue"),
+                label: detail.kind === "music" ? t("catalog.queueAll") : t("queue.addToQueue"),
                 onClick: () => {
                   onAddToQueue(detail.id, "end");
                   closeDetail();
@@ -407,15 +491,28 @@ export function CollectionDetailSheet({
         }}
       >
         {loadError ? (
+          <div className="ghost-collection-panel" role="alert">
+            <p className="view-error">{loadError}</p>
+            <p className="ghost-collection-panel-body">{t("catalog.staleEntryBody")}</p>
+            <button
+              type="button"
+              className="btn btn-secondary ghost-collection-panel-action"
+              onClick={() => removeCollectionFromLibrary(collectionId)}
+            >
+              {t("catalog.removeCollection")}
+            </button>
+          </div>
+        ) : null}
+        {actionError ? (
           <p className="view-error" role="alert">
-            {loadError}
+            {actionError}
           </p>
         ) : null}
-        {!detail || !metaForm ? (
+        {!loadError && (!detail || !metaForm) ? (
           <p className="view-loading" aria-live="polite">
             {t("home.loading")}
           </p>
-        ) : (
+        ) : !loadError && detail && metaForm ? (
           <>
             <header className="detail-sheet-head">
               <div className="detail-sheet-cover">
@@ -542,7 +639,18 @@ export function CollectionDetailSheet({
               </p>
             ) : null}
 
-            <div className="detail-sheet-actions">
+            {actionError ? (
+              <p className="view-error detail-action-error" role="alert">
+                {actionError}
+              </p>
+            ) : null}
+
+            {canPlay ? (
+              <section className="detail-playback-section" aria-labelledby="detail-playback-heading">
+                <h4 id="detail-playback-heading" className="detail-section-heading">
+                  {detail.kind === "music" ? t("catalog.playbackSectionMusic") : t("catalog.playbackSection")}
+                </h4>
+                <div className="detail-sheet-actions detail-sheet-actions--playback">
               <button
                 type="button"
                 className="btn btn-primary"
@@ -552,8 +660,25 @@ export function CollectionDetailSheet({
                   closeDetail();
                 }}
               >
-                {detail.progress_pct > 0 ? t("home.continue") : t("home.play")}
+                {detail.kind === "music"
+                  ? t("catalog.playAll")
+                  : detail.progress_pct > 0
+                    ? t("home.continue")
+                    : t("home.play")}
               </button>
+              {detail.kind === "music" && canPlay ? (
+                <button
+                  type="button"
+                  className="btn btn-secondary"
+                  disabled={!canPlay || detail.playable_file_count < 2}
+                  onClick={() => {
+                    onPlayCollection(detail.id, "start", true);
+                    closeDetail();
+                  }}
+                >
+                  {t("catalog.shuffleAll")}
+                </button>
+              ) : null}
               {onAddToQueue ? (
                 <>
                   <button
@@ -576,10 +701,19 @@ export function CollectionDetailSheet({
                       closeDetail();
                     }}
                   >
-                    {t("queue.addToQueue")}
+                    {detail.kind === "music" ? t("catalog.queueAll") : t("queue.addToQueue")}
                   </button>
                 </>
               ) : null}
+                </div>
+              </section>
+            ) : null}
+
+            <section className="detail-manage-section" aria-labelledby="detail-manage-heading">
+              <h4 id="detail-manage-heading" className="detail-section-heading">
+                {t("catalog.manageSection")}
+              </h4>
+              <div className="detail-sheet-actions detail-sheet-actions--manage">
               <button
                 type="button"
                 className="btn btn-secondary"
@@ -596,11 +730,16 @@ export function CollectionDetailSheet({
                 disabled={!canPlay}
                 onClick={() => {
                   void (async () => {
-                    await invoke("mark_collection_listened", {
-                      collectionId: detail.id,
-                      listened: !detail.listened,
-                    });
-                    await refreshDetail(detail.id);
+                    setActionError(null);
+                    try {
+                      await invoke("mark_collection_listened", {
+                        collectionId: detail.id,
+                        listened: !detail.listened,
+                      });
+                      await refreshDetail(detail.id);
+                    } catch (e) {
+                      setActionError(String(e));
+                    }
                   })();
                 }}
               >
@@ -632,11 +771,22 @@ export function CollectionDetailSheet({
                 >
                   {busyAction === "fix" ? t("catalog.busyFixOrder") : t("catalog.fixTrackOrder")}
                 </button>
+              ) : detail.kind === "music" ? (
+                <button
+                  type="button"
+                  className="btn btn-ghost"
+                  disabled={!!busyAction}
+                  title={t("catalog.refreshTracksHint")}
+                  onClick={() => void fixTrackOrder()}
+                >
+                  {busyAction === "fix" ? t("catalog.busyRefreshTracks") : t("catalog.refreshTracks")}
+                </button>
               ) : null}
-              <button type="button" className="btn btn-ghost" ref={closeRef} onClick={closeDetail}>
+              <button type="button" className="btn btn-ghost" ref={closeRef} onClick={requestClose}>
                 {t("modal.close")}
               </button>
-            </div>
+              </div>
+            </section>
 
             {onlineMetadataEnabled ? (
               <section className="detail-lookup" aria-labelledby="detail-lookup-heading">
@@ -663,7 +813,7 @@ export function CollectionDetailSheet({
                     </p>
                   ) : lookupError ? (
                     <p className="detail-lookup-msg detail-lookup-msg--error" role="alert">
-                      {t("catalog.lookupError")}
+                      {lookupError}
                     </p>
                   ) : lookupDone && suggestions.length === 0 ? (
                     <p className="detail-lookup-msg detail-lookup-msg--empty">
@@ -716,6 +866,14 @@ export function CollectionDetailSheet({
               <div className="missing-files-alert missing-files-alert--root" role="alert">
                 <p className="missing-files-alert-title">{t("catalog.rootUnavailableTitle")}</p>
                 <p className="missing-files-alert-body">{t("catalog.awayLong")}</p>
+                <button
+                  type="button"
+                  className="btn btn-secondary btn-compact missing-files-alert-action"
+                  disabled={!!busyAction}
+                  onClick={() => removeCollectionFromLibrary()}
+                >
+                  {t("catalog.removeCollection")}
+                </button>
               </div>
             ) : null}
 
@@ -764,7 +922,15 @@ export function CollectionDetailSheet({
 
             {canPlay ? (
               <>
-                <h4 className="detail-tracks-heading">{t("catalog.tracksHeading")}</h4>
+                <h4 className="detail-tracks-heading">
+                  {t("catalog.tracksHeading")}
+                  {detail.kind === "music" ? (
+                    <span className="detail-tracks-count">
+                      {" "}
+                      · {t("catalog.trackCount", { count: detail.playable_file_count })}
+                    </span>
+                  ) : null}
+                </h4>
                 {(() => {
                   const avail = detail.files.filter((f) => !f.unavailable);
                   const total = avail.length;
@@ -907,7 +1073,7 @@ export function CollectionDetailSheet({
               </p>
             ) : null}
           </>
-        )}
+        ) : null}
       </div>
     </div>
   );

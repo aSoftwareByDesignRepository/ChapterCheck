@@ -20,11 +20,7 @@ pub struct LibraryDb {
 }
 
 impl LibraryDb {
-    pub fn open(path: &Path) -> Result<Self, DbError> {
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        let conn = Connection::open(path)?;
+    fn apply_migrations(conn: &Connection) -> Result<(), DbError> {
         conn.execute_batch(
             "
             PRAGMA journal_mode = WAL;
@@ -161,6 +157,22 @@ impl LibraryDb {
             [],
         );
         let _ = conn.execute_batch("UPDATE schema_version SET version = 4 WHERE id = 1;");
+        Ok(())
+    }
+
+    pub fn open(path: &Path) -> Result<Self, DbError> {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let conn = Connection::open(path)?;
+        Self::apply_migrations(&conn)?;
+        Ok(Self { conn })
+    }
+
+    #[cfg(test)]
+    pub fn open_in_memory() -> Result<Self, DbError> {
+        let conn = Connection::open_in_memory()?;
+        Self::apply_migrations(&conn)?;
         Ok(Self { conn })
     }
 

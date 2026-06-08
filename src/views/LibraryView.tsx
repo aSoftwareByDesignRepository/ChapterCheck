@@ -93,7 +93,10 @@ export function LibraryView({
               </div>
               <p className="library-root-path">{root.path}</p>
               <p className="library-root-meta">
-                {t("library.collections", { count: root.collection_count })}
+                {t("library.collections", {
+                  collections: root.collection_count,
+                  tracks: root.track_count,
+                })}
               </p>
             </li>
           ))}

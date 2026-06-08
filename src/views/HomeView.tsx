@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { useCallback, useEffect, useState } from "react";
 import { MediaRow } from "../components/MediaRow";
 import { useI18n } from "../i18n/I18nContext";
@@ -6,7 +7,7 @@ import type { HomeSummaryDto } from "../types/catalog";
 
 type Props = {
   refreshKey: number;
-  onPlayCollection: (id: number, mode: "continue" | "start") => void;
+  onPlayCollection: (id: number, mode: "continue" | "start", shuffle?: boolean) => void;
   onAddToQueue: (id: number, position: "next" | "end") => void;
   onOpenDetail: (id: number) => void;
   onShuffleRelax: () => void;
@@ -15,6 +16,7 @@ type Props = {
   onOpenFile: () => void;
   onBrowseAudiobooks: () => void;
   onBrowseMusic: () => void;
+  onRemoveCollection?: (id: number, title: string) => void;
 };
 
 export function HomeView({
@@ -28,6 +30,7 @@ export function HomeView({
   onOpenFile,
   onBrowseAudiobooks,
   onBrowseMusic,
+  onRemoveCollection,
 }: Props) {
   const { t } = useI18n();
   const [home, setHome] = useState<HomeSummaryDto | null>(null);
@@ -45,9 +48,22 @@ export function HomeView({
 
   useEffect(() => {
     void load();
-    const id = window.setInterval(() => void load(), 30_000);
+    const pollMs = home?.scan_in_progress ? 2_000 : 30_000;
+    const id = window.setInterval(() => void load(), pollMs);
     return () => window.clearInterval(id);
-  }, [load, refreshKey]);
+  }, [load, refreshKey, home?.scan_in_progress]);
+
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    void listen<boolean>("abp:scan-status", () => {
+      void load();
+    }).then((fn) => {
+      unlisten = fn;
+    });
+    return () => {
+      unlisten?.();
+    };
+  }, [load]);
 
   if (error) {
     return (
@@ -94,6 +110,11 @@ export function HomeView({
 
   return (
     <div className="view-panel home-view">
+      {home.scan_in_progress ? (
+        <div className="library-prompt-banner library-prompt-banner--info home-scan-banner" role="status">
+          <p>{t("home.scanning")}</p>
+        </div>
+      ) : null}
       <header className="home-head">
         <h1 className="view-title">{t("nav.home")}</h1>
         <div className="home-head-actions">
@@ -118,7 +139,7 @@ export function HomeView({
             <MediaRow
               item={continueItem}
               featured
-              onPlay={(id, mode) => onPlayCollection(id, mode)}
+              onPlay={onPlayCollection}
               onAddToQueue={onAddToQueue}
               onOpen={onOpenDetail}
             />
@@ -156,9 +177,10 @@ export function HomeView({
               <MediaRow
                 key={item.id}
                 item={item}
-                onPlay={(id, mode) => onPlayCollection(id, mode)}
+                onPlay={onPlayCollection}
                 onAddToQueue={onAddToQueue}
                 onOpen={onOpenDetail}
+                onRemoveCollection={onRemoveCollection}
               />
             ))}
           </div>
@@ -180,9 +202,10 @@ export function HomeView({
               <MediaRow
                 key={item.id}
                 item={item}
-                onPlay={(id, mode) => onPlayCollection(id, mode)}
+                onPlay={onPlayCollection}
                 onAddToQueue={onAddToQueue}
                 onOpen={onOpenDetail}
+                onRemoveCollection={onRemoveCollection}
               />
             ))}
           </div>

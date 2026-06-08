@@ -12,6 +12,7 @@ import type {
   CollectionDetailDto,
   CollectionSummaryDto,
   LibraryRootDto,
+  ScanStatusDto,
 } from "./types/catalog";
 import { AddToPlaylistButton } from "./components/AddToPlaylistButton";
 import { useAddToPlaylist } from "./context/AddToPlaylistContext";
@@ -79,6 +80,7 @@ type RecentOpenDto = {
 type AppPrefsDto = {
   resume_playing_on_launch: boolean;
   scan_subfolders: boolean;
+  playlist_shuffle_on_play: boolean;
   online_metadata_enabled: boolean;
   ui_locale: string;
   default_speed_audiobook: number;
@@ -339,6 +341,14 @@ export default function App() {
   const lastAutoSave = useRef(0);
   const [seekUi, setSeekUi] = useState<number | null>(null);
   const menubarRef = useRef<HTMLDivElement>(null);
+  const menubarTriggerRefs = useRef<
+    Partial<Record<"file" | "playback" | "view" | "help", HTMLButtonElement | null>>
+  >({});
+  const menubarDropdownRefs = useRef<
+    Partial<Record<"file" | "playback" | "view" | "help", HTMLDivElement | null>>
+  >({});
+  const menubarMenuOrder = ["file", "playback", "view", "help"] as const;
+  type MenubarMenu = (typeof menubarMenuOrder)[number];
   const mainStageRef = useRef<HTMLElement>(null);
   const playlistPanelRef = useRef<HTMLElement>(null);
   const modalSheetRef = useRef<HTMLDivElement>(null);
@@ -354,6 +364,7 @@ export default function App() {
   const [playingCollectionKind, setPlayingCollectionKind] = useState<string | null>(null);
   const [libraryPromptPath, setLibraryPromptPath] = useState<string | null>(null);
   const [driveNotice, setDriveNotice] = useState<string | null>(null);
+  const [scanNotice, setScanNotice] = useState<string | null>(null);
   const [queueNotice, setQueueNotice] = useState<string | null>(null);
   const [collectionDetailId, setCollectionDetailId] = useState<number | null>(null);
   const [resolvedTrackCollectionId, setResolvedTrackCollectionId] = useState<number | null>(
@@ -386,6 +397,14 @@ export default function App() {
     setModalSheet((m) => (m === "confirm" ? null : m));
   }, []);
 
+  const closeModal = useCallback(() => {
+    if (modalSheet === "confirm") {
+      closeConfirm();
+      return;
+    }
+    setModalSheet(null);
+  }, [modalSheet, closeConfirm]);
+
   useEffect(() => {
     if (modalSheet !== "confirm" && confirmDialog) setConfirmDialog(null);
   }, [modalSheet, confirmDialog]);
@@ -417,27 +436,112 @@ export default function App() {
     setQueueSearch("");
   }, [playlist?.root]);
 
+  const closeMenu = useCallback((focusTrigger = true) => {
+    setMenuOpen((open) => {
+      if (focusTrigger && open) {
+        window.requestAnimationFrame(() => menubarTriggerRefs.current[open]?.focus());
+      }
+      return null;
+    });
+  }, []);
+
+  const focusMenuItemAt = useCallback((menuId: MenubarMenu, index: number) => {
+    const dropdown = menubarDropdownRefs.current[menuId];
+    if (!dropdown) return;
+    const items = Array.from(
+      dropdown.querySelectorAll<HTMLElement>('[role="menuitem"]:not([disabled])'),
+    );
+    if (items.length === 0) return;
+    const target = items[Math.max(0, Math.min(index, items.length - 1))];
+    target?.focus();
+  }, []);
+
+  const onMenubarDropdownKeyDown = useCallback(
+    (e: React.KeyboardEvent, menuId: MenubarMenu) => {
+      const dropdown = menubarDropdownRefs.current[menuId];
+      if (!dropdown) return;
+      const items = Array.from(
+        dropdown.querySelectorAll<HTMLElement>('[role="menuitem"]:not([disabled])'),
+      );
+      if (items.length === 0) return;
+      const current = items.indexOf(document.activeElement as HTMLElement);
+
+      if (e.key === "ArrowDown") {
+        e.preventDefault();
+        focusMenuItemAt(menuId, current < 0 ? 0 : (current + 1) % items.length);
+      } else if (e.key === "ArrowUp") {
+        e.preventDefault();
+        focusMenuItemAt(menuId, current < 0 ? items.length - 1 : (current - 1 + items.length) % items.length);
+      } else if (e.key === "Home") {
+        e.preventDefault();
+        focusMenuItemAt(menuId, 0);
+      } else if (e.key === "End") {
+        e.preventDefault();
+        focusMenuItemAt(menuId, items.length - 1);
+      } else if (e.key === "Escape") {
+        e.preventDefault();
+        closeMenu(true);
+      } else if (e.key === "ArrowLeft" || e.key === "ArrowRight") {
+        const idx = menubarMenuOrder.indexOf(menuId);
+        if (idx < 0) return;
+        e.preventDefault();
+        const next =
+          menubarMenuOrder[
+            (idx + (e.key === "ArrowRight" ? 1 : -1) + menubarMenuOrder.length) %
+              menubarMenuOrder.length
+          ]!;
+        closeMenu(false);
+        setMenuOpen(next);
+        window.requestAnimationFrame(() => menubarTriggerRefs.current[next]?.focus());
+      }
+    },
+    [closeMenu, focusMenuItemAt, menubarMenuOrder],
+  );
+
+  const onMenubarTriggerKeyDown = useCallback((e: React.KeyboardEvent, menuId: MenubarMenu) => {
+    if (e.key === "ArrowDown" || e.key === "Enter" || e.key === " ") {
+      e.preventDefault();
+      setMenuOpen(menuId);
+    } else if (e.key === "ArrowLeft" || e.key === "ArrowRight") {
+      const idx = menubarMenuOrder.indexOf(menuId);
+      if (idx < 0) return;
+      e.preventDefault();
+      const next =
+        menubarMenuOrder[
+          (idx + (e.key === "ArrowRight" ? 1 : -1) + menubarMenuOrder.length) %
+            menubarMenuOrder.length
+        ]!;
+      setMenuOpen(null);
+      menubarTriggerRefs.current[next]?.focus();
+    }
+  }, [menubarMenuOrder]);
+
+  useEffect(() => {
+    if (!menuOpen) return;
+    window.requestAnimationFrame(() => focusMenuItemAt(menuOpen, 0));
+  }, [menuOpen, focusMenuItemAt]);
+
   useEffect(() => {
     if (!menuOpen) return;
     const close = (e: MouseEvent) => {
       if (menubarRef.current && !menubarRef.current.contains(e.target as Node)) {
-        setMenuOpen(null);
+        closeMenu(true);
       }
     };
     document.addEventListener("mousedown", close);
     return () => document.removeEventListener("mousedown", close);
-  }, [menuOpen]);
+  }, [menuOpen, closeMenu]);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
-        setMenuOpen(null);
+        closeMenu(true);
         setModalSheet(null);
       }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, []);
+  }, [closeMenu]);
 
   useEffect(() => {
     eofPrev.current = false;
@@ -494,8 +598,11 @@ export default function App() {
       setAppPrefs({
         resume_playing_on_launch: false,
         scan_subfolders: false,
+        playlist_shuffle_on_play: false,
         online_metadata_enabled: false,
         ui_locale: "en",
+        default_speed_audiobook: 1,
+        default_speed_music: 1,
       });
     }
   }, []);
@@ -529,7 +636,7 @@ export default function App() {
     try {
       const path = knownPath ?? (await invoke<string | null>("pick_library_folder"));
       if (!path) return;
-      await invoke("add_library_root", {
+      const root = await invoke<LibraryRootDto>("add_library_root", {
         input: {
           path,
           label: null,
@@ -540,6 +647,14 @@ export default function App() {
       });
       await loadLibraryRoots();
       setLibraryRefreshKey((k) => k + 1);
+      setScanNotice(
+        t("library.scanDone", {
+          collections: root.collection_count,
+          tracks: root.track_count,
+          updated: root.track_count,
+        }),
+      );
+      window.setTimeout(() => setScanNotice(null), 8000);
       setLibraryPromptPath(null);
       setModalSheet(null);
       setActiveView((prev) => (prev === "library" ? prev : "home"));
@@ -1118,13 +1233,95 @@ export default function App() {
         confirmLabel: t("catalog.removeCollectionConfirmBtn"),
         danger: true,
         onConfirm: async () => {
-          await invoke("remove_collection_from_library", { collectionId });
-          onCollectionDetailChanged();
+          try {
+            await invoke("remove_collection_from_library", { collectionId });
+            onCollectionDetailChanged();
+            if (collectionDetailId === collectionId) {
+              setCollectionDetailId(null);
+            }
+          } catch (e) {
+            setError(String(e));
+            onCollectionDetailChanged();
+          }
         },
       });
     },
-    [openConfirm, onCollectionDetailChanged, t],
+    [openConfirm, onCollectionDetailChanged, collectionDetailId, t],
   );
+
+  const playKindCatalog = async (
+    kind: "music",
+    filter: string | null,
+    search: string | null,
+    shuffle = false,
+  ) => {
+    if (!isTauri()) return;
+    setBusy(t("busy.opening"));
+    setError(null);
+    try {
+      const dto = await invoke<PlaylistDto>("play_kind", {
+        kind,
+        filter,
+        search,
+        shuffle,
+      });
+      setPlaylist(dto);
+      setActiveView("nowPlaying");
+      await refreshTransport();
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const enqueueKindCatalog = async (
+    kind: "music",
+    filter: string | null,
+    search: string | null,
+    position: "next" | "end" = "end",
+  ) => {
+    if (!isTauri()) return;
+    setError(null);
+    const sourceTitle = t("nav.music");
+    try {
+      const result = await invoke<{
+        playlist: PlaylistDto;
+        tracks_added: number;
+        collection_title: string;
+        session_started: boolean;
+        autoplay_started: boolean;
+      }>("enqueue_kind", { kind, filter, search, position });
+      setPlaylist(result.playlist);
+      if (result.session_started && result.autoplay_started) {
+        setActiveView("nowPlaying");
+      } else if (result.session_started) {
+        setScanNotice(
+          t("queue.loadedSession", {
+            count: result.tracks_added,
+            title: sourceTitle,
+          }),
+        );
+        window.setTimeout(() => setScanNotice(null), 6000);
+      } else {
+        const notice =
+          position === "next"
+            ? t("queue.addedNext", {
+                count: result.tracks_added,
+                title: sourceTitle,
+              })
+            : t("queue.addedEnd", {
+                count: result.tracks_added,
+                title: sourceTitle,
+              });
+        setQueueNotice(notice);
+        window.setTimeout(() => setQueueNotice(null), 4000);
+      }
+      await refreshTransport();
+    } catch (e) {
+      setError(String(e));
+    }
+  };
 
   const enqueueCollection = async (
     collectionId: number,
@@ -1137,34 +1334,48 @@ export default function App() {
         playlist: PlaylistDto;
         tracks_added: number;
         collection_title: string;
+        session_started: boolean;
+        autoplay_started: boolean;
       }>("enqueue_collection", { collectionId, position });
       setPlaylist(result.playlist);
-      const notice =
-        position === "next"
-          ? t("queue.addedNext", {
-              count: result.tracks_added,
-              title: result.collection_title,
-            })
-          : t("queue.addedEnd", {
-              count: result.tracks_added,
-              title: result.collection_title,
-            });
-      setQueueNotice(notice);
-      window.setTimeout(() => setQueueNotice(null), 4000);
+      if (result.session_started && result.autoplay_started) {
+        setActiveView("nowPlaying");
+      } else if (result.session_started) {
+        setScanNotice(
+          t("queue.loadedSession", {
+            count: result.tracks_added,
+            title: result.collection_title,
+          }),
+        );
+        window.setTimeout(() => setScanNotice(null), 6000);
+      } else {
+        const notice =
+          position === "next"
+            ? t("queue.addedNext", {
+                count: result.tracks_added,
+                title: result.collection_title,
+              })
+            : t("queue.addedEnd", {
+                count: result.tracks_added,
+                title: result.collection_title,
+              });
+        setQueueNotice(notice);
+        window.setTimeout(() => setQueueNotice(null), 4000);
+      }
       await refreshTransport();
     } catch (e) {
       setError(String(e));
     }
   };
 
-  const playPlaylistById = async (playlistId: number) => {
+  const playPlaylistById = async (playlistId: number, shuffle?: boolean) => {
     if (!isTauri()) return;
     setBusy(t("busy.opening"));
     setError(null);
     try {
       const dto = await invoke<PlaylistDto>("play_playlist", {
         playlistId,
-        shuffle: true,
+        shuffle: shuffle ?? null,
       });
       setPlaylist(dto);
       setActiveView("nowPlaying");
@@ -1182,17 +1393,17 @@ export default function App() {
     try {
       const relaxId = await invoke<number | null>("find_relax_playlist");
       if (relaxId != null) {
-        await playPlaylistById(relaxId);
+        await playPlaylistById(relaxId, true);
         return;
       }
-      const music = await invoke<CollectionSummaryDto[]>("list_collections", {
+      const musicPage = await invoke<{ items: CollectionSummaryDto[] }>("list_collections", {
         kind: "music",
         filter: null,
         search: null,
         limit: 200,
         offset: 0,
       });
-      const available = music.filter((m) => !m.unavailable);
+      const available = musicPage.items.filter((m) => !m.unavailable);
       if (available.length === 0) {
         setError(t("home.noRelaxMusic"));
         return;
@@ -1209,9 +1420,17 @@ export default function App() {
     setBusy(t("library.busy.scanning"));
     setError(null);
     try {
-      await invoke("scan_library_root", { rootId });
+      const status = await invoke<ScanStatusDto>("scan_library_root", { rootId });
       await loadLibraryRoots();
       setLibraryRefreshKey((k) => k + 1);
+      setScanNotice(
+        t("library.scanDone", {
+          collections: status.collections_total,
+          tracks: status.tracks_total,
+          updated: status.tracks_updated,
+        }),
+      );
+      window.setTimeout(() => setScanNotice(null), 8000);
     } catch (e) {
       setError(String(e));
     } finally {
@@ -1354,6 +1573,19 @@ export default function App() {
     setAppPrefs((prev) => (prev ? { ...prev, resume_playing_on_launch: enabled } : prev));
     try {
       const p = await invoke<AppPrefsDto>("set_resume_playing_on_launch", { enabled });
+      setAppPrefs(p);
+    } catch (e) {
+      setError(String(e));
+      void loadAppPrefs();
+    }
+  };
+
+  const setPlaylistShufflePref = async (enabled: boolean) => {
+    if (!isTauri()) return;
+    setError(null);
+    setAppPrefs((prev) => (prev ? { ...prev, playlist_shuffle_on_play: enabled } : prev));
+    try {
+      const p = await invoke<AppPrefsDto>("set_playlist_shuffle_on_play", { enabled });
       setAppPrefs(p);
     } catch (e) {
       setError(String(e));
@@ -1702,7 +1934,7 @@ export default function App() {
   const isPlaying =
     hasTrack && transport != null && !transport.paused && !transport.eof && !transport.idle;
   const showMiniPlayer = hasSession && activeView !== "nowPlaying";
-  const showQueuePanel = activeView === "nowPlaying";
+  const showQueuePanel = hasQueue;
   const isMusicSession =
     playingCollectionKind === "music" ||
     transport?.active_collection_kind === "music" ||
@@ -1772,7 +2004,7 @@ export default function App() {
   return (
     <div className="app-shell">
       <a className="skip-link" href="#main-stage">
-        {activeView === "nowPlaying" ? t("skip.toPlayback") : t("nav.home")}
+        {t("skip.toMain")}
       </a>
 
       <div className="app-chrome">
@@ -1793,9 +2025,15 @@ export default function App() {
             <div className="menubar-menu">
               <button
                 type="button"
+                ref={(el) => {
+                  menubarTriggerRefs.current.file = el;
+                }}
                 className={`menubar-trigger${menuOpen === "file" ? " menubar-trigger--open" : ""}`}
                 aria-expanded={menuOpen === "file"}
                 aria-haspopup="menu"
+                aria-controls="menubar-menu-file"
+                id="menubar-trigger-file"
+                onKeyDown={(e) => onMenubarTriggerKeyDown(e, "file")}
                 onClick={(e) => {
                   e.stopPropagation();
                   setMenuOpen((m) => (m === "file" ? null : "file"));
@@ -1804,13 +2042,22 @@ export default function App() {
                 {t("menubar.file")}
               </button>
               {menuOpen === "file" ? (
-                <div className="menubar-dropdown" role="menu">
+                <div
+                  ref={(el) => {
+                    menubarDropdownRefs.current.file = el;
+                  }}
+                  id="menubar-menu-file"
+                  className="menubar-dropdown"
+                  role="menu"
+                  aria-labelledby="menubar-trigger-file"
+                  onKeyDown={(e) => onMenubarDropdownKeyDown(e, "file")}
+                >
                   <button
                     type="button"
                     role="menuitem"
                     className="menubar-item menubar-item--primary"
                     onClick={() => {
-                      setMenuOpen(null);
+                      closeMenu();
                       void linkLibraryFolder();
                     }}
                   >
@@ -1825,7 +2072,7 @@ export default function App() {
                     role="menuitem"
                     className="menubar-item"
                     onClick={() => {
-                      setMenuOpen(null);
+                      closeMenu();
                       void openFolder();
                     }}
                   >
@@ -1836,7 +2083,7 @@ export default function App() {
                     role="menuitem"
                     className="menubar-item"
                     onClick={() => {
-                      setMenuOpen(null);
+                      closeMenu();
                       void openFile();
                     }}
                   >
@@ -1848,7 +2095,7 @@ export default function App() {
                     role="menuitem"
                     className="menubar-item"
                     onClick={() => {
-                      setMenuOpen(null);
+                      closeMenu();
                       openPreferences();
                     }}
                   >
@@ -1861,9 +2108,15 @@ export default function App() {
             <div className="menubar-menu">
               <button
                 type="button"
+                ref={(el) => {
+                  menubarTriggerRefs.current.playback = el;
+                }}
                 className={`menubar-trigger${menuOpen === "playback" ? " menubar-trigger--open" : ""}`}
                 aria-expanded={menuOpen === "playback"}
                 aria-haspopup="menu"
+                aria-controls="menubar-menu-playback"
+                id="menubar-trigger-playback"
+                onKeyDown={(e) => onMenubarTriggerKeyDown(e, "playback")}
                 onClick={(e) => {
                   e.stopPropagation();
                   setMenuOpen((m) => (m === "playback" ? null : "playback"));
@@ -1872,14 +2125,24 @@ export default function App() {
                 {t("menubar.playback")}
               </button>
               {menuOpen === "playback" ? (
-                <div className="menubar-dropdown" role="menu">
+                <div
+                  ref={(el) => {
+                    menubarDropdownRefs.current.playback = el;
+                  }}
+                  id="menubar-menu-playback"
+                  className="menubar-dropdown"
+                  role="menu"
+                  aria-labelledby="menubar-trigger-playback"
+                  onKeyDown={(e) => onMenubarDropdownKeyDown(e, "playback")}
+                >
                   <button
                     type="button"
                     role="menuitem"
                     className="menubar-item"
                     disabled={!canTogglePlayback}
+                    aria-disabled={!canTogglePlayback}
                     onClick={() => {
-                      setMenuOpen(null);
+                      closeMenu();
                       void togglePause();
                     }}
                   >
@@ -1890,8 +2153,9 @@ export default function App() {
                     role="menuitem"
                     className="menubar-item"
                     disabled={!canSkipTransport}
+                    aria-disabled={!canSkipTransport}
                     onClick={() => {
-                      setMenuOpen(null);
+                      closeMenu();
                       void skipPrev();
                     }}
                   >
@@ -1902,8 +2166,9 @@ export default function App() {
                     role="menuitem"
                     className="menubar-item"
                     disabled={!canSkipTransport}
+                    aria-disabled={!canSkipTransport}
                     onClick={() => {
-                      setMenuOpen(null);
+                      closeMenu();
                       void skipNext();
                     }}
                   >
@@ -1915,8 +2180,9 @@ export default function App() {
                     role="menuitem"
                     className="menubar-item"
                     disabled={!canSeekTransport}
+                    aria-disabled={!canSeekTransport}
                     onClick={() => {
-                      setMenuOpen(null);
+                      closeMenu();
                       void seekDelta(-30);
                     }}
                   >
@@ -1927,8 +2193,9 @@ export default function App() {
                     role="menuitem"
                     className="menubar-item"
                     disabled={!canSeekTransport}
+                    aria-disabled={!canSeekTransport}
                     onClick={() => {
-                      setMenuOpen(null);
+                      closeMenu();
                       void seekDelta(30);
                     }}
                   >
@@ -1940,7 +2207,7 @@ export default function App() {
                     role="menuitem"
                     className="menubar-item"
                     onClick={() => {
-                      setMenuOpen(null);
+                      closeMenu();
                       setModalSheet("sleep");
                     }}
                   >
@@ -1953,9 +2220,15 @@ export default function App() {
             <div className="menubar-menu">
               <button
                 type="button"
+                ref={(el) => {
+                  menubarTriggerRefs.current.view = el;
+                }}
                 className={`menubar-trigger${menuOpen === "view" ? " menubar-trigger--open" : ""}`}
                 aria-expanded={menuOpen === "view"}
                 aria-haspopup="menu"
+                aria-controls="menubar-menu-view"
+                id="menubar-trigger-view"
+                onKeyDown={(e) => onMenubarTriggerKeyDown(e, "view")}
                 onClick={(e) => {
                   e.stopPropagation();
                   setMenuOpen((m) => (m === "view" ? null : "view"));
@@ -1964,13 +2237,22 @@ export default function App() {
                 {t("menubar.view")}
               </button>
               {menuOpen === "view" ? (
-                <div className="menubar-dropdown" role="menu">
+                <div
+                  ref={(el) => {
+                    menubarDropdownRefs.current.view = el;
+                  }}
+                  id="menubar-menu-view"
+                  className="menubar-dropdown"
+                  role="menu"
+                  aria-labelledby="menubar-trigger-view"
+                  onKeyDown={(e) => onMenubarDropdownKeyDown(e, "view")}
+                >
                   <button
                     type="button"
                     role="menuitem"
                     className="menubar-item"
                     onClick={() => {
-                      setMenuOpen(null);
+                      closeMenu();
                       scrollToPlayer();
                     }}
                   >
@@ -1980,8 +2262,10 @@ export default function App() {
                     type="button"
                     role="menuitem"
                     className="menubar-item"
+                    disabled={!hasQueue}
+                    aria-disabled={!hasQueue}
                     onClick={() => {
-                      setMenuOpen(null);
+                      closeMenu();
                       scrollToQueue();
                     }}
                   >
@@ -1994,9 +2278,15 @@ export default function App() {
             <div className="menubar-menu">
               <button
                 type="button"
+                ref={(el) => {
+                  menubarTriggerRefs.current.help = el;
+                }}
                 className={`menubar-trigger${menuOpen === "help" ? " menubar-trigger--open" : ""}`}
                 aria-expanded={menuOpen === "help"}
                 aria-haspopup="menu"
+                aria-controls="menubar-menu-help"
+                id="menubar-trigger-help"
+                onKeyDown={(e) => onMenubarTriggerKeyDown(e, "help")}
                 onClick={(e) => {
                   e.stopPropagation();
                   setMenuOpen((m) => (m === "help" ? null : "help"));
@@ -2005,13 +2295,22 @@ export default function App() {
                 {t("menubar.help")}
               </button>
               {menuOpen === "help" ? (
-                <div className="menubar-dropdown" role="menu">
+                <div
+                  ref={(el) => {
+                    menubarDropdownRefs.current.help = el;
+                  }}
+                  id="menubar-menu-help"
+                  className="menubar-dropdown"
+                  role="menu"
+                  aria-labelledby="menubar-trigger-help"
+                  onKeyDown={(e) => onMenubarDropdownKeyDown(e, "help")}
+                >
                   <button
                     type="button"
                     role="menuitem"
                     className="menubar-item"
                     onClick={() => {
-                      setMenuOpen(null);
+                      closeMenu();
                       setModalSheet("shortcuts");
                     }}
                   >
@@ -2022,7 +2321,7 @@ export default function App() {
                     role="menuitem"
                     className="menubar-item"
                     onClick={() => {
-                      setMenuOpen(null);
+                      closeMenu();
                       setModalSheet("about");
                     }}
                   >
@@ -2070,6 +2369,21 @@ export default function App() {
                 className="btn btn-ghost btn-compact"
                 aria-label={t("alert.dismiss")}
                 onClick={() => setDriveNotice(null)}
+              >
+                {t("alert.dismiss")}
+              </button>
+            </div>
+          </div>
+        ) : null}
+        {scanNotice ? (
+          <div className="library-prompt-banner library-prompt-banner--info" role="status">
+            <div className="library-prompt-row">
+              <p>{scanNotice}</p>
+              <button
+                type="button"
+                className="btn btn-ghost btn-compact"
+                aria-label={t("alert.dismiss")}
+                onClick={() => setScanNotice(null)}
               >
                 {t("alert.dismiss")}
               </button>
@@ -2193,7 +2507,7 @@ export default function App() {
           {activeView === "home" ? (
             <HomeView
               refreshKey={libraryRefreshKey}
-              onPlayCollection={(id, mode) => void playCollection(id, mode)}
+              onPlayCollection={(id, mode, shuffle) => void playCollection(id, mode, shuffle)}
               onAddToQueue={(id, position) => void enqueueCollection(id, position)}
               onOpenDetail={openCollectionDetail}
               onShuffleRelax={() => void shuffleRelax()}
@@ -2202,14 +2516,17 @@ export default function App() {
               onOpenFile={() => void openFile()}
               onBrowseAudiobooks={() => setActiveView("audiobooks")}
               onBrowseMusic={() => setActiveView("music")}
+              onRemoveCollection={confirmRemoveCollection}
             />
           ) : activeView === "audiobooks" ? (
             <CatalogView
               kind="audiobook"
               refreshKey={libraryRefreshKey}
-              onPlayCollection={(id, mode) => void playCollection(id, mode)}
+              onPlayCollection={(id, mode, shuffle) => void playCollection(id, mode, shuffle)}
               onOpenDetail={openCollectionDetail}
               onAddToQueue={(id, position) => void enqueueCollection(id, position)}
+              onLibraryChanged={onCollectionDetailChanged}
+              openConfirm={openConfirm}
               onLinkFolder={() => void linkLibraryFolder()}
               onOpenFolder={() => void openFolder()}
               onRemoveCollection={confirmRemoveCollection}
@@ -2218,9 +2535,27 @@ export default function App() {
             <CatalogView
               kind="music"
               refreshKey={libraryRefreshKey}
-              onPlayCollection={(id, mode) => void playCollection(id, mode)}
+              onPlayCollection={(id, mode, shuffle) => void playCollection(id, mode, shuffle)}
               onOpenDetail={openCollectionDetail}
               onAddToQueue={(id, position) => void enqueueCollection(id, position)}
+              onPlayAll={({ filter, search, shuffle }) =>
+                void playKindCatalog(
+                  "music",
+                  filter === "all" ? null : filter,
+                  search.trim() || null,
+                  shuffle,
+                )
+              }
+              onAddAllToQueue={({ filter, search, position }) =>
+                void enqueueKindCatalog(
+                  "music",
+                  filter === "all" ? null : filter,
+                  search.trim() || null,
+                  position,
+                )
+              }
+              onLibraryChanged={onCollectionDetailChanged}
+              openConfirm={openConfirm}
               onLinkFolder={() => void linkLibraryFolder()}
               onOpenFolder={() => void openFolder()}
               onRemoveCollection={confirmRemoveCollection}
@@ -2235,7 +2570,7 @@ export default function App() {
             />
           ) : activeView === "playlists" ? (
             <PlaylistsView
-              onPlayPlaylist={(id) => void playPlaylistById(id)}
+              onPlayPlaylist={(id, shuffle) => void playPlaylistById(id, shuffle)}
               openConfirm={openConfirm}
               onLibraryChanged={() => {
                 void loadLibraryRoots();
@@ -2267,6 +2602,8 @@ export default function App() {
               onTogglePause={() => void togglePause()}
               onSkipPrev={() => void skipPrev()}
               onSkipNext={() => void skipNext()}
+              onShuffleQueue={() => void shuffleQueue()}
+              queueLength={playlist?.items.length ?? 0}
               onSetSpeed={(s) => void setSpeed(s)}
               onSetDefaultSpeed={(s) => void setDefaultSpeed(s)}
               onResetTrackSpeed={() => void resetTrackSpeed()}
@@ -2629,9 +2966,9 @@ export default function App() {
           className="modal-backdrop"
           role="presentation"
           data-modal-open
-          onClick={() => setModalSheet(null)}
+          onClick={() => closeModal()}
           onKeyDown={(e) => {
-            if (e.key === "Escape") setModalSheet(null);
+            if (e.key === "Escape") closeModal();
           }}
         >
           <div
@@ -2733,6 +3070,22 @@ export default function App() {
                         <span className="prefs-row-label">{t("prefs.resume")}</span>
                         <span className="hint prefs-hint" id="prefs-resume-hint">
                           {t("prefs.resumeHint")}
+                        </span>
+                      </span>
+                    </label>
+                    <label className="prefs-row prefs-row--toggle">
+                      <input
+                        type="checkbox"
+                        className="prefs-checkbox"
+                        checked={!!appPrefs?.playlist_shuffle_on_play}
+                        disabled={!isTauri() || appPrefs == null}
+                        aria-describedby="prefs-playlist-shuffle-hint"
+                        onChange={(e) => void setPlaylistShufflePref(e.target.checked)}
+                      />
+                      <span className="prefs-row-text">
+                        <span className="prefs-row-label">{t("prefs.playlistShuffle")}</span>
+                        <span className="hint prefs-hint" id="prefs-playlist-shuffle-hint">
+                          {t("prefs.playlistShuffleHint")}
                         </span>
                       </span>
                     </label>
@@ -2947,12 +3300,14 @@ export default function App() {
       {collectionDetailId != null ? (
         <CollectionDetailSheet
           collectionId={collectionDetailId}
+          refreshKey={libraryRefreshKey}
           onlineMetadataEnabled={!!appPrefs?.online_metadata_enabled}
           onClose={() => setCollectionDetailId(null)}
-          onPlayCollection={(id, mode) => void playCollection(id, mode)}
+          onPlayCollection={(id, mode, shuffle) => void playCollection(id, mode, shuffle)}
           onAddToQueue={(id, position) => void enqueueCollection(id, position)}
           onChanged={onCollectionDetailChanged}
           openConfirm={openConfirm}
+          dialogSuspended={modalSheet === "confirm"}
         />
       ) : null}
     </div>

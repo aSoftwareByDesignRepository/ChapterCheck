@@ -59,6 +59,9 @@ type Props = {
   onDeleteSessionFiles: () => void;
   deleteSessionLabel?: string | null;
   onOpenDetails?: () => void;
+  onShuffleQueue?: () => void;
+  queueLength?: number;
+  currentPath?: string | null;
   osMediaActive?: boolean;
 };
 
@@ -93,6 +96,8 @@ export function NowPlayingView({
   onDeleteSessionFiles,
   deleteSessionLabel,
   onOpenDetails,
+  onShuffleQueue,
+  queueLength = 0,
   currentPath,
   osMediaActive = false,
 }: Props) {
@@ -213,6 +218,19 @@ export function NowPlayingView({
               void onSeekTo(v);
             }}
             onPointerCancel={() => setSeekUi(null)}
+            onKeyUp={(e) => {
+              if (e.key === "Enter" || e.key === " ") {
+                const v = Number((e.currentTarget as HTMLInputElement).value);
+                setSeekUi(null);
+                void onSeekTo(v);
+              }
+            }}
+            onBlur={(e) => {
+              if (seekUi == null) return;
+              const v = Number((e.currentTarget as HTMLInputElement).value);
+              setSeekUi(null);
+              void onSeekTo(v);
+            }}
           />
         </div>
 
@@ -270,19 +288,27 @@ export function NowPlayingView({
             >
               <IconSkipNext />
             </button>
+            {onShuffleQueue ? (
+              <button
+                className="btn btn-ghost transport-shuffle-btn"
+                type="button"
+                title={t("nowPlaying.shuffleQueueTitle")}
+                aria-label={t("nowPlaying.shuffleQueueTitle")}
+                disabled={!hasQueue || queueLength < 2}
+                onClick={() => void onShuffleQueue()}
+              >
+                {t("nowPlaying.shuffleQueue")}
+              </button>
+            ) : null}
           </div>
-          <div className="transport-headphone" role="status" aria-live="polite">
-            <p className="transport-hint">
-              {osMediaActive ? t("nowPlaying.headphoneHint") : t("nowPlaying.headphoneHintFallback")}
-            </p>
-            <span
-              className={`transport-headphone-badge${osMediaActive ? " transport-headphone-badge--on" : ""}`}
-            >
-              {osMediaActive
-                ? t("nowPlaying.headphoneStatusOn")
-                : t("nowPlaying.headphoneStatusOff")}
-            </span>
-          </div>
+          {osMediaActive ? (
+            <div className="transport-headphone" role="status" aria-live="polite">
+              <p className="transport-hint">{t("nowPlaying.headphoneHint")}</p>
+              <span className="transport-headphone-badge transport-headphone-badge--on">
+                {t("nowPlaying.headphoneStatusOn")}
+              </span>
+            </div>
+          ) : null}
         </div>
 
         {!isMusicSession && chapters.length > 0 ? (
