@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-delete-session-files"
+description = "Enables the delete_session_files command without any pre-configured scope."
+commands.allow = ["delete_session_files"]
+
+[[permission]]
+identifier = "deny-delete-session-files"
+description = "Denies the delete_session_files command without any pre-configured scope."
+commands.deny = ["delete_session_files"]

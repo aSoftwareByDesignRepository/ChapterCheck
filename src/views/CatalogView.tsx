@@ -1,9 +1,14 @@
 import { invoke } from "@tauri-apps/api/core";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { MediaRow } from "../components/MediaRow";
 import { IconPlaySm } from "../components/PlayerIcons";
 import { useI18n } from "../i18n/I18nContext";
 import type { CollectionListPageDto, SetCollectionsKindResult } from "../types/catalog";
+import {
+  parseCatalogFilter,
+  shouldApplyAsyncResult,
+  type CatalogFilter,
+} from "../utils/viewLogic";
 
 const PAGE_SIZE = 50;
 
@@ -21,16 +26,14 @@ type Props = {
   onPlayCollection: (id: number, mode: "continue" | "start", shuffle?: boolean) => void;
   onOpenDetail: (id: number) => void;
   onAddToQueue?: (id: number, position: "next" | "end") => void;
-  onPlayAll?: (opts: { filter: Filter; search: string; shuffle?: boolean }) => void;
-  onAddAllToQueue?: (opts: { filter: Filter; search: string; position: "next" | "end" }) => void;
+  onPlayAll?: (opts: { filter: CatalogFilter; search: string; shuffle?: boolean }) => void;
   onLinkFolder?: () => void;
-  onOpenFolder?: () => void;
   onRemoveCollection?: (id: number, title: string) => void;
   onLibraryChanged?: () => void;
   openConfirm?: (cfg: ConfirmCfg) => void;
 };
 
-type Filter = "all" | "in-progress" | "finished" | "away";
+type Filter = CatalogFilter;
 
 export function CatalogView({
   kind,
@@ -39,9 +42,7 @@ export function CatalogView({
   onOpenDetail,
   onAddToQueue,
   onPlayAll,
-  onAddAllToQueue,
   onLinkFolder,
-  onOpenFolder,
   onRemoveCollection,
   onLibraryChanged,
   openConfirm,
@@ -59,10 +60,14 @@ export function CatalogView({
   const [kindBusy, setKindBusy] = useState(false);
   const [selectAllBusy, setSelectAllBusy] = useState(false);
   const [kindNotice, setKindNotice] = useState<string | null>(null);
+  const requestId = useRef(0);
+  const hadPage = useRef(false);
+  const queryEpoch = useRef(0);
+  const selectAllGen = useRef(0);
 
   const load = useCallback(async () => {
-    setLoading(true);
-    setError(null);
+    const id = ++requestId.current;
+    if (!hadPage.current) setLoading(true);
     try {
       const result = await invoke<CollectionListPageDto>("list_collections", {
         kind,
@@ -71,25 +76,38 @@ export function CatalogView({
         limit: PAGE_SIZE,
         offset: pageIndex * PAGE_SIZE,
       });
+      if (!shouldApplyAsyncResult(id, requestId.current)) return;
       setPage(result);
+      setError(null);
+      hadPage.current = true;
       const maxPage = Math.max(0, Math.ceil(result.total / PAGE_SIZE) - 1);
       if (pageIndex > maxPage) {
         setPageIndex(maxPage);
       }
     } catch (e) {
-      setPage(null);
+      if (!shouldApplyAsyncResult(id, requestId.current)) return;
       setError(String(e));
     } finally {
-      setLoading(false);
+      if (shouldApplyAsyncResult(id, requestId.current)) {
+        setLoading(false);
+      }
     }
   }, [kind, filter, search, pageIndex]);
 
   useEffect(() => {
+    hadPage.current = false;
+    setPage(null);
+    setLoading(true);
     setPageIndex(0);
     setSelectMode(false);
     setSelectedIds(new Set());
     setBulkErrors([]);
   }, [kind, refreshKey]);
+
+  useEffect(() => {
+    queryEpoch.current += 1;
+    setSelectAllBusy(false);
+  }, [kind, filter, search]);
 
   useEffect(() => {
     const tmr = window.setTimeout(() => void load(), search ? 200 : 0);
@@ -104,7 +122,6 @@ export function CatalogView({
   ];
 
   const title = kind === "audiobook" ? t("nav.audiobooks") : t("nav.music");
-  const lead = kind === "audiobook" ? t("catalog.audiobooksLead") : t("catalog.musicLead");
   const items = page?.items ?? [];
   const total = page?.total ?? 0;
   const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
@@ -143,6 +160,8 @@ export function CatalogView({
   };
 
   const selectAllMatching = async () => {
+    const gen = ++selectAllGen.current;
+    const epoch = queryEpoch.current;
     setSelectAllBusy(true);
     setError(null);
     try {
@@ -151,11 +170,15 @@ export function CatalogView({
         filter: filter === "all" ? null : filter,
         search: search.trim() || null,
       });
+      if (gen !== selectAllGen.current || epoch !== queryEpoch.current) return;
       setSelectedIds(new Set(ids));
     } catch (e) {
+      if (gen !== selectAllGen.current || epoch !== queryEpoch.current) return;
       setError(String(e));
     } finally {
-      setSelectAllBusy(false);
+      if (gen === selectAllGen.current) {
+        setSelectAllBusy(false);
+      }
     }
   };
 
@@ -220,42 +243,27 @@ export function CatalogView({
     <div className="view-panel catalog-view">
       <header className="catalog-head">
         <div className="catalog-head-text">
-          <h2 className="view-title">{title}</h2>
-          <p className="view-lead catalog-lead">{lead}</p>
+          <h1 className="view-title">{title}</h1>
         </div>
 
         {showBulkPlayback && onPlayAll ? (
-          <section className="catalog-section" aria-labelledby="catalog-playback-heading">
-            <h3 id="catalog-playback-heading" className="catalog-section-title">
-              {t("catalog.playbackSectionMusic")}
-            </h3>
-            <div className="catalog-bulk-actions" role="group" aria-label={t("catalog.playbackSectionMusic")}>
-              <button
-                type="button"
-                className="btn btn-primary btn-compact catalog-bulk-play"
-                onClick={() => onPlayAll({ filter, search, shuffle: false })}
-              >
-                <IconPlaySm />
-                <span>{t("catalog.playAll")}</span>
-              </button>
-              <button
-                type="button"
-                className="btn btn-secondary btn-compact"
-                onClick={() => onPlayAll({ filter, search, shuffle: true })}
-              >
-                {t("catalog.shuffleAll")}
-              </button>
-              {onAddAllToQueue ? (
-                <button
-                  type="button"
-                  className="btn btn-secondary btn-compact"
-                  onClick={() => onAddAllToQueue({ filter, search, position: "end" })}
-                >
-                  {t("catalog.queueAll")}
-                </button>
-              ) : null}
-            </div>
-          </section>
+          <div className="catalog-bulk-actions" role="group" aria-label={t("catalog.playbackSectionMusic")}>
+            <button
+              type="button"
+              className="btn btn-primary catalog-bulk-play"
+              onClick={() => onPlayAll({ filter, search, shuffle: false })}
+            >
+              <IconPlaySm />
+              <span>{t("catalog.playAll")}</span>
+            </button>
+            <button
+              type="button"
+              className="btn btn-secondary"
+              onClick={() => onPlayAll({ filter, search, shuffle: true })}
+            >
+              {t("catalog.shuffleAll")}
+            </button>
+          </div>
         ) : null}
 
         <section className="catalog-section catalog-section--toolbar" aria-label={t("catalog.searchLabel")}>
@@ -274,28 +282,28 @@ export function CatalogView({
                   setSearch(e.target.value);
                   setPageIndex(0);
                 }}
-                aria-label={t("catalog.searchPlaceholder")}
               />
             </div>
 
-            <div className="catalog-toolbar-filters" role="group" aria-label={t("catalog.sectionFilters")}>
-              <span className="field-label">{t("catalog.sectionFilters")}</span>
-              <div className="catalog-filters-buttons">
+            <div className="catalog-toolbar-filters">
+              <label className="catalog-toolbar-search-label" htmlFor="catalog-filter-select">
+                <span className="field-label">{t("catalog.filters")}</span>
+              </label>
+              <select
+                id="catalog-filter-select"
+                className="select catalog-filter-select"
+                value={filter}
+                onChange={(e) => {
+                  setFilter(parseCatalogFilter(e.target.value));
+                  setPageIndex(0);
+                }}
+              >
                 {filters.map((f) => (
-                  <button
-                    key={f.id}
-                    type="button"
-                    className={`btn btn-ghost btn-compact${filter === f.id ? " btn-compact--active" : ""}`}
-                    aria-pressed={filter === f.id}
-                    onClick={() => {
-                      setFilter(f.id);
-                      setPageIndex(0);
-                    }}
-                  >
+                  <option key={f.id} value={f.id}>
                     {f.label}
-                  </button>
+                  </option>
                 ))}
-              </div>
+              </select>
             </div>
 
             {showSelectToggle ? (
@@ -321,9 +329,12 @@ export function CatalogView({
       </header>
 
       {error ? (
-        <p className="view-error catalog-error" role="alert">
-          {error}
-        </p>
+        <div className="view-error catalog-error" role="alert">
+          <p>{error}</p>
+          <button type="button" className="btn btn-secondary btn-compact" onClick={() => void load()}>
+            {t("catalog.retry")}
+          </button>
+        </div>
       ) : null}
 
       {bulkErrors.length > 0 ? (
@@ -393,7 +404,7 @@ export function CatalogView({
         </div>
       ) : null}
 
-      {loading ? (
+      {loading && items.length === 0 ? (
         <p className="view-loading" aria-live="polite">
           {t("home.loading")}
         </p>
@@ -411,21 +422,15 @@ export function CatalogView({
               <div className="view-empty-actions">
                 {onLinkFolder ? (
                   <button type="button" className="btn btn-primary" onClick={onLinkFolder}>
-                    {t("library.linkFolder")}
-                  </button>
-                ) : null}
-                {onOpenFolder ? (
-                  <button type="button" className="btn btn-ghost" onClick={onOpenFolder}>
-                    {t("sidebar.openFolder")}
+                    {t("home.addFolderCta")}
                   </button>
                 ) : null}
               </div>
-              <p className="view-empty-hint">{t("catalog.emptyQuick")}</p>
             </>
           )}
         </div>
-      ) : !loading && items.length > 0 ? (
-        <section className="catalog-results" aria-label={title}>
+      ) : items.length > 0 ? (
+        <section className="catalog-results" aria-label={title} aria-busy={loading}>
           <p className="catalog-results-meta" aria-live="polite">
             {showPagination
               ? t("catalog.resultsRange", {

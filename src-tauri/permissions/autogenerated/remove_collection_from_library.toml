@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-remove-collection-from-library"
+description = "Enables the remove_collection_from_library command without any pre-configured scope."
+commands.allow = ["remove_collection_from_library"]
+
+[[permission]]
+identifier = "deny-remove-collection-from-library"
+description = "Denies the remove_collection_from_library command without any pre-configured scope."
+commands.deny = ["remove_collection_from_library"]

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-mark-collection-listened"
+description = "Enables the mark_collection_listened command without any pre-configured scope."
+commands.allow = ["mark_collection_listened"]
+
+[[permission]]
+identifier = "deny-mark-collection-listened"
+description = "Denies the mark_collection_listened command without any pre-configured scope."
+commands.deny = ["mark_collection_listened"]

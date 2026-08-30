@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-pick-open-folder"
+description = "Enables the pick_open_folder command without any pre-configured scope."
+commands.allow = ["pick_open_folder"]
+
+[[permission]]
+identifier = "deny-pick-open-folder"
+description = "Denies the pick_open_folder command without any pre-configured scope."
+commands.deny = ["pick_open_folder"]

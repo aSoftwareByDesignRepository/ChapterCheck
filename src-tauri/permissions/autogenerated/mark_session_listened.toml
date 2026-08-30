@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-mark-session-listened"
+description = "Enables the mark_session_listened command without any pre-configured scope."
+commands.allow = ["mark_session_listened"]
+
+[[permission]]
+identifier = "deny-mark-session-listened"
+description = "Denies the mark_session_listened command without any pre-configured scope."
+commands.deny = ["mark_session_listened"]

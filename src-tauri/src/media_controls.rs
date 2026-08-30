@@ -162,7 +162,7 @@ fn run(app: AppHandle) -> Result<(), ()> {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MediaActionClass {
     Transport,
     Skip,
@@ -179,6 +179,22 @@ fn action_class(event: &MediaControlEvent) -> MediaActionClass {
     }
 }
 
+/// Pure debounce decision (headset double-taps). Seek is never debounced.
+fn should_debounce_class(
+    prev: Option<MediaActionClass>,
+    prev_at: Instant,
+    now: Instant,
+    class: MediaActionClass,
+) -> bool {
+    if class == MediaActionClass::Seek {
+        return false;
+    }
+    match prev {
+        Some(p) if p == class && now.duration_since(prev_at) < Duration::from_millis(280) => true,
+        _ => false,
+    }
+}
+
 /// Drop duplicate transport events within a short window (common with BT headsets
 /// and when both MPRIS and the webview receive the same key).
 fn should_debounce_event(event: &MediaControlEvent) -> bool {
@@ -189,15 +205,11 @@ fn should_debounce_event(event: &MediaControlEvent) -> bool {
     };
     let now = Instant::now();
     let class = action_class(event);
+    let drop = should_debounce_class(last.0, last.1, now, class);
     if class != MediaActionClass::Seek {
-        if let Some(prev) = last.0 {
-            if prev == class && now.duration_since(last.1) < Duration::from_millis(280) {
-                return true;
-            }
-        }
         *last = (Some(class), now);
     }
-    false
+    drop
 }
 
 /// Route a hardware media event into the playback engine using the same
@@ -256,9 +268,14 @@ fn raise_window(app: &AppHandle) {
 
 fn snapshot(app: &AppHandle) -> Option<OsMediaSnapshot> {
     let state = app.state::<AppState>();
+    // Peek mpv first and drop that lock before the catalog lock (never mpv→wait-inner).
+    let peek = match state.mpv.try_lock() {
+        Ok(mut mpv) => mpv.peek_transport(),
+        Err(_) => return None,
+    };
     for _ in 0..12 {
         if let Ok(mut guard) = state.inner.try_lock() {
-            return Some(guard.os_media_snapshot());
+            return Some(guard.os_media_snapshot(peek));
         }
         std::thread::sleep(Duration::from_millis(5));
     }
@@ -311,5 +328,109 @@ fn safe_duration(secs: f64) -> Option<Duration> {
         Some(Duration::from_secs_f64(secs))
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn seek_step_is_thirty_seconds_for_audiobook_keys() {
+        assert_eq!(SEEK_STEP_SECS, 30.0);
+    }
+
+    #[test]
+    fn player_dbus_name_is_stable() {
+        assert_eq!(player_dbus_name(), "org.mpris.MediaPlayer2.chaptercheck");
+    }
+
+    #[test]
+    fn action_class_separates_seek_skip_and_transport() {
+        assert_eq!(
+            action_class(&MediaControlEvent::Seek(SeekDirection::Forward)),
+            MediaActionClass::Seek
+        );
+        assert_eq!(
+            action_class(&MediaControlEvent::SetPosition(MediaPosition(
+                Duration::from_secs(1)
+            ))),
+            MediaActionClass::Seek
+        );
+        assert_eq!(action_class(&MediaControlEvent::Next), MediaActionClass::Skip);
+        assert_eq!(
+            action_class(&MediaControlEvent::Previous),
+            MediaActionClass::Skip
+        );
+        assert_eq!(
+            action_class(&MediaControlEvent::Play),
+            MediaActionClass::Transport
+        );
+        assert_eq!(
+            action_class(&MediaControlEvent::Toggle),
+            MediaActionClass::Transport
+        );
+    }
+
+    #[test]
+    fn debounce_drops_rapid_duplicate_transport_but_not_seek() {
+        let t0 = Instant::now();
+        let t1 = t0 + Duration::from_millis(50);
+        let t2 = t0 + Duration::from_millis(400);
+        let at_window = t0 + Duration::from_millis(280);
+        let just_inside = t0 + Duration::from_millis(279);
+        assert!(
+            should_debounce_class(Some(MediaActionClass::Transport), t0, t1, MediaActionClass::Transport),
+            "double PlayPause within 280ms must debounce"
+        );
+        assert!(
+            should_debounce_class(
+                Some(MediaActionClass::Transport),
+                t0,
+                just_inside,
+                MediaActionClass::Transport
+            ),
+            "279ms is still inside the window"
+        );
+        assert!(
+            !should_debounce_class(
+                Some(MediaActionClass::Transport),
+                t0,
+                at_window,
+                MediaActionClass::Transport
+            ),
+            "age == 280ms must pass (strict <); kills < → <="
+        );
+        assert!(
+            !should_debounce_class(Some(MediaActionClass::Transport), t0, t2, MediaActionClass::Transport),
+            "after the window a second tap must pass"
+        );
+        assert!(
+            !should_debounce_class(Some(MediaActionClass::Transport), t0, t1, MediaActionClass::Skip),
+            "different class must not debounce"
+        );
+        assert!(
+            !should_debounce_class(Some(MediaActionClass::Seek), t0, t1, MediaActionClass::Seek),
+            "seek must never debounce"
+        );
+        assert!(!should_debounce_class(None, t0, t1, MediaActionClass::Transport));
+    }
+
+    #[test]
+    fn safe_duration_rejects_negative_and_non_finite() {
+        assert!(safe_duration(0.0).is_some());
+        assert!(safe_duration(12.5).is_some());
+        assert!(safe_duration(-0.1).is_none());
+        assert!(safe_duration(f64::NAN).is_none());
+        assert!(safe_duration(f64::INFINITY).is_none());
+    }
+
+    #[test]
+    fn stopped_snapshot_has_no_track() {
+        let s = OsMediaSnapshot::stopped();
+        assert!(!s.has_track);
+        assert!(s.stopped);
+        assert!(!s.playing);
+        assert!(s.track_key.is_empty());
     }
 }

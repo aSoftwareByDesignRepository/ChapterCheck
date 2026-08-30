@@ -26,6 +26,8 @@
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
+    "test": "vitest run",
+    "test:mutate": "stryker run",
     "tauri": "tauri",
     "install:deb": "bash scripts/install-deb.sh",
     "ship": "npm run tauri build && npm run install:deb",
@@ -39,11 +41,17 @@
     "react-dom": "^18.3.1"
   },
   "devDependencies": {
+    "@stryker-mutator/core": "^10.0.0",
+    "@stryker-mutator/vitest-runner": "^10.0.0",
     "@tauri-apps/cli": "^2.1.0",
+    "@testing-library/react": "^16.3.3",
     "@types/react": "^18.3.12",
     "@types/react-dom": "^18.3.1",
     "@vitejs/plugin-react": "^4.3.4",
+    "axe-core": "^4.13.0",
+    "jsdom": "^29.1.1",
     "typescript": "~5.6.3",
-    "vite": "^6.0.1"
+    "vite": "^6.0.1",
+    "vitest": "^3.2.4"
   }
 }

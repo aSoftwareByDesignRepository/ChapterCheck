@@ -5,3 +5,7 @@ src-tauri/target
 *.log
 .env
 .env.*
+.stryker-tmp
+reports
+src-tauri/mutants.out
+src-tauri/mutants.out.old

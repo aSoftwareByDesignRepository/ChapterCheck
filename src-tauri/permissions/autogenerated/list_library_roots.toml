@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-list-library-roots"
+description = "Enables the list_library_roots command without any pre-configured scope."
+commands.allow = ["list_library_roots"]
+
+[[permission]]
+identifier = "deny-list-library-roots"
+description = "Denies the list_library_roots command without any pre-configured scope."
+commands.deny = ["list_library_roots"]

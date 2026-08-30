@@ -35,7 +35,9 @@ export function MediaCard({ item, onPlay, onOpen }: Props) {
   return (
     <article
       className={cardClass}
-      aria-label={`${item.title}${item.subtitle ? `, ${item.subtitle}` : ""}`}
+      aria-label={`${item.title}${item.subtitle ? `, ${item.subtitle}` : ""}${
+        item.in_progress && !item.listened ? `, ${Math.round(item.progress_pct)}%` : ""
+      }`}
     >
       <button type="button" className="media-card-hit" onClick={() => onOpen(item.id)}>
         <div className="media-card-cover" aria-hidden="true">

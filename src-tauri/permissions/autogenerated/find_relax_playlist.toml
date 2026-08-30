@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-find-relax-playlist"
+description = "Enables the find_relax_playlist command without any pre-configured scope."
+commands.allow = ["find_relax_playlist"]
+
+[[permission]]
+identifier = "deny-find-relax-playlist"
+description = "Denies the find_relax_playlist command without any pre-configured scope."
+commands.deny = ["find_relax_playlist"]

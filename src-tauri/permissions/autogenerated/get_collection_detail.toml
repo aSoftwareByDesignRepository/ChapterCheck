@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-get-collection-detail"
+description = "Enables the get_collection_detail command without any pre-configured scope."
+commands.allow = ["get_collection_detail"]
+
+[[permission]]
+identifier = "deny-get-collection-detail"
+description = "Denies the get_collection_detail command without any pre-configured scope."
+commands.deny = ["get_collection_detail"]

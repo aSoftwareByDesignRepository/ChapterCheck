@@ -38,6 +38,14 @@ export function IconPlaySm({ className }: { className?: string }) {
   );
 }
 
+export function IconSleep({ className }: { className?: string }) {
+  return (
+    <svg className={className} width="20" height="20" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+      <path d="M12.1 21.5A9.5 9.5 0 0 1 9.6 3.1a.75.75 0 0 1 .9 1.05 7.9 7.9 0 0 0 9.3 10.7.75.75 0 0 1 .85 1.15 9.5 9.5 0 0 1-8.55 5.5Z" />
+    </svg>
+  );
+}
+
 export function IconQueueAdd({ className }: { className?: string }) {
   return (
     <svg className={className} width="20" height="20" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">

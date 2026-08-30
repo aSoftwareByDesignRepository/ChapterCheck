@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-play-collection"
+description = "Enables the play_collection command without any pre-configured scope."
+commands.allow = ["play_collection"]
+
+[[permission]]
+identifier = "deny-play-collection"
+description = "Denies the play_collection command without any pre-configured scope."
+commands.deny = ["play_collection"]

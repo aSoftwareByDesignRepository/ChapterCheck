@@ -1,19 +1,23 @@
 mod catalog;
+mod ipc_allowlist;
 mod db;
+mod fs_privacy;
+mod picker_grant;
+mod destructive_grant;
 #[cfg(target_os = "linux")]
 mod media_controls;
 mod mpv;
 mod path_policy;
 
-use path_policy::tracked_file_on_disk;
+use path_policy::{canonicalize_existing, tracked_file_on_disk};
 
 use catalog::{
-    AddLibraryRootInput, AddToLibraryInput, CatalogService, CollectionMetadataInput,
+    AddLibraryRootInput, CatalogService, CollectionMetadataInput,
     fetch_metadata_online, MetadataLookupPlan, MetadataSuggestionDto, PREF_ONLINE_METADATA,
     PREF_REPEAT_MODE, SESSION_COLLECTION_ID, SESSION_PLAYBACK_KIND, SESSION_PLAYLIST_ID,
 };
 use db::{LibraryDb, MediaRow};
-use mpv::{MpvController, MpvError};
+use mpv::{MpvController, MpvError, MpvTransportRead};
 use serde::{Deserialize, Serialize};
 use rand::seq::SliceRandom;
 use rand::thread_rng;
@@ -22,12 +26,14 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
+use std::thread;
+use std::time::Duration;
+use std::sync::{Mutex, TryLockError};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, Manager, WindowEvent};
 #[cfg(desktop)]
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem, Submenu};
-use tauri_plugin_dialog::DialogExt;
+use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
 
 const AUDIO_EXT: &[&str] = &[
     "mp3", "m4a", "m4b", "aac", "flac", "ogg", "opus", "wav", "wma", "aiff", "aif", "oga",
@@ -43,12 +49,125 @@ const PREF_RESUME_PLAYING_ON_LAUNCH: &str = "pref.resume_playing_on_launch";
 const PREF_SCAN_SUBFOLDERS: &str = "pref.scan_subfolders";
 const PREF_PLAYLIST_SHUFFLE: &str = "pref.playlist_shuffle";
 const PREF_UI_LOCALE: &str = "pref.ui_locale";
+const PREF_SLEEP_DEADLINE: &str = "session.sleep_deadline_ms";
+const PREF_STOP_AFTER_TRACK: &str = "session.stop_after_track";
+const SLEEP_MIN_MINUTES: u32 = 1;
+const SLEEP_MAX_MINUTES: u32 = 180;
+/// PlayPause right after sleep fire must not resume (headset toggle / accidental bump).
+const SLEEP_TOGGLE_GRACE_MS: i64 = 2_000;
 
 /// Headphones / MPRIS "Previous" restart the current track when playback is past this point.
 const TRACK_RESTART_SECS: f64 = 3.0;
 
 /// Ensures session persistence runs at most once per process exit.
 static CLOSE_PERSISTED: AtomicBool = AtomicBool::new(false);
+
+
+fn now_unix_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+fn parse_sleep_deadline(raw: Option<String>) -> Option<i64> {
+    let s = raw?;
+    let ms = s.trim().parse::<i64>().ok()?;
+    if ms > 0 {
+        Some(ms)
+    } else {
+        None
+    }
+}
+
+fn sleep_deadline_from_minutes(minutes: u32, now_ms: i64) -> Result<i64, String> {
+    if minutes < SLEEP_MIN_MINUTES || minutes > SLEEP_MAX_MINUTES {
+        return Err(format!(
+            "Sleep timer must be between {SLEEP_MIN_MINUTES} and {SLEEP_MAX_MINUTES} minutes."
+        ));
+    }
+    Ok(now_ms.saturating_add(i64::from(minutes) * 60_000))
+}
+
+fn apply_sleep_if_due(state: &AppState) -> bool {
+    let due = match state.lock_inner() {
+        Ok(g) => g.sleep_deadline_due(now_unix_ms()),
+        Err(_) => false,
+    };
+    if !due {
+        return false;
+    }
+    // try_lock: a held 8s command must not pin the watchdog or get_transport.
+    // Deadline stays due; the next 500ms tick retries.
+    let Some(mut mpv) = state.try_lock_mpv() else {
+        return false;
+    };
+    mpv.pause_or_kill();
+    drop(mpv);
+    let claimed = match state.lock_inner() {
+        Ok(mut g) => g.claim_sleep_if_due(now_unix_ms()),
+        Err(_) => false,
+    };
+    let hold = match state.lock_inner() {
+        Ok(g) => g.sleep_hold,
+        Err(_) => true,
+    };
+    match sleep_finish_after_pause(claimed, hold) {
+        SleepFinish::Fired => true,
+        SleepFinish::StayPaused => false,
+        SleepFinish::Resume => {
+            if let Some(mut mpv) = state.try_lock_mpv() {
+                let _ = mpv.resume_if_connected();
+            }
+            false
+        }
+    }
+}
+
+/// After a speculative pause, decide whether this caller won the sleep claim,
+/// lost to another claimant (stay paused), or lost because the user extended
+/// or cancelled the timer (resume).
+fn sleep_finish_after_pause(claimed: bool, sleep_hold: bool) -> SleepFinish {
+    if claimed {
+        SleepFinish::Fired
+    } else if sleep_hold {
+        SleepFinish::StayPaused
+    } else {
+        SleepFinish::Resume
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SleepFinish {
+    Fired,
+    StayPaused,
+    Resume,
+}
+
+fn spawn_sleep_watchdog(app: AppHandle) {
+    for attempt in 1..=5 {
+        let handle = app.clone();
+        match thread::Builder::new()
+            .name("sleep-watchdog".into())
+            .spawn(move || loop {
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    thread::sleep(Duration::from_millis(500));
+                    if apply_sleep_if_due(&handle.state::<AppState>()) {
+                        let _ = handle.emit("abp:sleep-fired", true);
+                        notify_transport_changed(&handle);
+                    }
+                }));
+            }) {
+            Ok(_) => return,
+            Err(e) => {
+                eprintln!(
+                    "chaptercheck.audit watchdog_spawn_failed attempt={attempt} err={e}"
+                );
+                thread::sleep(Duration::from_millis(200));
+            }
+        }
+    }
+}
 
 fn notify_transport_changed(app: &AppHandle) {
     let _ = app.emit("abp:transport-changed", ());
@@ -238,6 +357,9 @@ pub struct TransportDto {
     pub playback_kind: String,
     pub active_collection_id: Option<i64>,
     pub active_collection_kind: Option<String>,
+    /// Unix epoch milliseconds. `None` = sleep timer off.
+    pub sleep_deadline_ms: Option<i64>,
+    pub stop_after_track: bool,
 }
 
 #[derive(Clone, Serialize)]
@@ -278,7 +400,6 @@ pub struct EnqueueCollectionResult {
 
 struct InnerState {
     db: LibraryDb,
-    mpv: MpvController,
     session_root: Option<PathBuf>,
     allowed_files: HashSet<PathBuf>,
     playlist: Vec<PathBuf>,
@@ -293,21 +414,50 @@ struct InnerState {
     active_playlist_id: Option<i64>,
     /// `"audiobook"` or `"music"` for context-aware UI.
     playback_kind: String,
+    sleep_deadline_ms: Option<i64>,
+    stop_after_track: bool,
+    /// Set when the sleep timer fires. Blocks EOF auto-advance until the user
+    /// explicitly plays, so a track ending at the same moment cannot restart audio.
+    sleep_hold: bool,
+    /// Unix ms when `sleep_hold` was set. Used to ignore PlayPause during grace.
+    sleep_hold_since_ms: Option<i64>,
 }
 
 pub struct AppState {
     inner: Mutex<InnerState>,
+    mpv: Mutex<MpvController>,
     scan_in_progress: AtomicBool,
+    folder_grants: Mutex<picker_grant::PickerGrantSet>,
+    destructive_grants: Mutex<destructive_grant::DestructiveGrantSet>,
 }
 
 fn with_scan_flag<R>(app: &AppHandle, f: impl FnOnce() -> Result<R, String>) -> Result<R, String> {
     let state = app.state::<AppState>();
-    state.scan_in_progress.store(true, Ordering::SeqCst);
+    if state
+        .scan_in_progress
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return Err("A library scan is already running. Try again in a moment.".into());
+    }
     let _ = app.emit("abp:scan-status", true);
-    let result = f();
-    state.scan_in_progress.store(false, Ordering::SeqCst);
-    let _ = app.emit("abp:scan-status", false);
-    result
+    struct ScanFlagGuard {
+        app: AppHandle,
+    }
+    impl Drop for ScanFlagGuard {
+        fn drop(&mut self) {
+            let state = self.app.state::<AppState>();
+            state.scan_in_progress.store(false, Ordering::SeqCst);
+            let _ = self.app.emit("abp:scan-status", false);
+        }
+    }
+    let _guard = ScanFlagGuard { app: app.clone() };
+    f()
+}
+
+/// Second SQLite connection (WAL) so filesystem scans never hold the playback mutex.
+fn open_sidecar_catalog() -> Result<LibraryDb, String> {
+    LibraryDb::open(&data_db_path()?).map_err(|e| e.to_string())
 }
 
 impl AppState {
@@ -334,10 +484,11 @@ impl AppState {
             .ok()
             .flatten()
             .and_then(|s| s.parse::<i64>().ok());
+        let sleep_deadline_ms = parse_sleep_deadline(db.get_setting(PREF_SLEEP_DEADLINE).ok().flatten());
+        let stop_after_track = parse_bool_pref(db.get_setting(PREF_STOP_AFTER_TRACK).ok().flatten());
         Self {
             inner: Mutex::new(InnerState {
                 db,
-                mpv: MpvController::default(),
                 session_root: None,
                 allowed_files: HashSet::new(),
                 playlist: Vec::new(),
@@ -349,8 +500,15 @@ impl AppState {
                 active_collection_id,
                 active_playlist_id,
                 playback_kind,
+                sleep_deadline_ms,
+                stop_after_track,
+                sleep_hold: false,
+                sleep_hold_since_ms: None,
             }),
+            mpv: Mutex::new(MpvController::default()),
             scan_in_progress: AtomicBool::new(false),
+            folder_grants: Mutex::new(picker_grant::PickerGrantSet::default()),
+            destructive_grants: Mutex::new(destructive_grant::DestructiveGrantSet::default()),
         }
     }
 
@@ -358,27 +516,159 @@ impl AppState {
         if CLOSE_PERSISTED.swap(true, Ordering::SeqCst) {
             return Ok(());
         }
-        let mut g = self.inner.lock().map_err(|e| e.to_string())?;
-        g.persist_current()?;
-        let was_playing = g.session_is_actively_playing();
-        g.persist_session_for_close(was_playing)?;
-        g.mpv.shutdown();
-        Ok(())
+        self.with_engine(|g, mpv| {
+            g.persist_current(mpv)?;
+            let was_playing = g.session_is_actively_playing(mpv);
+            g.persist_session_for_close(was_playing)?;
+            mpv.shutdown();
+            Ok(())
+        })
     }
 
     fn try_restore_last_session(&self) -> Result<Option<PlaylistDto>, String> {
-        let mut g = self.inner.lock().map_err(|e| e.to_string())?;
-        g.restore_last_session()
+        self.with_engine(|g, mpv| g.restore_last_session(mpv))
     }
 
     fn get_recent_opened(&self) -> Result<Vec<RecentOpenDto>, String> {
-        let g = self.inner.lock().map_err(|e| e.to_string())?;
+        let g = self.lock_inner()?;
         g.read_recent_opened()
     }
 
     fn clear_recent_opened(&self) -> Result<(), String> {
-        let mut g = self.inner.lock().map_err(|e| e.to_string())?;
+        let mut g = self.lock_inner()?;
         g.clear_recent_opened_history()
+    }
+
+    fn lock_inner(&self) -> Result<std::sync::MutexGuard<'_, InnerState>, String> {
+        Ok(self.inner.lock().unwrap_or_else(|p| p.into_inner()))
+    }
+
+    fn lock_folder_grants(
+        &self,
+    ) -> Result<std::sync::MutexGuard<'_, picker_grant::PickerGrantSet>, String> {
+        Ok(self.folder_grants.lock().unwrap_or_else(|p| p.into_inner()))
+    }
+
+    fn grant_picked_directory(&self, path: &Path) {
+        let Ok(canon) = canonicalize_existing(path) else {
+            return;
+        };
+        if !canon.is_dir() {
+            return;
+        }
+        if let Ok(mut grants) = self.lock_folder_grants() {
+            grants.grant(canon);
+        }
+    }
+
+    /// Peek a picker / OS-open grant. Does not consume — `add_root` may still fail.
+    fn require_library_folder_grant(&self, path: &Path) -> Result<PathBuf, String> {
+        let canon = canonicalize_existing(path).map_err(|e| e.to_string())?;
+        if !canon.is_dir() {
+            return Err("Library root must be a folder".into());
+        }
+        let mut grants = self.lock_folder_grants()?;
+        if !grants.contains(&canon) {
+            return Err(
+                "Use Add my folder so we know you chose it. A random path cannot be linked."
+                    .into(),
+            );
+        }
+        Ok(canon)
+    }
+
+    fn forget_library_folder_grant(&self, canon: &Path) {
+        if let Ok(mut grants) = self.lock_folder_grants() {
+            let _ = grants.consume(canon);
+        }
+    }
+
+    fn lock_destructive_grants(
+        &self,
+    ) -> Result<std::sync::MutexGuard<'_, destructive_grant::DestructiveGrantSet>, String> {
+        Ok(self
+            .destructive_grants
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()))
+    }
+
+    fn grant_destructive(&self, kind: destructive_grant::DestructiveKind) {
+        if let Ok(mut grants) = self.lock_destructive_grants() {
+            grants.grant(kind);
+        }
+    }
+
+    fn consume_destructive(
+        &self,
+        kind: &destructive_grant::DestructiveKind,
+        missing: &str,
+    ) -> Result<(), String> {
+        let mut grants = self.lock_destructive_grants()?;
+        if grants.consume(kind) {
+            Ok(())
+        } else {
+            Err(missing.into())
+        }
+    }
+
+    fn try_lock_mpv(&self) -> Option<std::sync::MutexGuard<'_, MpvController>> {
+        match self.mpv.try_lock() {
+            Ok(g) => Some(g),
+            Err(TryLockError::WouldBlock) => None,
+            Err(TryLockError::Poisoned(p)) => Some(p.into_inner()),
+        }
+    }
+
+    /// Peek transport, drop mpv, then write SQLite so a scan writer cannot pin the engine.
+    fn persist_progress_without_holding_mpv(&self) -> Result<(), String> {
+        let read = {
+            let mut mpv = self.lock_mpv()?;
+            mpv.peek_transport()
+        };
+        let Some(read) = read else {
+            return Ok(());
+        };
+        const ATTEMPTS: u32 = 12;
+        for attempt in 0..ATTEMPTS {
+            let outcome = {
+                let mut g = self.lock_inner()?;
+                let Some(path) = g.current_path() else {
+                    return Ok(());
+                };
+                let key = path.to_string_lossy();
+                g.db.upsert_position_duration(
+                    &key,
+                    read.position_sec,
+                    read.duration_sec,
+                    InnerState::now_unix(),
+                )
+            };
+            match outcome {
+                Ok(()) => return Ok(()),
+                Err(e) if crate::db::LibraryDb::is_sqlite_busy(&e) && attempt + 1 < ATTEMPTS => {
+                    thread::sleep(Duration::from_millis(40));
+                }
+                Err(e) => {
+                    return Err(format!("Could not save your place right now. Try again in a moment. ({e})"));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn lock_mpv(&self) -> Result<std::sync::MutexGuard<'_, MpvController>, String> {
+        Ok(self.mpv.lock().unwrap_or_else(|p| p.into_inner()))
+    }
+
+    /// Catalog + engine. Lock order is **inner, then mpv**. Never reverse.
+    /// Never hold `mpv` while waiting for `inner` (see `get_transport`).
+    fn with_engine<R>(
+        &self,
+        f: impl FnOnce(&mut InnerState, &mut MpvController) -> Result<R, String>,
+    ) -> Result<R, String> {
+        let mut inner = self.lock_inner()?;
+        let mut mpv = self.lock_mpv()?;
+        f(&mut inner, &mut mpv)
     }
 }
 
@@ -533,7 +823,6 @@ impl InnerState {
     }
 
     fn build_playlist_dto(&mut self) -> Result<PlaylistDto, String> {
-        let now = Self::now_unix();
         let root = self
             .session_root
             .as_ref()
@@ -543,7 +832,7 @@ impl InnerState {
         let mut items = Vec::new();
         for p in &self.playlist {
             let key_owned = p.to_string_lossy().into_owned();
-            let (mut dur, mut artist, mut album, listened_at) = self
+            let (mut dur, artist, album, listened_at) = self
                 .db
                 .get_media_display_meta(&key_owned)
                 .map_err(|e| e.to_string())?
@@ -555,19 +844,6 @@ impl InnerState {
                     .ok()
                     .flatten()
                     .and_then(|m| m.duration_sec);
-            }
-            if artist.is_none() || album.is_none() {
-                let (p_artist, p_album) = probe_audio_tags(p);
-                if p_artist.is_some() || p_album.is_some() {
-                    let _ = self.db.merge_media_tags(
-                        &key_owned,
-                        p_artist.as_deref(),
-                        p_album.as_deref(),
-                        now,
-                    );
-                    artist = artist.or(p_artist);
-                    album = album.or(p_album);
-                }
             }
             let file_ref = CatalogService::new(&mut self.db)
                 .find_collection_file_ref_by_path(p)
@@ -808,10 +1084,15 @@ impl InnerState {
         Ok(Some(self.build_playlist_dto()?))
     }
 
-    fn remove_queue_item_inner(&mut self, path: PathBuf) -> Result<Option<PlaylistDto>, String> {
+    fn remove_queue_item_inner(&mut self, mpv: &mut MpvController, path: PathBuf) -> Result<Option<PlaylistDto>, String> {
         let canon = Self::canonicalize_allowed(&path).unwrap_or(path);
         if !self.allowed_files.contains(&canon) {
             return Err("Track is not part of the current session".into());
+        }
+        let was_current = self.current_path().as_ref() == Some(&canon);
+        let was_playing = was_current && self.session_is_actively_playing(mpv);
+        if was_current {
+            let _ = self.persist_current(mpv);
         }
         self.remove_path_from_session(&canon.to_string_lossy())?;
         if self.playlist.is_empty() {
@@ -819,14 +1100,23 @@ impl InnerState {
             self.allowed_files.clear();
             self.current_index = None;
             self.single_file_session = false;
+            mpv.reset_session();
             self.clear_stored_session_keys();
             return Ok(None);
+        }
+        if was_current {
+            if let Some(idx) = self.current_index {
+                if mpv.ensure_running().is_ok() {
+                    let _ = self.play_path_at_index_with_autoplay(mpv, idx, was_playing);
+                }
+            }
         }
         self.session_playlist_if_open()
     }
 
     fn play_collection_inner(
         &mut self,
+        mpv: &mut MpvController,
         collection_id: i64,
         mode: &str,
         shuffle: bool,
@@ -842,30 +1132,31 @@ impl InnerState {
             paths.shuffle(&mut thread_rng());
         }
         let start_idx = if mode == "continue" {
-            let mut idx = 0usize;
-            let mut best_pos = -1.0f64;
-            for (i, p) in paths.iter().enumerate() {
-                let key = p.to_string_lossy();
-                if let Ok(Some(row)) = self.db.get_media(&key) {
-                    if row.position_sec > best_pos && row.position_sec > 1.0 {
-                        if let Some(dur) = row.duration_sec {
-                            if row.position_sec < dur - 30.0 {
-                                best_pos = row.position_sec;
-                                idx = i;
-                            }
-                        } else {
-                            best_pos = row.position_sec;
-                            idx = i;
-                        }
-                    }
-                }
-            }
-            idx
+            let hints: Vec<(f64, Option<f64>, bool)> = paths
+                .iter()
+                .map(|p| {
+                    let key = p.to_string_lossy();
+                    let row = self.db.get_media(&key).ok().flatten();
+                    let listened = self
+                        .db
+                        .get_media_display_meta(&key)
+                        .ok()
+                        .flatten()
+                        .and_then(|(_, _, _, listened_at)| listened_at)
+                        .is_some();
+                    (
+                        row.as_ref().map(|r| r.position_sec).unwrap_or(0.0),
+                        row.as_ref().and_then(|r| r.duration_sec),
+                        listened,
+                    )
+                })
+                .collect();
+            Self::continue_start_index(&hints)
         } else {
             0
         };
-        self.mpv.ensure_running().map_err(|e: MpvError| e.to_string())?;
-        let _ = self.persist_current();
+        mpv.ensure_running().map_err(|e: MpvError| e.to_string())?;
+        let _ = self.persist_current(mpv);
         let single = paths.len() == 1;
         self.set_session_paths_ordered(
             root,
@@ -875,7 +1166,7 @@ impl InnerState {
             None,
             &detail.kind,
         );
-        self.play_path_at_index_with_autoplay(start_idx, autoplay)?;
+        self.play_path_at_index_with_autoplay(mpv, start_idx, autoplay)?;
         self.touch_session_track_after_play()?;
         self.persist_session_meta_checkpoint()?;
         self.build_playlist_dto()
@@ -883,6 +1174,7 @@ impl InnerState {
 
     fn enqueue_collection_inner(
         &mut self,
+        mpv: &mut MpvController,
         collection_id: i64,
         position: &str,
     ) -> Result<EnqueueCollectionResult, String> {
@@ -911,10 +1203,10 @@ impl InnerState {
             );
             let autoplay_started = position == "next";
             if autoplay_started {
-                self.mpv
+                mpv
                     .ensure_running()
                     .map_err(|e: MpvError| e.to_string())?;
-                self.play_path_at_index_with_autoplay(0, true)?;
+                self.play_path_at_index_with_autoplay(mpv, 0, true)?;
                 self.touch_session_track_after_play()?;
             }
             self.persist_session_meta_checkpoint()?;
@@ -965,6 +1257,7 @@ impl InnerState {
 
     fn play_kind_inner(
         &mut self,
+        mpv: &mut MpvController,
         kind: &str,
         filter: Option<&str>,
         search: Option<&str>,
@@ -973,18 +1266,21 @@ impl InnerState {
     ) -> Result<PlaylistDto, String> {
         let mut paths =
             CatalogService::new(&mut self.db).kind_playback_paths(kind, filter, search)?;
+        if paths.is_empty() {
+            return Err("No playable tracks in your library".into());
+        }
         if shuffle && paths.len() >= 2 {
             paths.shuffle(&mut thread_rng());
         }
-        self.mpv.ensure_running().map_err(|e: MpvError| e.to_string())?;
-        let _ = self.persist_current();
+        mpv.ensure_running().map_err(|e: MpvError| e.to_string())?;
+        let _ = self.persist_current(mpv);
         let root = paths[0]
             .parent()
             .map(Path::to_path_buf)
             .unwrap_or_else(|| paths[0].clone());
         let root = InnerState::canonicalize_allowed(&root)?;
         self.set_session_paths_ordered(root, paths, false, None, None, kind);
-        self.play_path_at_index_with_autoplay(0, autoplay)?;
+        self.play_path_at_index_with_autoplay(mpv, 0, autoplay)?;
         self.touch_session_track_after_play()?;
         self.persist_session_meta_checkpoint()?;
         self.build_playlist_dto()
@@ -992,6 +1288,7 @@ impl InnerState {
 
     fn enqueue_kind_inner(
         &mut self,
+        mpv: &mut MpvController,
         kind: &str,
         filter: Option<&str>,
         search: Option<&str>,
@@ -1021,10 +1318,10 @@ impl InnerState {
             self.set_session_paths_ordered(root, paths.clone(), false, None, None, kind);
             let autoplay_started = position == "next";
             if autoplay_started {
-                self.mpv
+                mpv
                     .ensure_running()
                     .map_err(|e: MpvError| e.to_string())?;
-                self.play_path_at_index_with_autoplay(0, true)?;
+                self.play_path_at_index_with_autoplay(mpv, 0, true)?;
                 self.touch_session_track_after_play()?;
             }
             self.persist_session_meta_checkpoint()?;
@@ -1071,6 +1368,36 @@ impl InnerState {
             session_started: false,
             autoplay_started: false,
         })
+    }
+
+    fn play_playlist_inner(
+        &mut self,
+        mpv: &mut MpvController,
+        playlist_id: i64,
+        shuffle: bool,
+        autoplay: bool,
+    ) -> Result<PlaylistDto, String> {
+        let mut paths = CatalogService::new(&mut self.db).playlist_playback_paths(playlist_id)?;
+        if paths.is_empty() {
+            return Err("This playlist has no playable tracks".into());
+        }
+        if shuffle && paths.len() >= 2 {
+            paths.shuffle(&mut thread_rng());
+        }
+        mpv
+            .ensure_running()
+            .map_err(|e: MpvError| e.to_string())?;
+        let _ = self.persist_current(mpv);
+        let root = paths[0]
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| paths[0].clone());
+        let root = InnerState::canonicalize_allowed(&root)?;
+        self.set_session_paths_ordered(root, paths, false, None, Some(playlist_id), "music");
+        self.play_path_at_index_with_autoplay(mpv, 0, autoplay)?;
+        self.touch_session_track_after_play()?;
+        self.persist_session_meta_checkpoint()?;
+        self.build_playlist_dto()
     }
 
     fn clear_stored_session_keys(&mut self) {
@@ -1211,18 +1538,18 @@ impl InnerState {
         self.push_recent_session()
     }
 
-    fn session_is_actively_playing(&mut self) -> bool {
-        self.mpv
+    fn session_is_actively_playing(&mut self, mpv: &mut MpvController) -> bool {
+        mpv
             .peek_transport()
             .map(|r| !r.paused && !r.idle && !r.eof)
             .unwrap_or(false)
     }
 
-    fn sync_session_last_playing(&mut self) -> Result<(), String> {
+    fn sync_session_last_playing(&mut self, mpv: &mut MpvController) -> Result<(), String> {
         if self.session_root.is_none() {
             return Ok(());
         }
-        let playing = self.session_is_actively_playing();
+        let playing = self.session_is_actively_playing(mpv);
         self.db
             .set_setting(SESSION_LAST_PLAYING, if playing { "1" } else { "0" })
             .map_err(|e| e.to_string())?;
@@ -1282,14 +1609,37 @@ impl InnerState {
         Ok(resume_on_launch && was_saved_playing)
     }
 
-    fn restore_last_session(&mut self) -> Result<Option<PlaylistDto>, String> {
+    fn restore_last_session(&mut self, mpv: &mut MpvController) -> Result<Option<PlaylistDto>, String> {
         if let Some(collection_id) = self.active_collection_id {
-            let autoplay = self.launch_autoplay_enabled()?;
-            match self.play_collection_inner(collection_id, "continue", false, autoplay) {
-                Ok(dto) => return Ok(Some(dto)),
+            let sleep_claimed = self.claim_sleep_if_due(now_unix_ms());
+            let autoplay = self.launch_autoplay_enabled()? && !sleep_claimed;
+            match self.play_collection_inner(mpv, collection_id, "continue", false, autoplay) {
+                Ok(dto) => {
+                    if sleep_claimed {
+                        mpv.pause_or_kill();
+                    }
+                    return Ok(Some(dto));
+                }
                 Err(_) => {
                     self.active_collection_id = None;
                     let _ = self.db.delete_setting(SESSION_COLLECTION_ID);
+                }
+            }
+        }
+
+        if let Some(playlist_id) = self.active_playlist_id {
+            let sleep_claimed = self.claim_sleep_if_due(now_unix_ms());
+            let autoplay = self.launch_autoplay_enabled()? && !sleep_claimed;
+            match self.play_playlist_inner(mpv, playlist_id, false, autoplay) {
+                Ok(dto) => {
+                    if sleep_claimed {
+                        mpv.pause_or_kill();
+                    }
+                    return Ok(Some(dto));
+                }
+                Err(_) => {
+                    self.active_playlist_id = None;
+                    let _ = self.db.delete_setting(SESSION_PLAYLIST_ID);
                 }
             }
         }
@@ -1393,15 +1743,19 @@ impl InnerState {
         };
         let idx = idx.min(self.playlist.len().saturating_sub(1));
 
-        let autoplay = self.launch_autoplay_enabled()?;
+        let sleep_claimed = self.claim_sleep_if_due(now_unix_ms());
+        let autoplay = self.launch_autoplay_enabled()? && !sleep_claimed;
 
-        self.mpv
+        mpv
             .ensure_running()
             .map_err(|e: MpvError| e.to_string())?;
         if self.playlist.is_empty() {
             return Ok(None);
         }
-        self.play_path_at_index_with_autoplay(idx, autoplay)?;
+        self.play_path_at_index_with_autoplay(mpv, idx, autoplay)?;
+        if sleep_claimed {
+            mpv.pause_or_kill();
+        }
         self.touch_session_track_after_play()?;
         self.build_playlist_dto().map(Some)
     }
@@ -1469,24 +1823,112 @@ impl InnerState {
         position_sec
     }
 
-    fn persist_current(&mut self) -> Result<(), String> {
+    fn track_is_finished(position_sec: f64, duration_sec: Option<f64>, listened: bool) -> bool {
+        if listened {
+            return true;
+        }
+        if let Some(d) = duration_sec.filter(|d| d.is_finite() && *d > 0.0) {
+            position_sec.is_finite() && position_sec >= (d - 2.0).max(0.0)
+        } else {
+            false
+        }
+    }
+
+    fn continue_start_index(hints: &[(f64, Option<f64>, bool)]) -> usize {
+        hints
+            .iter()
+            .position(|(pos, dur, listened)| !Self::track_is_finished(*pos, *dur, *listened))
+            .unwrap_or(0)
+    }
+
+
+    fn persist_stop_after_track(&mut self) -> Result<(), String> {
+        self.db
+            .set_setting(
+                PREF_STOP_AFTER_TRACK,
+                if self.stop_after_track { "1" } else { "0" },
+            )
+            .map_err(|e| e.to_string())
+    }
+
+    fn sleep_deadline_due(&self, now_ms: i64) -> bool {
+        self.sleep_deadline_ms.map(|d| now_ms >= d).unwrap_or(false)
+    }
+
+    fn release_sleep_hold(&mut self) {
+        self.sleep_hold = false;
+        self.sleep_hold_since_ms = None;
+    }
+
+    /// Headset PlayPause in the moments after sleep must stay paused.
+    fn sleep_hold_blocks_toggle(&self, now_ms: i64) -> bool {
+        if !self.sleep_hold {
+            return false;
+        }
+        match self.sleep_hold_since_ms {
+            Some(t) => now_ms.saturating_sub(t) < SLEEP_TOGGLE_GRACE_MS,
+            None => true,
+        }
+    }
+
+    /// Returns true iff this caller won the claim and must treat playback as stopped-for-the-night.
+    fn claim_sleep_if_due(&mut self, now_ms: i64) -> bool {
+        if !self.sleep_deadline_due(now_ms) {
+            return false;
+        }
+        self.sleep_deadline_ms = None;
+        self.sleep_hold = true;
+        self.sleep_hold_since_ms = Some(now_ms);
+        let _ = self.db.delete_setting(PREF_SLEEP_DEADLINE);
+        let _ = self.db.set_setting(SESSION_LAST_PLAYING, "0");
+        true
+    }
+
+    fn set_sleep_deadline(&mut self, deadline_ms: Option<i64>) -> Result<Option<i64>, String> {
+        let next = deadline_ms.filter(|ms| *ms > 0);
+        match next {
+            Some(ms) => self
+                .db
+                .set_setting(PREF_SLEEP_DEADLINE, &ms.to_string())
+                .map_err(|e| e.to_string())?,
+            None => self
+                .db
+                .delete_setting(PREF_SLEEP_DEADLINE)
+                .map_err(|e| e.to_string())?,
+        }
+        self.sleep_deadline_ms = next;
+        if next.is_some() {
+            self.sleep_hold = false;
+            self.sleep_hold_since_ms = None;
+        }
+        Ok(self.sleep_deadline_ms)
+    }
+
+    fn set_stop_after_track_flag(&mut self, enabled: bool) -> Result<bool, String> {
+        self.stop_after_track = enabled;
+        self.persist_stop_after_track()?;
+        Ok(self.stop_after_track)
+    }
+
+    fn persist_current(&mut self, mpv: &mut MpvController) -> Result<(), String> {
         let Some(path) = self.current_path() else {
             return Ok(());
         };
+        let Some(read) = mpv.peek_transport() else {
+            return Ok(());
+        };
         let key = path.to_string_lossy();
-        let pos = self.mpv.time_pos_lenient();
-        let dur = self.mpv.duration_lenient();
         self.db
-            .upsert_position_duration(&key, pos, dur, Self::now_unix())
+            .upsert_position_duration(&key, read.position_sec, read.duration_sec, Self::now_unix())
             .map_err(|e| e.to_string())?;
         Ok(())
     }
 
-    fn play_path_at_index(&mut self, idx: usize) -> Result<(), String> {
-        self.play_path_at_index_with_autoplay(idx, true)
+    fn play_path_at_index(&mut self, mpv: &mut MpvController, idx: usize) -> Result<(), String> {
+        self.play_path_at_index_with_autoplay(mpv, idx, true)
     }
 
-    fn play_path_at_index_with_autoplay(&mut self, idx: usize, autoplay: bool) -> Result<(), String> {
+    fn play_path_at_index_with_autoplay(&mut self, mpv: &mut MpvController, idx: usize, autoplay: bool) -> Result<(), String> {
         let idx = self.resolve_playable_index(idx)?;
         let path = self
             .playlist
@@ -1497,6 +1939,15 @@ impl InnerState {
             return Err("Blocked: file is outside the opened folder".to_string());
         }
         let key = path.to_string_lossy().into_owned();
+        let (p_artist, p_album) = probe_audio_tags(&path);
+        if p_artist.is_some() || p_album.is_some() {
+            let _ = self.db.merge_media_tags(
+                &key,
+                p_artist.as_deref(),
+                p_album.as_deref(),
+                Self::now_unix(),
+            );
+        }
         let media: Option<MediaRow> = self.db.get_media(&key).map_err(|e| e.to_string())?;
         let speed = self.resolve_playback_speed(&key)?;
         let start = Self::resume_start_seconds(
@@ -1504,33 +1955,36 @@ impl InnerState {
             media.as_ref().and_then(|m| m.duration_sec),
         );
 
-        self.mpv
+        mpv
             .load_file_controlled(&key, start, autoplay)
             .map_err(|e: MpvError| e.to_string())?;
-        self.mpv
+        mpv
             .set_speed(speed)
             .map_err(|e: MpvError| e.to_string())?;
         self.current_index = Some(idx);
+        if autoplay {
+            self.release_sleep_hold();
+        }
         self.touch_session_track_after_play()?;
-        let _ = self.sync_session_last_playing();
+        let _ = self.sync_session_last_playing(mpv);
         Ok(())
     }
 
-    fn recover_mpv_engine(&mut self) -> Result<(), String> {
-        self.mpv.reset_session();
-        self.mpv
+    fn recover_mpv_engine(&mut self, mpv: &mut MpvController) -> Result<(), String> {
+        mpv.reset_session();
+        mpv
             .ensure_running()
             .map_err(|e: MpvError| e.to_string())?;
         if let Some(idx) = self.current_index {
             if idx < self.playlist.len() {
-                self.play_path_at_index_with_autoplay(idx, false)?;
+                self.play_path_at_index_with_autoplay(mpv, idx, false)?;
             }
         }
         Ok(())
     }
 
     /// Re-scan the open folder (respecting `scan_subfolders`), rebuild playlist, reload current file paused.
-    fn rescan_folder_playlist(&mut self) -> Result<PlaylistDto, String> {
+    fn rescan_folder_playlist(&mut self, mpv: &mut MpvController) -> Result<PlaylistDto, String> {
         if self.single_file_session {
             return self.build_playlist_dto();
         }
@@ -1557,10 +2011,10 @@ impl InnerState {
         } else {
             Some(idx)
         };
-        self.mpv
+        mpv
             .ensure_running()
             .map_err(|e: MpvError| e.to_string())?;
-        self.play_path_at_index_with_autoplay(idx, false)?;
+        self.play_path_at_index_with_autoplay(mpv, idx, false)?;
         self.persist_session_meta_checkpoint()?;
         self.build_playlist_dto()
     }
@@ -1604,7 +2058,7 @@ impl InnerState {
 
     /// Delete one tracked file from disk. Updates queue, advances playback if it was current.
     /// Returns `None` if the session became empty (caller should treat as fully closed).
-    fn delete_track_inner(&mut self, path: PathBuf) -> Result<Option<PlaylistDto>, String> {
+    fn delete_track_inner(&mut self, mpv: &mut MpvController, path: PathBuf) -> Result<Option<PlaylistDto>, String> {
         let canon = InnerState::canonicalize_allowed(&path).unwrap_or(path);
         if !self.allowed_files.contains(&canon) {
             return Err("Track is not part of the current session".into());
@@ -1614,16 +2068,16 @@ impl InnerState {
         let was_current = self.current_path().as_ref() == Some(&canon);
 
         if was_current {
-            let _ = self.persist_current();
-            self.mpv.reset_session();
+            let _ = self.persist_current(mpv);
+            mpv.reset_session();
         }
 
         if let Err(e) = fs::remove_file(&canon) {
             if was_current {
-                let _ = self.mpv.ensure_running();
+                let _ = mpv.ensure_running();
                 if let Some(idx) = self.current_index {
                     if idx < self.playlist.len() {
-                        let _ = self.play_path_at_index_with_autoplay(idx, false);
+                        let _ = self.play_path_at_index_with_autoplay(mpv, idx, false);
                     }
                 }
             }
@@ -1650,7 +2104,7 @@ impl InnerState {
             self.allowed_files.clear();
             self.current_index = None;
             self.single_file_session = false;
-            self.mpv.reset_session();
+            mpv.reset_session();
             self.clear_stored_session_keys();
             return Ok(None);
         }
@@ -1659,10 +2113,10 @@ impl InnerState {
             let new_idx = removed_idx
                 .map(|i| i.min(self.playlist.len() - 1))
                 .unwrap_or(0);
-            self.mpv
+            mpv
                 .ensure_running()
                 .map_err(|e: MpvError| e.to_string())?;
-            self.play_path_at_index_with_autoplay(new_idx, false)?;
+            self.play_path_at_index_with_autoplay(mpv, new_idx, false)?;
         }
 
         self.persist_session_meta_checkpoint()?;
@@ -1670,7 +2124,7 @@ impl InnerState {
     }
 
     /// Permanently delete every tracked file in the session (and remove the folder if it ends up empty).
-    fn delete_session_inner(&mut self) -> Result<(), String> {
+    fn delete_session_inner(&mut self, mpv: &mut MpvController) -> Result<(), String> {
         let Some(root) = self.session_root.clone() else {
             return Err("No session is open".into());
         };
@@ -1684,8 +2138,8 @@ impl InnerState {
                 cat.path_delete_allowed(&root)?;
             }
         }
-        let _ = self.persist_current();
-        self.mpv.reset_session();
+        let _ = self.persist_current(mpv);
+        mpv.reset_session();
 
         let mut last_err: Option<String> = None;
         for p in &files {
@@ -1719,105 +2173,114 @@ impl InnerState {
     }
 
     /// True when mpv has no file loaded (or is not connected).
-    fn mpv_is_idle(&mut self) -> bool {
-        self.mpv
+    fn mpv_is_idle(&mut self, mpv: &mut MpvController) -> bool {
+        mpv
             .peek_transport()
             .map(|t| t.idle)
             .unwrap_or(true)
     }
 
     /// Reload the current track when mpv is idle but a playlist index is selected.
-    fn ensure_current_track_loaded(&mut self) -> Result<(), String> {
+    fn ensure_current_track_loaded(&mut self, mpv: &mut MpvController) -> Result<(), String> {
         let Some(idx) = self.current_index else {
             return Ok(());
         };
-        if !self.mpv_is_idle() {
+        if !self.mpv_is_idle(mpv) {
             return Ok(());
         }
         if idx >= self.playlist.len() {
             return Ok(());
         }
-        self.mpv
+        mpv
             .ensure_running()
             .map_err(|e: MpvError| e.to_string())?;
-        self.play_path_at_index_with_autoplay(idx, false)
+        self.play_path_at_index_with_autoplay(mpv, idx, false)
     }
 
     /// Start the first queue item when nothing is selected yet.
-    fn start_first_track_if_needed(&mut self) -> Result<(), String> {
+    fn start_first_track_if_needed(&mut self, mpv: &mut MpvController) -> Result<(), String> {
         if self.current_index.is_some() || self.playlist.is_empty() {
             return Ok(());
         }
-        self.mpv
+        mpv
             .ensure_running()
             .map_err(|e: MpvError| e.to_string())?;
-        self.play_path_at_index(0)
+        self.play_path_at_index(mpv, 0)
     }
 
     /// Resume the current track, restart after EOF, or begin the queue at track 1.
-    fn resume_or_start_playback(&mut self) -> Result<(), String> {
+    fn resume_or_start_playback(&mut self, mpv: &mut MpvController) -> Result<(), String> {
+        self.release_sleep_hold();
         if self.current_index.is_none() {
-            return self.start_first_track_if_needed();
+            return self.start_first_track_if_needed(mpv);
         }
-        self.ensure_current_track_loaded()?;
-        if self.mpv.eof_reached_lenient() {
-            self.mpv
+        self.ensure_current_track_loaded(mpv)?;
+        if mpv.eof_reached_lenient() {
+            mpv
                 .seek(0.0)
                 .map_err(|e: MpvError| e.to_string())?;
         }
-        self.mpv
+        mpv
             .set_pause(false)
             .map_err(|e: MpvError| e.to_string())?;
         Ok(())
     }
 
     /// Play/Pause toggle shared by UI, native menu, and headphone keys.
-    fn toggle_playback_inner(&mut self) -> Result<bool, String> {
+    fn toggle_playback_inner(&mut self, mpv: &mut MpvController) -> Result<bool, String> {
         if self.current_index.is_none() {
             if self.playlist.is_empty() {
                 return Ok(true);
             }
-            self.start_first_track_if_needed()?;
-            let _ = self.persist_current();
-            let _ = self.sync_session_last_playing();
+            self.release_sleep_hold();
+            self.start_first_track_if_needed(mpv)?;
+            let _ = self.persist_current(mpv);
+            let _ = self.sync_session_last_playing(mpv);
             return Ok(false);
         }
-        self.ensure_current_track_loaded()?;
-        if self.mpv.eof_reached_lenient() {
-            self.mpv
+        self.ensure_current_track_loaded(mpv)?;
+        if mpv.eof_reached_lenient() {
+            self.release_sleep_hold();
+            mpv
                 .seek(0.0)
                 .map_err(|e: MpvError| e.to_string())?;
-            self.mpv
+            mpv
                 .set_pause(false)
                 .map_err(|e: MpvError| e.to_string())?;
-            let _ = self.persist_current();
-            let _ = self.sync_session_last_playing();
+            let _ = self.persist_current(mpv);
+            let _ = self.sync_session_last_playing(mpv);
             return Ok(false);
         }
-        let paused = self
-            .mpv
+        if self.sleep_hold_blocks_toggle(now_unix_ms()) {
+            mpv.pause_or_kill();
+            return Ok(true);
+        }
+        let paused = mpv
             .toggle_pause()
             .map_err(|e: MpvError| e.to_string())?;
-        let _ = self.persist_current();
-        let _ = self.sync_session_last_playing();
+        if !paused {
+            self.release_sleep_hold();
+        }
+        let _ = self.persist_current(mpv);
+        let _ = self.sync_session_last_playing(mpv);
         Ok(paused)
     }
 
     /// Hardware "Play" key — same resume/start semantics as [`resume_or_start_playback`].
-    fn media_play_inner(&mut self) -> Result<(), String> {
-        self.resume_or_start_playback()?;
-        let _ = self.persist_current();
-        let _ = self.sync_session_last_playing();
+    fn media_play_inner(&mut self, mpv: &mut MpvController) -> Result<(), String> {
+        self.resume_or_start_playback(mpv)?;
+        let _ = self.persist_current(mpv);
+        let _ = self.sync_session_last_playing(mpv);
         Ok(())
     }
 
-    fn skip_next_inner(&mut self) -> Result<(), String> {
+    fn skip_next_inner(&mut self, mpv: &mut MpvController) -> Result<(), String> {
         let len = self.playlist.len();
         if len == 0 {
             return Ok(());
         }
         if self.current_index.is_none() {
-            return self.start_first_track_if_needed();
+            return self.start_first_track_if_needed(mpv);
         }
         let idx = self.current_index.unwrap();
         let next = match self.repeat_mode {
@@ -1830,82 +2293,82 @@ impl InnerState {
                 n
             }
         };
-        self.persist_current()?;
-        self.play_path_at_index(next)
+        self.persist_current(mpv)?;
+        self.play_path_at_index(mpv, next)
     }
 
-    fn skip_prev_inner(&mut self) -> Result<(), String> {
+    fn skip_prev_inner(&mut self, mpv: &mut MpvController) -> Result<(), String> {
         let len = self.playlist.len();
         if len == 0 {
             return Ok(());
         }
         if self.current_index.is_none() {
-            return self.start_first_track_if_needed();
+            return self.start_first_track_if_needed(mpv);
         }
         let idx = self.current_index.unwrap();
-        self.ensure_current_track_loaded()?;
-        let pos = self.mpv.time_pos_lenient();
+        self.ensure_current_track_loaded(mpv)?;
+        let pos = mpv.time_pos_lenient();
         if pos > TRACK_RESTART_SECS {
-            self.mpv
+            mpv
                 .seek(0.0)
                 .map_err(|e: MpvError| e.to_string())?;
-            self.mpv
+            mpv
                 .resume()
                 .map_err(|e: MpvError| e.to_string())?;
-            let _ = self.persist_current();
+            let _ = self.persist_current(mpv);
             return Ok(());
         }
         let prev = match self.repeat_mode {
             RepeatMode::All => (idx + len - 1) % len,
             _ => {
                 if idx == 0 {
-                    self.mpv
+                    mpv
                         .seek(0.0)
                         .map_err(|e: MpvError| e.to_string())?;
-                    let _ = self.persist_current();
+                    let _ = self.persist_current(mpv);
                     return Ok(());
                 }
                 idx - 1
             }
         };
-        self.persist_current()?;
-        self.play_path_at_index(prev)
+        self.persist_current(mpv)?;
+        self.play_path_at_index(mpv, prev)
     }
 
-    fn seek_delta_inner(&mut self, delta: f64) -> Result<(), String> {
+    fn seek_delta_inner(&mut self, mpv: &mut MpvController, delta: f64) -> Result<(), String> {
         if !delta.is_finite() {
             return Err("Invalid seek delta".to_string());
         }
         if self.current_index.is_none() {
-            self.start_first_track_if_needed()?;
+            self.start_first_track_if_needed(mpv)?;
         }
-        self.ensure_current_track_loaded()?;
-        self.mpv
+        self.ensure_current_track_loaded(mpv)?;
+        mpv
             .seek_relative(delta)
             .map_err(|e: MpvError| e.to_string())?;
-        let _ = self.persist_current();
+        let _ = self.persist_current(mpv);
         Ok(())
     }
 
-    fn seek_seconds_inner(&mut self, seconds: f64) -> Result<(), String> {
+    fn seek_seconds_inner(&mut self, mpv: &mut MpvController, seconds: f64) -> Result<(), String> {
         if !seconds.is_finite() || seconds < 0.0 {
             return Err("Invalid seek position".to_string());
         }
         if self.current_index.is_none() {
-            self.start_first_track_if_needed()?;
+            self.start_first_track_if_needed(mpv)?;
         }
-        self.ensure_current_track_loaded()?;
-        self.mpv
+        self.ensure_current_track_loaded(mpv)?;
+        mpv
             .seek(seconds)
             .map_err(|e: MpvError| e.to_string())?;
-        let _ = self.persist_current();
+        let _ = self.persist_current(mpv);
         Ok(())
     }
 
     /// Build the snapshot the OS media controls display. Reads playback state
     /// passively (never spawns mpv) so it is safe from the background sync loop.
     #[cfg(target_os = "linux")]
-    fn os_media_snapshot(&mut self) -> media_controls::OsMediaSnapshot {
+    fn os_media_snapshot(&mut self, peek: Option<MpvTransportRead>) -> media_controls::OsMediaSnapshot {
         let preview_idx = self.current_index.or_else(|| {
             if self.playlist.is_empty() {
                 None
@@ -1974,8 +2437,7 @@ impl InnerState {
             };
         }
 
-        let read = self.mpv.peek_transport();
-        let (mpv_pos, paused, eof, idle, mpv_duration) = match read {
+        let (mpv_pos, paused, eof, idle, mpv_duration) = match peek {
             Some(r) => (r.position_sec, r.paused, r.eof, r.idle, r.duration_sec),
             None => (persisted_pos, true, false, true, None),
         };
@@ -2044,11 +2506,21 @@ fn normalize_ui_locale_code(raw: Option<&str>) -> String {
 }
 
 fn data_db_path() -> Result<PathBuf, String> {
-    let pd = directories::ProjectDirs::from("com", "chaptercheck", "ChapterCheck")
-        .ok_or_else(|| "Cannot resolve application data directory".to_string())?;
-    let dir = pd.data_dir();
-    fs::create_dir_all(dir).map_err(|e| format!("Cannot create data directory: {e}"))?;
-    Ok(dir.join("library.sqlite3"))
+    Ok(catalog::app_data_dir()?.join("library.sqlite3"))
+}
+
+fn export_library_db(src: &Path, dest: &Path) -> Result<(), String> {
+    let src_conn = rusqlite::Connection::open(src).map_err(|e| format!("Backup failed: {e}"))?;
+    let mut dst_conn =
+        rusqlite::Connection::open(dest).map_err(|e| format!("Backup failed: {e}"))?;
+    {
+        let backup = rusqlite::backup::Backup::new(&src_conn, &mut dst_conn)
+            .map_err(|e| format!("Backup failed: {e}"))?;
+        backup
+            .run_to_completion(100, std::time::Duration::from_millis(50), None)
+            .map_err(|e| format!("Backup failed: {e}"))?;
+    }
+    Ok(())
 }
 
 fn setup_err(msg: impl Into<String>) -> Box<dyn std::error::Error> {
@@ -2343,6 +2815,7 @@ async fn pick_library_folder(app: AppHandle) -> Result<Option<String>, String> {
     let folder = fp
         .into_path()
         .map_err(|e| format!("Could not use selected folder path: {e}"))?;
+    app.state::<AppState>().grant_picked_directory(&folder);
     Ok(Some(folder.to_string_lossy().to_string()))
 }
 
@@ -2375,36 +2848,39 @@ async fn open_folder_path_impl(app: AppHandle, folder: PathBuf) -> Result<Option
     if !root.is_dir() {
         return Err("Selected path is not a folder".to_string());
     }
+    app.state::<AppState>().grant_picked_directory(&root);
     let catalog_match = {
-        let mut g = state.inner.lock().map_err(|e| e.to_string())?;
+        let mut g = state.lock_inner()?;
         CatalogService::new(&mut g.db).find_collection_for_folder(&root)?
     };
     if let Some(collection_id) = catalog_match {
         let dto = {
-            let mut g = state.inner.lock().map_err(|e| e.to_string())?;
-            g.play_collection_inner(collection_id, "continue", false, true)?
+            let mut g = state.lock_inner()?;
+            let mut mpv = state.lock_mpv()?;
+            g.play_collection_inner(&mut mpv, collection_id, "continue", false, true)?
         };
         let _ = app.emit("abp:playlist-update", &dto);
         return Ok(Some(dto));
     }
     let scan = {
-        let g = state.inner.lock().map_err(|e| e.to_string())?;
+        let g = state.lock_inner()?;
         g.scan_subfolders
     };
     let paths = InnerState::scan_dir(&root, scan)?;
     let sort = {
-        let g = state.inner.lock().map_err(|e| e.to_string())?;
+        let g = state.lock_inner()?;
         g.sort_key
     };
     {
-        let mut g = state.inner.lock().map_err(|e| e.to_string())?;
-        g.mpv.ensure_running().map_err(|e: MpvError| e.to_string())?;
-        let _ = g.persist_current();
+        let mut g = state.lock_inner()?;
+        let mut mpv = state.lock_mpv()?;
+        mpv.ensure_running().map_err(|e: MpvError| e.to_string())?;
+        let _ = g.persist_current(&mut mpv);
         g.set_session_paths(root, paths, sort, false);
         g.persist_session_meta_checkpoint()?;
     }
     let dto = {
-        let mut g = state.inner.lock().map_err(|e| e.to_string())?;
+        let mut g = state.lock_inner()?;
         g.build_playlist_dto()?
     };
     Ok(Some(dto))
@@ -2416,6 +2892,23 @@ fn startup_open_paths() -> Vec<PathBuf> {
         .skip(1)
         .filter_map(|arg| decode_open_path_arg(&arg))
         .collect()
+}
+
+fn recent_path_is_allowed(recents: &[RecentOpenDto], requested: &str) -> bool {
+    recents.iter().any(|r| recent_entry_matches(&r.path, requested))
+}
+
+fn recent_entry_matches(stored: &str, requested: &str) -> bool {
+    if stored == requested {
+        return true;
+    }
+    match (
+        Path::new(stored).canonicalize(),
+        Path::new(requested).canonicalize(),
+    ) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
 }
 
 fn decode_open_path_arg(arg: &str) -> Option<PathBuf> {
@@ -2476,13 +2969,14 @@ async fn open_file_path_impl(app: AppHandle, file_path: PathBuf) -> Result<Optio
         return Err("Selected file is not a supported audio type".to_string());
     }
     let catalog_match = {
-        let mut g = state.inner.lock().map_err(|e| e.to_string())?;
+        let mut g = state.lock_inner()?;
         CatalogService::new(&mut g.db).find_collection_for_path(&file_path)?
     };
     if let Some(collection_id) = catalog_match {
         let dto = {
-            let mut g = state.inner.lock().map_err(|e| e.to_string())?;
-            g.play_collection_inner(collection_id, "continue", false, true)?
+            let mut g = state.lock_inner()?;
+            let mut mpv = state.lock_mpv()?;
+            g.play_collection_inner(&mut mpv, collection_id, "continue", false, true)?
         };
         let _ = app.emit("abp:playlist-update", &dto);
         return Ok(Some(dto));
@@ -2493,18 +2987,19 @@ async fn open_file_path_impl(app: AppHandle, file_path: PathBuf) -> Result<Optio
         .ok_or_else(|| "Cannot determine parent folder".to_string())?;
     let parent = InnerState::canonicalize_allowed(&parent)?;
     let sort = {
-        let g = state.inner.lock().map_err(|e| e.to_string())?;
+        let g = state.lock_inner()?;
         g.sort_key
     };
     {
-        let mut g = state.inner.lock().map_err(|e| e.to_string())?;
-        g.mpv.ensure_running().map_err(|e: MpvError| e.to_string())?;
-        let _ = g.persist_current();
+        let mut g = state.lock_inner()?;
+        let mut mpv = state.lock_mpv()?;
+        mpv.ensure_running().map_err(|e: MpvError| e.to_string())?;
+        let _ = g.persist_current(&mut mpv);
         g.set_session_paths(parent, vec![file_path], sort, true);
         g.persist_session_meta_checkpoint()?;
     }
     let dto = {
-        let mut g = state.inner.lock().map_err(|e| e.to_string())?;
+        let mut g = state.lock_inner()?;
         g.build_playlist_dto()?
     };
     Ok(Some(dto))
@@ -2513,7 +3008,7 @@ async fn open_file_path_impl(app: AppHandle, file_path: PathBuf) -> Result<Optio
 #[tauri::command]
 fn resort_playlist(app: AppHandle, sort: SortKey) -> Result<PlaylistDto, String> {
     let state = app.state::<AppState>();
-    let mut g = state.inner.lock().map_err(|e| e.to_string())?;
+    let mut g = state.lock_inner()?;
     if g.session_root.is_none() {
         return Err("Open a folder or file first".to_string());
     }
@@ -2534,7 +3029,7 @@ fn resort_playlist(app: AppHandle, sort: SortKey) -> Result<PlaylistDto, String>
 fn set_repeat_mode(app: AppHandle, mode: String) -> Result<(), String> {
     let mode = RepeatMode::parse(&mode).ok_or_else(|| "Invalid repeat mode (use off, one, or all)".to_string())?;
     let state = app.state::<AppState>();
-    let mut g = state.inner.lock().map_err(|e| e.to_string())?;
+    let mut g = state.lock_inner()?;
     g.repeat_mode = mode;
     g.db
         .set_setting(PREF_REPEAT_MODE, mode.as_str())
@@ -2545,18 +3040,20 @@ fn set_repeat_mode(app: AppHandle, mode: String) -> Result<(), String> {
 #[tauri::command]
 fn play_index(app: AppHandle, index: usize) -> Result<(), String> {
     let state = app.state::<AppState>();
-    let mut g = state.inner.lock().map_err(|e| e.to_string())?;
-    g.mpv.ensure_running().map_err(|e: MpvError| e.to_string())?;
-    let _ = g.persist_current();
-    g.play_path_at_index(index)?;
+    let mut g = state.lock_inner()?;
+    let mut mpv = state.lock_mpv()?;
+    mpv.ensure_running().map_err(|e: MpvError| e.to_string())?;
+    let _ = g.persist_current(&mut mpv);
+    g.play_path_at_index(&mut mpv, index)?;
     Ok(())
 }
 
 #[tauri::command]
 fn toggle_pause(app: AppHandle) -> Result<bool, String> {
     let state = app.state::<AppState>();
-    let mut g = state.inner.lock().map_err(|e| e.to_string())?;
-    let paused = g.toggle_playback_inner()?;
+    let mut g = state.lock_inner()?;
+    let mut mpv = state.lock_mpv()?;
+    let paused = g.toggle_playback_inner(&mut mpv)?;
     notify_transport_changed(&app);
     Ok(paused)
 }
@@ -2564,20 +3061,19 @@ fn toggle_pause(app: AppHandle) -> Result<bool, String> {
 #[tauri::command]
 fn set_paused(app: AppHandle, paused: bool) -> Result<(), String> {
     let state = app.state::<AppState>();
-    let mut g = state.inner.lock().map_err(|e| e.to_string())?;
+    let mut g = state.lock_inner()?;
+    let mut mpv = state.lock_mpv()?;
     if paused {
         // Ignore stray Pause/Stop signals when nothing is loaded — do not spawn mpv.
-        if g.current_index.is_some() || !g.mpv_is_idle() {
-            g.mpv
-                .set_pause(true)
-                .map_err(|e: MpvError| e.to_string())?;
-            let _ = g.persist_current();
+        if g.current_index.is_some() || !g.mpv_is_idle(&mut mpv) {
+            mpv.pause_or_kill();
+            let _ = g.persist_current(&mut mpv);
         }
     } else {
-        g.resume_or_start_playback()?;
-        let _ = g.persist_current();
+        g.resume_or_start_playback(&mut mpv)?;
+        let _ = g.persist_current(&mut mpv);
     }
-    let _ = g.sync_session_last_playing();
+    let _ = g.sync_session_last_playing(&mut mpv);
     notify_transport_changed(&app);
     Ok(())
 }
@@ -2586,8 +3082,9 @@ fn set_paused(app: AppHandle, paused: bool) -> Result<(), String> {
 #[cfg(target_os = "linux")]
 fn media_play(app: AppHandle) -> Result<(), String> {
     let state = app.state::<AppState>();
-    let mut g = state.inner.lock().map_err(|e| e.to_string())?;
-    g.media_play_inner()?;
+    let mut g = state.lock_inner()?;
+    let mut mpv = state.lock_mpv()?;
+    g.media_play_inner(&mut mpv)?;
     notify_transport_changed(&app);
     Ok(())
 }
@@ -2596,8 +3093,9 @@ fn media_play(app: AppHandle) -> Result<(), String> {
 #[cfg(target_os = "linux")]
 fn media_toggle(app: AppHandle) -> Result<(), String> {
     let state = app.state::<AppState>();
-    let mut g = state.inner.lock().map_err(|e| e.to_string())?;
-    g.toggle_playback_inner().map(|_| ())?;
+    let mut g = state.lock_inner()?;
+    let mut mpv = state.lock_mpv()?;
+    g.toggle_playback_inner(&mut mpv).map(|_| ())?;
     notify_transport_changed(&app);
     Ok(())
 }
@@ -2620,8 +3118,9 @@ fn get_os_media_status() -> media_controls::OsMediaStatusDto {
 #[tauri::command]
 fn seek_seconds(app: AppHandle, seconds: f64) -> Result<(), String> {
     let state = app.state::<AppState>();
-    let mut g = state.inner.lock().map_err(|e| e.to_string())?;
-    g.seek_seconds_inner(seconds)?;
+    let mut g = state.lock_inner()?;
+    let mut mpv = state.lock_mpv()?;
+    g.seek_seconds_inner(&mut mpv, seconds)?;
     notify_transport_changed(&app);
     Ok(())
 }
@@ -2629,8 +3128,9 @@ fn seek_seconds(app: AppHandle, seconds: f64) -> Result<(), String> {
 #[tauri::command]
 fn seek_delta(app: AppHandle, delta: f64) -> Result<(), String> {
     let state = app.state::<AppState>();
-    let mut g = state.inner.lock().map_err(|e| e.to_string())?;
-    g.seek_delta_inner(delta)?;
+    let mut g = state.lock_inner()?;
+    let mut mpv = state.lock_mpv()?;
+    g.seek_delta_inner(&mut mpv, delta)?;
     notify_transport_changed(&app);
     Ok(())
 }
@@ -2639,8 +3139,9 @@ fn seek_delta(app: AppHandle, delta: f64) -> Result<(), String> {
 fn set_speed(app: AppHandle, speed: f64) -> Result<f64, String> {
     let speed = InnerState::clamp_speed(speed);
     let state = app.state::<AppState>();
-    let mut g = state.inner.lock().map_err(|e| e.to_string())?;
-    g.mpv
+    let mut g = state.lock_inner()?;
+    let mut mpv = state.lock_mpv()?;
+    mpv
         .set_speed(speed)
         .map_err(|e: MpvError| e.to_string())?;
     if let Some(path) = g.current_path() {
@@ -2649,7 +3150,7 @@ fn set_speed(app: AppHandle, speed: f64) -> Result<f64, String> {
             .upsert_speed(&key, speed, InnerState::now_unix())
             .map_err(|e| e.to_string())?;
     }
-    let _ = g.persist_current();
+    let _ = g.persist_current(&mut mpv);
     Ok(speed)
 }
 
@@ -2657,7 +3158,8 @@ fn set_speed(app: AppHandle, speed: f64) -> Result<f64, String> {
 fn set_default_playback_speed(app: AppHandle, speed: f64) -> Result<f64, String> {
     let speed = InnerState::clamp_speed(speed);
     let state = app.state::<AppState>();
-    let mut g = state.inner.lock().map_err(|e| e.to_string())?;
+    let mut g = state.lock_inner()?;
+    let mut mpv = state.lock_mpv()?;
     let kind = g.effective_playback_kind();
     if kind == "music" {
         g.db
@@ -2668,16 +3170,15 @@ fn set_default_playback_speed(app: AppHandle, speed: f64) -> Result<f64, String>
             .set_default_speed_audiobook(speed)
             .map_err(|e| e.to_string())?;
     }
-    g.mpv
-        .set_speed(speed)
-        .map_err(|e: MpvError| e.to_string())?;
     if let Some(path) = g.current_path() {
         let key = path.to_string_lossy();
         g.db
-            .upsert_speed(&key, speed, InnerState::now_unix())
+            .clear_speed_custom(&key, InnerState::now_unix())
             .map_err(|e| e.to_string())?;
     }
-    let _ = g.persist_current();
+    mpv
+        .set_speed(speed)
+        .map_err(|e: MpvError| e.to_string())?;
     Ok(speed)
 }
 
@@ -2690,7 +3191,7 @@ fn set_playback_speed_defaults(
     let audiobook = InnerState::clamp_speed(audiobook);
     let music = InnerState::clamp_speed(music);
     let state = app.state::<AppState>();
-    let mut g = state.inner.lock().map_err(|e| e.to_string())?;
+    let mut g = state.lock_inner()?;
     g.db
         .set_default_speed_audiobook(audiobook)
         .map_err(|e| e.to_string())?;
@@ -2707,7 +3208,7 @@ fn set_playlist_default_speed(
     speed: Option<f64>,
 ) -> Result<catalog::PlaylistDetailDto, String> {
     let state = app.state::<AppState>();
-    let mut g = state.inner.lock().map_err(|e| e.to_string())?;
+    let mut g = state.lock_inner()?;
     let speed = speed.map(InnerState::clamp_speed);
     CatalogService::new(&mut g.db).set_playlist_default_speed(playlist_id, speed)?;
     CatalogService::new(&mut g.db).get_playlist_detail(playlist_id)
@@ -2716,7 +3217,8 @@ fn set_playlist_default_speed(
 #[tauri::command]
 fn reset_track_speed_to_default(app: AppHandle) -> Result<f64, String> {
     let state = app.state::<AppState>();
-    let mut g = state.inner.lock().map_err(|e| e.to_string())?;
+    let mut g = state.lock_inner()?;
+    let mut mpv = state.lock_mpv()?;
     let Some(path) = g.current_path() else {
         return Err("Nothing is playing".into());
     };
@@ -2725,7 +3227,7 @@ fn reset_track_speed_to_default(app: AppHandle) -> Result<f64, String> {
         .clear_speed_custom(&key, InnerState::now_unix())
         .map_err(|e| e.to_string())?;
     let speed = g.resolve_playback_speed(&key)?;
-    g.mpv
+    mpv
         .set_speed(speed)
         .map_err(|e: MpvError| e.to_string())?;
     Ok(speed)
@@ -2733,30 +3235,25 @@ fn reset_track_speed_to_default(app: AppHandle) -> Result<f64, String> {
 
 #[tauri::command]
 fn save_progress(app: AppHandle) -> Result<(), String> {
-    let state = app.state::<AppState>();
-    let mut g = state.inner.lock().map_err(|e| e.to_string())?;
-    g.persist_current()
+    app.state::<AppState>().persist_progress_without_holding_mpv()
 }
 
 #[tauri::command]
 fn get_transport(app: AppHandle) -> Result<TransportDto, String> {
     let state = app.state::<AppState>();
-    let mut g = state.inner.lock().map_err(|e| e.to_string())?;
-    let mut mpv_error = None;
-    let (position_sec, duration_sec, paused, speed, eof, idle) = match g.mpv.read_transport_state() {
-        Ok(r) => (
-            r.position_sec,
-            r.duration_sec,
-            r.paused,
-            r.speed,
-            r.eof,
-            r.idle,
-        ),
-        Err(e) => {
-            mpv_error = Some(e.to_string());
-            (0.0, None, true, 1.0, false, true)
+    if apply_sleep_if_due(&state) {
+        let _ = app.emit("abp:sleep-fired", true);
+        notify_transport_changed(&app);
+    }
+    // Peek mpv first and drop that lock before touching the catalog.
+    let (read, mpv_error) = {
+        let mut mpv = state.lock_mpv()?;
+        match mpv.read_transport_passive() {
+            Ok(r) => (r, None),
+            Err(e) => (MpvController::idle_transport(), Some(e.to_string())),
         }
     };
+    let mut g = state.lock_inner()?;
     let current_path = g
         .current_path()
         .map(|p| p.to_string_lossy().into_owned());
@@ -2765,12 +3262,12 @@ fn get_transport(app: AppHandle) -> Result<TransportDto, String> {
         .as_ref()
         .map(|p| p.to_string_lossy().into_owned());
     Ok(TransportDto {
-        position_sec,
-        duration_sec,
-        paused,
-        speed,
-        eof,
-        idle,
+        position_sec: read.position_sec,
+        duration_sec: read.duration_sec,
+        paused: read.paused,
+        speed: read.speed,
+        eof: read.eof,
+        idle: read.idle,
         current_index: g.current_index,
         current_path,
         playlist_len: g.playlist.len(),
@@ -2782,13 +3279,15 @@ fn get_transport(app: AppHandle) -> Result<TransportDto, String> {
         active_collection_kind: g
             .resolved_collection_id()
             .and_then(|id| g.collection_kind(id)),
+        sleep_deadline_ms: g.sleep_deadline_ms,
+        stop_after_track: g.stop_after_track,
     })
 }
 
 #[tauri::command]
 fn get_current_playlist(app: AppHandle) -> Result<Option<PlaylistDto>, String> {
     let state = app.state::<AppState>();
-    let mut g = state.inner.lock().map_err(|e| e.to_string())?;
+    let mut g = state.lock_inner()?;
     if g.playlist.is_empty() {
         return Ok(None);
     }
@@ -2798,41 +3297,55 @@ fn get_current_playlist(app: AppHandle) -> Result<Option<PlaylistDto>, String> {
 #[tauri::command]
 fn list_library_roots(app: AppHandle) -> Result<Vec<catalog::LibraryRootDto>, String> {
     let state = app.state::<AppState>();
-    let mut g = state.inner.lock().map_err(|e| e.to_string())?;
+    let mut g = state.lock_inner()?;
     CatalogService::new(&mut g.db).list_roots()
+}
+
+/// Grant stays until `add` succeeds so a failed scan/validation does not force a re-pick.
+fn link_granted_library_root(
+    state: &AppState,
+    input: AddLibraryRootInput,
+    add: impl FnOnce(AddLibraryRootInput) -> Result<catalog::LibraryRootDto, String>,
+) -> Result<catalog::LibraryRootDto, String> {
+    let canon = state.require_library_folder_grant(Path::new(input.path.trim()))?;
+    let out = add(input);
+    if out.is_ok() {
+        state.forget_library_folder_grant(&canon);
+    }
+    out
 }
 
 #[tauri::command]
 fn add_library_root(app: AppHandle, input: AddLibraryRootInput) -> Result<catalog::LibraryRootDto, String> {
-    with_scan_flag(&app, || {
-        let state = app.state::<AppState>();
-        let mut g = state.inner.lock().map_err(|e| e.to_string())?;
-        CatalogService::new(&mut g.db).add_root(input)
+    let state = app.state::<AppState>();
+    link_granted_library_root(&state, input, |input| {
+        with_scan_flag(&app, || {
+            let mut db = open_sidecar_catalog()?;
+            CatalogService::new(&mut db).add_root(input)
+        })
     })
 }
 
 #[tauri::command]
 fn remove_library_root(app: AppHandle, root_id: i64) -> Result<(), String> {
     let state = app.state::<AppState>();
-    let mut g = state.inner.lock().map_err(|e| e.to_string())?;
+    let mut g = state.lock_inner()?;
     CatalogService::new(&mut g.db).remove_root(root_id)
 }
 
 #[tauri::command]
 fn scan_library_root(app: AppHandle, root_id: i64) -> Result<catalog::ScanStatusDto, String> {
     with_scan_flag(&app, || {
-        let state = app.state::<AppState>();
-        let mut g = state.inner.lock().map_err(|e| e.to_string())?;
-        CatalogService::new(&mut g.db).scan_root(root_id)
+        let mut db = open_sidecar_catalog()?;
+        CatalogService::new(&mut db).scan_root(root_id)
     })
 }
 
 #[tauri::command]
 fn refresh_library_roots(app: AppHandle) -> Result<(), String> {
     with_scan_flag(&app, || {
-        let state = app.state::<AppState>();
-        let mut g = state.inner.lock().map_err(|e| e.to_string())?;
-        CatalogService::new(&mut g.db).refresh_roots_availability()
+        let mut db = open_sidecar_catalog()?;
+        CatalogService::new(&mut db).refresh_roots_availability()
     })
 }
 
@@ -2847,7 +3360,7 @@ fn list_collections(
     offset: Option<i64>,
 ) -> Result<catalog::CollectionListPageDto, String> {
     let state = app.state::<AppState>();
-    let mut g = state.inner.lock().map_err(|e| e.to_string())?;
+    let mut g = state.lock_inner()?;
     CatalogService::new(&mut g.db).list_collections(
         kind.as_deref(),
         filter.as_deref(),
@@ -2859,30 +3372,23 @@ fn list_collections(
 }
 
 #[tauri::command]
-fn list_series_names(app: AppHandle, kind: Option<String>) -> Result<Vec<String>, String> {
-    let state = app.state::<AppState>();
-    let mut g = state.inner.lock().map_err(|e| e.to_string())?;
-    CatalogService::new(&mut g.db).list_series_names(kind.as_deref())
-}
-
-#[tauri::command]
 fn get_collection_detail(app: AppHandle, collection_id: i64) -> Result<catalog::CollectionDetailDto, String> {
     let state = app.state::<AppState>();
-    let mut g = state.inner.lock().map_err(|e| e.to_string())?;
+    let mut g = state.lock_inner()?;
     CatalogService::new(&mut g.db).get_collection_detail(collection_id)
 }
 
 #[tauri::command]
 fn find_collection_file_id(app: AppHandle, path: String) -> Result<Option<i64>, String> {
     let state = app.state::<AppState>();
-    let mut g = state.inner.lock().map_err(|e| e.to_string())?;
+    let mut g = state.lock_inner()?;
     CatalogService::new(&mut g.db).find_collection_file_id_by_path(Path::new(&path))
 }
 
 #[tauri::command]
 fn find_relax_playlist(app: AppHandle) -> Result<Option<i64>, String> {
     let state = app.state::<AppState>();
-    let mut g = state.inner.lock().map_err(|e| e.to_string())?;
+    let mut g = state.lock_inner()?;
     CatalogService::new(&mut g.db).find_relax_playlist_id()
 }
 
@@ -2890,7 +3396,7 @@ fn find_relax_playlist(app: AppHandle) -> Result<Option<i64>, String> {
 fn get_home_summary(app: AppHandle) -> Result<catalog::HomeSummaryDto, String> {
     let state = app.state::<AppState>();
     let scanning = state.scan_in_progress.load(Ordering::SeqCst);
-    let mut g = state.inner.lock().map_err(|e| e.to_string())?;
+    let mut g = state.lock_inner()?;
     CatalogService::new(&mut g.db).get_home_summary(scanning)
 }
 
@@ -2903,8 +3409,9 @@ fn play_collection(
 ) -> Result<PlaylistDto, String> {
     let state = app.state::<AppState>();
     let dto = {
-        let mut g = state.inner.lock().map_err(|e| e.to_string())?;
-        g.play_collection_inner(collection_id, &mode, shuffle.unwrap_or(false), true)?
+        let mut g = state.lock_inner()?;
+        let mut mpv = state.lock_mpv()?;
+        g.play_collection_inner(&mut mpv, collection_id, &mode, shuffle.unwrap_or(false), true)?
     };
     let _ = app.emit("abp:playlist-update", &dto);
     Ok(dto)
@@ -2918,8 +3425,9 @@ fn enqueue_collection(
 ) -> Result<EnqueueCollectionResult, String> {
     let state = app.state::<AppState>();
     let result = {
-        let mut g = state.inner.lock().map_err(|e| e.to_string())?;
-        g.enqueue_collection_inner(collection_id, position.as_deref().unwrap_or("end"))?
+        let mut g = state.lock_inner()?;
+        let mut mpv = state.lock_mpv()?;
+        g.enqueue_collection_inner(&mut mpv, collection_id, position.as_deref().unwrap_or("end"))?
     };
     let _ = app.emit("abp:playlist-update", &result.playlist);
     Ok(result)
@@ -2936,8 +3444,9 @@ fn play_kind(
     catalog::validate_playback_kind(&kind)?;
     let state = app.state::<AppState>();
     let dto = {
-        let mut g = state.inner.lock().map_err(|e| e.to_string())?;
-        g.play_kind_inner(
+        let mut g = state.lock_inner()?;
+        let mut mpv = state.lock_mpv()?;
+        g.play_kind_inner(&mut mpv, 
             &kind,
             filter.as_deref(),
             search.as_deref(),
@@ -2960,8 +3469,9 @@ fn enqueue_kind(
     catalog::validate_playback_kind(&kind)?;
     let state = app.state::<AppState>();
     let result = {
-        let mut g = state.inner.lock().map_err(|e| e.to_string())?;
-        g.enqueue_kind_inner(
+        let mut g = state.lock_inner()?;
+        let mut mpv = state.lock_mpv()?;
+        g.enqueue_kind_inner(&mut mpv, 
             &kind,
             filter.as_deref(),
             search.as_deref(),
@@ -2979,12 +3489,13 @@ fn update_collection_metadata(
     metadata: CollectionMetadataInput,
 ) -> Result<(), String> {
     let state = app.state::<AppState>();
-    let mut g = state.inner.lock().map_err(|e| e.to_string())?;
+    let mut g = state.lock_inner()?;
     CatalogService::new(&mut g.db).update_collection_metadata(collection_id, metadata)
 }
 
 fn apply_collection_kind_playback_effects(
     g: &mut InnerState,
+    mpv: &mut MpvController,
     collection_id: i64,
     kind: &str,
 ) -> Result<(), String> {
@@ -3002,8 +3513,8 @@ fn apply_collection_kind_playback_effects(
         if let Some(current) = g.current_path() {
             let key = current.to_string_lossy().into_owned();
             let speed = g.resolve_playback_speed(&key)?;
-            if g.mpv.ensure_running().is_ok() {
-                let _ = g.mpv.set_speed(speed);
+            if mpv.ensure_running().is_ok() {
+                let _ = mpv.set_speed(speed);
             }
         }
     }
@@ -3013,9 +3524,10 @@ fn apply_collection_kind_playback_effects(
 #[tauri::command]
 fn set_collection_kind(app: AppHandle, collection_id: i64, kind: String) -> Result<(), String> {
     let state = app.state::<AppState>();
-    let mut g = state.inner.lock().map_err(|e| e.to_string())?;
+    let mut g = state.lock_inner()?;
+    let mut mpv = state.lock_mpv()?;
     CatalogService::new(&mut g.db).set_collection_kind(collection_id, &kind)?;
-    apply_collection_kind_playback_effects(&mut g, collection_id, &kind)?;
+    apply_collection_kind_playback_effects(&mut g, &mut mpv, collection_id, &kind)?;
     Ok(())
 }
 
@@ -3026,7 +3538,8 @@ fn set_collections_kind(
     kind: String,
 ) -> Result<catalog::SetCollectionsKindResult, String> {
     let state = app.state::<AppState>();
-    let mut g = state.inner.lock().map_err(|e| e.to_string())?;
+    let mut g = state.lock_inner()?;
+    let mut mpv = state.lock_mpv()?;
     let result = CatalogService::new(&mut g.db).set_collections_kind(&collection_ids, &kind)?;
     for &id in &collection_ids {
         if result
@@ -3036,7 +3549,7 @@ fn set_collections_kind(
         {
             continue;
         }
-        let _ = apply_collection_kind_playback_effects(&mut g, id, &kind);
+        let _ = apply_collection_kind_playback_effects(&mut g, &mut mpv, id, &kind);
     }
     Ok(result)
 }
@@ -3052,7 +3565,7 @@ fn list_collection_ids(
         catalog::validate_playback_kind(k)?;
     }
     let state = app.state::<AppState>();
-    let mut g = state.inner.lock().map_err(|e| e.to_string())?;
+    let mut g = state.lock_inner()?;
     CatalogService::new(&mut g.db).list_collection_ids(
         kind.as_deref(),
         filter.as_deref(),
@@ -3063,92 +3576,42 @@ fn list_collection_ids(
 #[tauri::command]
 fn find_collection_id_for_path(app: AppHandle, path: String) -> Result<Option<i64>, String> {
     let state = app.state::<AppState>();
-    let mut g = state.inner.lock().map_err(|e| e.to_string())?;
+    let mut g = state.lock_inner()?;
     CatalogService::new(&mut g.db).find_collection_for_path(Path::new(&path))
 }
 
 #[tauri::command]
 fn mark_collection_listened(app: AppHandle, collection_id: i64, listened: bool) -> Result<(), String> {
     let state = app.state::<AppState>();
-    let mut g = state.inner.lock().map_err(|e| e.to_string())?;
+    let mut g = state.lock_inner()?;
     CatalogService::new(&mut g.db).mark_collection_listened(collection_id, listened)
 }
 
 #[tauri::command]
 fn list_playlists(app: AppHandle) -> Result<Vec<catalog::PlaylistSummaryDto>, String> {
     let state = app.state::<AppState>();
-    let mut g = state.inner.lock().map_err(|e| e.to_string())?;
+    let mut g = state.lock_inner()?;
     CatalogService::new(&mut g.db).list_playlists()
 }
 
 #[tauri::command]
 fn create_playlist(app: AppHandle, name: String, pin: Option<bool>) -> Result<i64, String> {
     let state = app.state::<AppState>();
-    let mut g = state.inner.lock().map_err(|e| e.to_string())?;
+    let mut g = state.lock_inner()?;
     CatalogService::new(&mut g.db).create_playlist(&name, pin.unwrap_or(false))
 }
 
 #[tauri::command]
 fn add_to_playlist(app: AppHandle, playlist_id: i64, collection_file_id: i64) -> Result<(), String> {
     let state = app.state::<AppState>();
-    let mut g = state.inner.lock().map_err(|e| e.to_string())?;
+    let mut g = state.lock_inner()?;
     CatalogService::new(&mut g.db).add_to_playlist(playlist_id, collection_file_id)
-}
-
-#[tauri::command]
-fn list_album_groups(
-    app: AppHandle,
-    search: Option<String>,
-    limit: Option<i64>,
-    offset: Option<i64>,
-) -> Result<Vec<catalog::AlbumGroupDto>, String> {
-    let state = app.state::<AppState>();
-    let mut g = state.inner.lock().map_err(|e| e.to_string())?;
-    CatalogService::new(&mut g.db).list_album_groups(
-        search.as_deref(),
-        limit.unwrap_or(500),
-        offset.unwrap_or(0),
-    )
-}
-
-#[tauri::command]
-fn add_album_to_playlist(
-    app: AppHandle,
-    playlist_id: i64,
-    artist: String,
-    album: String,
-) -> Result<catalog::AddToPlaylistBulkResult, String> {
-    let state = app.state::<AppState>();
-    let mut g = state.inner.lock().map_err(|e| e.to_string())?;
-    CatalogService::new(&mut g.db).add_album_to_playlist(playlist_id, &artist, &album)
-}
-
-#[tauri::command]
-fn add_collection_to_playlist(
-    app: AppHandle,
-    playlist_id: i64,
-    collection_id: i64,
-) -> Result<catalog::AddToPlaylistBulkResult, String> {
-    let state = app.state::<AppState>();
-    let mut g = state.inner.lock().map_err(|e| e.to_string())?;
-    CatalogService::new(&mut g.db).add_collection_to_playlist(playlist_id, collection_id)
-}
-
-#[tauri::command]
-fn create_playlist_from_album(
-    app: AppHandle,
-    artist: String,
-    album: String,
-) -> Result<i64, String> {
-    let state = app.state::<AppState>();
-    let mut g = state.inner.lock().map_err(|e| e.to_string())?;
-    CatalogService::new(&mut g.db).create_playlist_from_album(&artist, &album)
 }
 
 #[tauri::command]
 fn create_playlist_from_collection(app: AppHandle, collection_id: i64) -> Result<i64, String> {
     let state = app.state::<AppState>();
-    let mut g = state.inner.lock().map_err(|e| e.to_string())?;
+    let mut g = state.lock_inner()?;
     CatalogService::new(&mut g.db).create_playlist_from_collection(collection_id)
 }
 
@@ -3161,11 +3624,11 @@ fn list_metadata_groups(
     offset: Option<i64>,
 ) -> Result<Vec<catalog::MetadataGroupDto>, String> {
     let state = app.state::<AppState>();
-    let mut g = state.inner.lock().map_err(|e| e.to_string())?;
+    let mut g = state.lock_inner()?;
     CatalogService::new(&mut g.db).list_metadata_groups(
         &group_kind,
         search.as_deref(),
-        limit.unwrap_or(500),
+        limit.unwrap_or(200),
         offset.unwrap_or(0),
     )
 }
@@ -3178,7 +3641,7 @@ fn add_metadata_group_to_playlist(
     group_key: String,
 ) -> Result<catalog::AddToPlaylistBulkResult, String> {
     let state = app.state::<AppState>();
-    let mut g = state.inner.lock().map_err(|e| e.to_string())?;
+    let mut g = state.lock_inner()?;
     CatalogService::new(&mut g.db).add_metadata_group_to_playlist(
         playlist_id,
         &group_kind,
@@ -3193,7 +3656,7 @@ fn create_playlist_from_metadata_group(
     group_key: String,
 ) -> Result<i64, String> {
     let state = app.state::<AppState>();
-    let mut g = state.inner.lock().map_err(|e| e.to_string())?;
+    let mut g = state.lock_inner()?;
     CatalogService::new(&mut g.db).create_playlist_from_metadata_group(&group_kind, &group_key)
 }
 
@@ -3213,23 +3676,24 @@ async fn pick_import_folder_to_playlist(
     let folder = fp
         .into_path()
         .map_err(|e| format!("Could not use selected folder path: {e}"))?;
-    let state = app.state::<AppState>();
-    let mut g = state.inner.lock().map_err(|e| e.to_string())?;
-    let result = CatalogService::new(&mut g.db).import_folder_to_playlist(playlist_id, &folder)?;
-    Ok(Some(result))
+    with_scan_flag(&app, || {
+        let mut db = open_sidecar_catalog()?;
+        CatalogService::new(&mut db).import_folder_to_playlist(playlist_id, &folder)
+    })
+    .map(Some)
 }
 
 #[tauri::command]
 fn rename_playlist(app: AppHandle, playlist_id: i64, name: String) -> Result<(), String> {
     let state = app.state::<AppState>();
-    let mut g = state.inner.lock().map_err(|e| e.to_string())?;
+    let mut g = state.lock_inner()?;
     CatalogService::new(&mut g.db).rename_playlist(playlist_id, &name)
 }
 
 #[tauri::command]
 fn delete_playlist(app: AppHandle, playlist_id: i64) -> Result<(), String> {
     let state = app.state::<AppState>();
-    let mut g = state.inner.lock().map_err(|e| e.to_string())?;
+    let mut g = state.lock_inner()?;
     CatalogService::new(&mut g.db).delete_playlist(playlist_id)
 }
 
@@ -3239,14 +3703,14 @@ fn get_playlist_detail(
     playlist_id: i64,
 ) -> Result<catalog::PlaylistDetailDto, String> {
     let state = app.state::<AppState>();
-    let mut g = state.inner.lock().map_err(|e| e.to_string())?;
+    let mut g = state.lock_inner()?;
     CatalogService::new(&mut g.db).get_playlist_detail(playlist_id)
 }
 
 #[tauri::command]
 fn remove_from_playlist(app: AppHandle, item_id: i64) -> Result<(), String> {
     let state = app.state::<AppState>();
-    let mut g = state.inner.lock().map_err(|e| e.to_string())?;
+    let mut g = state.lock_inner()?;
     CatalogService::new(&mut g.db).remove_from_playlist(item_id)
 }
 
@@ -3257,7 +3721,7 @@ fn reorder_playlist_items(
     item_ids: Vec<i64>,
 ) -> Result<(), String> {
     let state = app.state::<AppState>();
-    let mut g = state.inner.lock().map_err(|e| e.to_string())?;
+    let mut g = state.lock_inner()?;
     CatalogService::new(&mut g.db).reorder_playlist_items(playlist_id, item_ids)
 }
 
@@ -3268,7 +3732,7 @@ fn reorder_collection_files(
     file_ids: Vec<i64>,
 ) -> Result<(), String> {
     let state = app.state::<AppState>();
-    let mut g = state.inner.lock().map_err(|e| e.to_string())?;
+    let mut g = state.lock_inner()?;
     CatalogService::new(&mut g.db).reorder_collection_files(collection_id, file_ids)
 }
 
@@ -3279,7 +3743,7 @@ fn update_file_display_title(
     display_title: String,
 ) -> Result<(), String> {
     let state = app.state::<AppState>();
-    let mut g = state.inner.lock().map_err(|e| e.to_string())?;
+    let mut g = state.lock_inner()?;
     CatalogService::new(&mut g.db).update_file_display_title(file_id, &display_title)
 }
 
@@ -3295,7 +3759,7 @@ fn relink_collection_file(
     new_path: String,
 ) -> Result<LibraryFileChangeResult, String> {
     let state = app.state::<AppState>();
-    let mut g = state.inner.lock().map_err(|e| e.to_string())?;
+    let mut g = state.lock_inner()?;
     let result = CatalogService::new(&mut g.db).relink_collection_file(file_id, &new_path)?;
     g.sync_session_after_relink(&result.old_path, &result.new_path)?;
     let playlist = g.session_playlist_if_open()?;
@@ -3311,7 +3775,7 @@ fn remove_collection_file_from_library(
     file_id: i64,
 ) -> Result<catalog::RemoveCollectionFileResult, String> {
     let state = app.state::<AppState>();
-    let mut g = state.inner.lock().map_err(|e| e.to_string())?;
+    let mut g = state.lock_inner()?;
     let result = CatalogService::new(&mut g.db).remove_collection_file_from_library(file_id)?;
     g.sync_session_after_remove(&result.removed_path)?;
     let playlist = g.session_playlist_if_open()?;
@@ -3327,7 +3791,7 @@ fn remove_collection_from_library(
     collection_id: i64,
 ) -> Result<catalog::RemoveCollectionResult, String> {
     let state = app.state::<AppState>();
-    let mut g = state.inner.lock().map_err(|e| e.to_string())?;
+    let mut g = state.lock_inner()?;
     let result = CatalogService::new(&mut g.db)
         .remove_collection_from_library(collection_id)?;
     for path in &result.removed_paths {
@@ -3344,8 +3808,9 @@ fn remove_collection_from_library(
 fn remove_queue_item(app: AppHandle, path: String) -> Result<Option<PlaylistDto>, String> {
     let state = app.state::<AppState>();
     let dto = {
-        let mut g = state.inner.lock().map_err(|e| e.to_string())?;
-        g.remove_queue_item_inner(PathBuf::from(path))?
+        let mut g = state.lock_inner()?;
+        let mut mpv = state.lock_mpv()?;
+        g.remove_queue_item_inner(&mut mpv, PathBuf::from(path))?
     };
     if let Some(ref d) = dto {
         let _ = app.emit("abp:playlist-update", d);
@@ -3379,29 +3844,15 @@ async fn pick_relink_audio_file(app: AppHandle) -> Result<Option<String>, String
 #[tauri::command]
 fn fix_collection_track_order(app: AppHandle, collection_id: i64) -> Result<(), String> {
     let state = app.state::<AppState>();
-    let mut g = state.inner.lock().map_err(|e| e.to_string())?;
+    let mut g = state.lock_inner()?;
     CatalogService::new(&mut g.db).fix_collection_track_order(collection_id)
 }
 
 #[tauri::command]
 fn set_playlist_pinned(app: AppHandle, playlist_id: i64, pinned: bool) -> Result<(), String> {
     let state = app.state::<AppState>();
-    let mut g = state.inner.lock().map_err(|e| e.to_string())?;
+    let mut g = state.lock_inner()?;
     CatalogService::new(&mut g.db).set_playlist_pinned(playlist_id, pinned)
-}
-
-#[tauri::command]
-fn get_scan_status(app: AppHandle) -> Result<Vec<catalog::ScanStatusDto>, String> {
-    let state = app.state::<AppState>();
-    let mut g = state.inner.lock().map_err(|e| e.to_string())?;
-    CatalogService::new(&mut g.db).scan_status_all()
-}
-
-#[tauri::command]
-fn add_to_library(app: AppHandle, input: AddToLibraryInput) -> Result<i64, String> {
-    let state = app.state::<AppState>();
-    let mut g = state.inner.lock().map_err(|e| e.to_string())?;
-    CatalogService::new(&mut g.db).add_to_library(input)
 }
 
 #[tauri::command]
@@ -3411,7 +3862,7 @@ async fn lookup_metadata_online(
 ) -> Result<Vec<MetadataSuggestionDto>, String> {
     let plan = {
         let state = app.state::<AppState>();
-        let mut g = state.inner.lock().map_err(|e| e.to_string())?;
+        let mut g = state.lock_inner()?;
         let enabled = parse_bool_pref(
             g.db
                 .get_setting(PREF_ONLINE_METADATA)
@@ -3435,7 +3886,7 @@ async fn lookup_metadata_online(
 
             if !suggestions.is_empty() {
                 let state = app.state::<AppState>();
-                let mut g = state.inner.lock().map_err(|e| e.to_string())?;
+                let mut g = state.lock_inner()?;
                 CatalogService::new(&mut g.db)
                     .store_metadata_lookup_cache(&cache_key, &suggestions)?;
             }
@@ -3447,30 +3898,23 @@ async fn lookup_metadata_online(
 #[tauri::command]
 fn set_online_metadata_enabled(app: AppHandle, enabled: bool) -> Result<AppPrefsDto, String> {
     let state = app.state::<AppState>();
-    let mut g = state.inner.lock().map_err(|e| e.to_string())?;
+    if enabled {
+        state.consume_destructive(
+            &destructive_grant::DestructiveKind::EnableOnlineMetadata,
+            "The computer must ask you before titles are sent to the internet.",
+        )?;
+    }
+    let mut g = state.lock_inner()?;
     g.db
         .set_setting(
             PREF_ONLINE_METADATA,
             if enabled { "1" } else { "0" },
         )
         .map_err(|e| e.to_string())?;
+    if enabled {
+        eprintln!("chaptercheck.audit online_metadata_enabled");
+    }
     Ok(g.app_prefs())
-}
-
-#[tauri::command]
-fn update_library_root(
-    app: AppHandle,
-    root_id: i64,
-    new_path: String,
-) -> Result<catalog::LibraryRootDto, String> {
-    let state = app.state::<AppState>();
-    let mut g = state.inner.lock().map_err(|e| e.to_string())?;
-    CatalogService::new(&mut g.db).update_root_path(root_id, &new_path)?;
-    CatalogService::new(&mut g.db)
-        .list_roots()?
-        .into_iter()
-        .find(|r| r.id == root_id)
-        .ok_or_else(|| "Root not found after update".to_string())
 }
 
 #[tauri::command]
@@ -3489,7 +3933,7 @@ async fn export_db(app: AppHandle) -> Result<Option<String>, String> {
         .into_path()
         .map_err(|e| format!("Could not use selected path: {e}"))?;
     let src = data_db_path()?;
-    fs::copy(&src, &dest_path).map_err(|e| format!("Backup failed: {e}"))?;
+    export_library_db(&src, &dest_path)?;
     Ok(Some(dest_path.to_string_lossy().to_string()))
 }
 
@@ -3499,40 +3943,16 @@ fn play_playlist(
     playlist_id: i64,
     shuffle: Option<bool>,
 ) -> Result<PlaylistDto, String> {
-    let state = app.state::<AppState>();
-    let (paths, kind) = {
-        let mut g = state.inner.lock().map_err(|e| e.to_string())?;
-        let mut cat = CatalogService::new(&mut g.db);
-        let paths = cat.playlist_playback_paths(playlist_id)?;
-        let kind = "music".to_string();
-        (paths, kind)
-    };
-    if paths.is_empty() {
-        return Err("This playlist has no playable tracks".into());
-    }
     let shuffle_play = {
         let state = app.state::<AppState>();
-        let g = state.inner.lock().map_err(|e| e.to_string())?;
+        let g = state.lock_inner()?;
         resolve_playlist_shuffle(shuffle, &g.db)
     };
-    let mut paths = paths;
-    if shuffle_play && paths.len() >= 2 {
-        paths.shuffle(&mut thread_rng());
-    }
     let dto = {
-        let mut g = state.inner.lock().map_err(|e| e.to_string())?;
-        g.mpv.ensure_running().map_err(|e: MpvError| e.to_string())?;
-        let _ = g.persist_current();
-        let root = paths[0]
-            .parent()
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| paths[0].clone());
-        let root = InnerState::canonicalize_allowed(&root)?;
-        g.set_session_paths_ordered(root, paths, false, None, Some(playlist_id), &kind);
-        g.play_path_at_index_with_autoplay(0, true)?;
-        g.touch_session_track_after_play()?;
-        g.persist_session_meta_checkpoint()?;
-        g.build_playlist_dto()?
+        let state = app.state::<AppState>();
+        let mut g = state.lock_inner()?;
+        let mut mpv = state.lock_mpv()?;
+        g.play_playlist_inner(&mut mpv, playlist_id, shuffle_play, true)?
     };
     let _ = app.emit("abp:playlist-update", &dto);
     Ok(dto)
@@ -3541,8 +3961,9 @@ fn play_playlist(
 #[tauri::command]
 fn advance_after_eof(app: AppHandle) -> Result<(), String> {
     let state = app.state::<AppState>();
-    let mut g = state.inner.lock().map_err(|e| e.to_string())?;
-    if !g.mpv.eof_reached_lenient() {
+    let mut g = state.lock_inner()?;
+    let mut mpv = state.lock_mpv()?;
+    if !mpv.eof_reached_lenient() {
         return Ok(());
     }
     let Some(idx) = g.current_index else {
@@ -3552,42 +3973,61 @@ fn advance_after_eof(app: AppHandle) -> Result<(), String> {
     if len == 0 {
         return Ok(());
     }
-    g.persist_current()?;
+    g.persist_current(&mut mpv)?;
+    if g.sleep_hold {
+        mpv.pause_or_kill();
+        drop(g);
+        drop(mpv);
+        notify_transport_changed(&app);
+        return Ok(());
+    }
+    if g.stop_after_track {
+        g.stop_after_track = false;
+        let _ = g.persist_stop_after_track();
+        mpv.pause_or_kill();
+        drop(g);
+        drop(mpv);
+        notify_transport_changed(&app);
+        return Ok(());
+    }
     match g.repeat_mode {
         RepeatMode::One => {
-            g.mpv
+            mpv
                 .seek(0.0)
                 .map_err(|e: MpvError| e.to_string())?;
-            let _ = g.mpv.resume();
+            let _ = mpv.resume();
         }
         RepeatMode::All => {
             let next = (idx + 1) % len;
-            g.play_path_at_index(next)?;
+            g.play_path_at_index(&mut mpv, next)?;
         }
         RepeatMode::Off => {
             let next = idx.saturating_add(1);
             if next < len {
                 match g.resolve_playable_index(next) {
                     Ok(playable) => {
-                        g.play_path_at_index(playable)?;
+                        g.play_path_at_index(&mut mpv, playable)?;
                     }
                     Err(_) => {
-                        let _ = g.mpv.pause();
+                        let _ = mpv.pause();
                     }
                 }
             } else {
-                let _ = g.mpv.pause();
+                let _ = mpv.pause();
             }
         }
     }
+    drop(g);
+    notify_transport_changed(&app);
     Ok(())
 }
 
 #[tauri::command]
 fn skip_next(app: AppHandle) -> Result<(), String> {
     let state = app.state::<AppState>();
-    let mut g = state.inner.lock().map_err(|e| e.to_string())?;
-    g.skip_next_inner()?;
+    let mut g = state.lock_inner()?;
+    let mut mpv = state.lock_mpv()?;
+    g.skip_next_inner(&mut mpv)?;
     notify_transport_changed(&app);
     Ok(())
 }
@@ -3595,8 +4035,9 @@ fn skip_next(app: AppHandle) -> Result<(), String> {
 #[tauri::command]
 fn skip_prev(app: AppHandle) -> Result<(), String> {
     let state = app.state::<AppState>();
-    let mut g = state.inner.lock().map_err(|e| e.to_string())?;
-    g.skip_prev_inner()?;
+    let mut g = state.lock_inner()?;
+    let mut mpv = state.lock_mpv()?;
+    g.skip_prev_inner(&mut mpv)?;
     notify_transport_changed(&app);
     Ok(())
 }
@@ -3618,6 +4059,10 @@ async fn reopen_recent(app: AppHandle, path: String, kind: String) -> Result<Opt
         return Err("Empty path".to_string());
     }
     let kind = kind.trim().to_lowercase();
+    let recents = app.state::<AppState>().get_recent_opened()?;
+    if !recent_path_is_allowed(&recents, &path) {
+        return Err("That path is not in your recent list".to_string());
+    }
     if kind == "file" {
         open_file_path_impl(app, PathBuf::from(path)).await
     } else if kind == "folder" {
@@ -3627,17 +4072,42 @@ async fn reopen_recent(app: AppHandle, path: String, kind: String) -> Result<Opt
     }
 }
 
+
+#[tauri::command]
+fn set_sleep_timer(app: AppHandle, minutes: Option<u32>) -> Result<Option<i64>, String> {
+    let deadline = match minutes {
+        None | Some(0) => None,
+        Some(m) => Some(sleep_deadline_from_minutes(m, now_unix_ms())?),
+    };
+    let state = app.state::<AppState>();
+    let mut g = state.lock_inner()?;
+    let out = g.set_sleep_deadline(deadline)?;
+    drop(g);
+    notify_transport_changed(&app);
+    Ok(out)
+}
+
+#[tauri::command]
+fn set_stop_after_track(app: AppHandle, enabled: bool) -> Result<bool, String> {
+    let state = app.state::<AppState>();
+    let mut g = state.lock_inner()?;
+    let out = g.set_stop_after_track_flag(enabled)?;
+    drop(g);
+    notify_transport_changed(&app);
+    Ok(out)
+}
+
 #[tauri::command]
 fn get_app_prefs(app: AppHandle) -> Result<AppPrefsDto, String> {
     let state = app.state::<AppState>();
-    let g = state.inner.lock().map_err(|e| e.to_string())?;
+    let g = state.lock_inner()?;
     Ok(g.app_prefs())
 }
 
 #[tauri::command]
 fn set_resume_playing_on_launch(app: AppHandle, enabled: bool) -> Result<AppPrefsDto, String> {
     let state = app.state::<AppState>();
-    let mut g = state.inner.lock().map_err(|e| e.to_string())?;
+    let mut g = state.lock_inner()?;
     g.db
         .set_setting(
             PREF_RESUME_PLAYING_ON_LAUNCH,
@@ -3655,7 +4125,7 @@ fn set_resume_playing_on_launch(app: AppHandle, enabled: bool) -> Result<AppPref
 #[tauri::command]
 fn set_playlist_shuffle_on_play(app: AppHandle, enabled: bool) -> Result<AppPrefsDto, String> {
     let state = app.state::<AppState>();
-    let mut g = state.inner.lock().map_err(|e| e.to_string())?;
+    let mut g = state.lock_inner()?;
     g.db
         .set_setting(PREF_PLAYLIST_SHUFFLE, if enabled { "1" } else { "0" })
         .map_err(|e| e.to_string())?;
@@ -3665,13 +4135,14 @@ fn set_playlist_shuffle_on_play(app: AppHandle, enabled: bool) -> Result<AppPref
 #[tauri::command]
 fn set_scan_subfolders(app: AppHandle, enabled: bool) -> Result<SetScanFoldersResult, String> {
     let state = app.state::<AppState>();
-    let mut g = state.inner.lock().map_err(|e| e.to_string())?;
+    let mut g = state.lock_inner()?;
+    let mut mpv = state.lock_mpv()?;
     g.db
         .set_setting(PREF_SCAN_SUBFOLDERS, if enabled { "1" } else { "0" })
         .map_err(|e| e.to_string())?;
     g.scan_subfolders = enabled;
     let playlist = if g.session_root.is_some() && !g.single_file_session {
-        Some(g.rescan_folder_playlist()?)
+        Some(g.rescan_folder_playlist(&mut mpv)?)
     } else {
         None
     };
@@ -3690,7 +4161,7 @@ fn set_ui_locale(app: AppHandle, locale: String) -> Result<AppPrefsDto, String> 
     };
     {
         let state = app.state::<AppState>();
-        let mut g = state.inner.lock().map_err(|e| e.to_string())?;
+        let mut g = state.lock_inner()?;
         g.db
             .set_setting(PREF_UI_LOCALE, code)
             .map_err(|e| e.to_string())?;
@@ -3701,15 +4172,16 @@ fn set_ui_locale(app: AppHandle, locale: String) -> Result<AppPrefsDto, String> 
         app.set_menu(menu).map_err(|e| e.to_string())?;
     }
     let state = app.state::<AppState>();
-    let g = state.inner.lock().map_err(|e| e.to_string())?;
+    let g = state.lock_inner()?;
     Ok(g.app_prefs())
 }
 
 #[tauri::command]
 fn recover_mpv(app: AppHandle) -> Result<(), String> {
     let state = app.state::<AppState>();
-    let mut g = state.inner.lock().map_err(|e| e.to_string())?;
-    g.recover_mpv_engine()
+    let mut g = state.lock_inner()?;
+    let mut mpv = state.lock_mpv()?;
+    g.recover_mpv_engine(&mut mpv)
 }
 
 #[tauri::command]
@@ -3723,14 +4195,110 @@ fn set_track_listened(
         return Err("Empty path".into());
     }
     let state = app.state::<AppState>();
-    let mut g = state.inner.lock().map_err(|e| e.to_string())?;
+    let mut g = state.lock_inner()?;
     g.set_track_listened_inner(PathBuf::from(p), listened)
+}
+
+fn native_confirm(app: &AppHandle, copy: &destructive_grant::OsConfirmCopy) -> bool {
+    app.dialog()
+        .message(copy.body.clone())
+        .title(copy.title.clone())
+        .kind(MessageDialogKind::Warning)
+        .buttons(MessageDialogButtons::OkCancelCustom(
+            copy.ok.clone(),
+            copy.cancel.clone(),
+        ))
+        .blocking_show()
+}
+
+fn host_locale_is_german(state: &AppState) -> bool {
+    state
+        .lock_inner()
+        .ok()
+        .map(|g| {
+            let raw = g.db.get_setting(PREF_UI_LOCALE).ok().flatten();
+            normalize_ui_locale_code(raw.as_deref()) == "de"
+        })
+        .unwrap_or(false)
+}
+
+#[tauri::command]
+fn confirm_delete_track_file(app: AppHandle, path: String) -> Result<(), String> {
+    let p = path.trim();
+    if p.is_empty() {
+        return Err("Empty path".into());
+    }
+    let state = app.state::<AppState>();
+    let canon = {
+        let mut g = state.lock_inner()?;
+        let canon = InnerState::canonicalize_allowed(Path::new(p)).unwrap_or_else(|_| PathBuf::from(p));
+        if !g.allowed_files.contains(&canon) {
+            return Err("That file is not in the current queue.".into());
+        }
+        CatalogService::new(&mut g.db).path_delete_allowed(&canon)?;
+        canon
+    };
+    let german = host_locale_is_german(&state);
+    let name = canon
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| canon.display().to_string());
+    let copy = destructive_grant::delete_file_os_copy(german, &name, &canon.to_string_lossy());
+    if !native_confirm(&app, &copy) {
+        return Err(destructive_grant::USER_CANCELLED.into());
+    }
+    state.grant_destructive(destructive_grant::DestructiveKind::DeleteFile(canon));
+    eprintln!("chaptercheck.audit delete_file_confirm_granted");
+    Ok(())
+}
+
+#[tauri::command]
+fn confirm_delete_session_files(app: AppHandle) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    let (fingerprint, count) = {
+        let mut g = state.lock_inner()?;
+        if g.session_root.is_none() {
+            return Err("No session is open".into());
+        }
+        let files = g.playlist.clone();
+        {
+            let cat = CatalogService::new(&mut g.db);
+            for f in &files {
+                cat.path_delete_allowed(f)?;
+            }
+        }
+        (destructive_grant::session_fingerprint(&files), files.len())
+    };
+    if count == 0 {
+        return Err("Nothing to delete".into());
+    }
+    let german = host_locale_is_german(&state);
+    let copy = destructive_grant::delete_session_os_copy(german, count);
+    if !native_confirm(&app, &copy) {
+        return Err(destructive_grant::USER_CANCELLED.into());
+    }
+    state.grant_destructive(destructive_grant::DestructiveKind::DeleteSession(fingerprint));
+    eprintln!("chaptercheck.audit delete_session_confirm_granted count={count}");
+    Ok(())
+}
+
+#[tauri::command]
+fn confirm_enable_online_metadata(app: AppHandle) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    let german = host_locale_is_german(&state);
+    let copy = destructive_grant::enable_online_os_copy(german);
+    if !native_confirm(&app, &copy) {
+        return Err(destructive_grant::USER_CANCELLED.into());
+    }
+    state.grant_destructive(destructive_grant::DestructiveKind::EnableOnlineMetadata);
+    eprintln!("chaptercheck.audit online_metadata_confirm_granted");
+    Ok(())
 }
 
 #[tauri::command]
 fn mark_session_listened(app: AppHandle, listened: bool) -> Result<PlaylistDto, String> {
     let state = app.state::<AppState>();
-    let mut g = state.inner.lock().map_err(|e| e.to_string())?;
+    let mut g = state.lock_inner()?;
     g.mark_session_listened_inner(listened)
 }
 
@@ -3741,26 +4309,43 @@ fn delete_track_file(app: AppHandle, path: String) -> Result<Option<PlaylistDto>
         return Err("Empty path".into());
     }
     let state = app.state::<AppState>();
+    let canon = InnerState::canonicalize_allowed(Path::new(p)).unwrap_or_else(|_| PathBuf::from(p));
+    state.consume_destructive(
+        &destructive_grant::DestructiveKind::DeleteFile(canon.clone()),
+        "The computer must ask you again before a file is deleted.",
+    )?;
     let dto = {
-        let mut g = state.inner.lock().map_err(|e| e.to_string())?;
-        g.delete_track_inner(PathBuf::from(p))?
+        let mut g = state.lock_inner()?;
+        let mut mpv = state.lock_mpv()?;
+        g.delete_track_inner(&mut mpv, canon)?
     };
+    eprintln!("chaptercheck.audit delete_file_done");
     Ok(dto)
 }
 
 #[tauri::command]
 fn delete_session_files(app: AppHandle) -> Result<(), String> {
     let state = app.state::<AppState>();
-    let mut g = state.inner.lock().map_err(|e| e.to_string())?;
-    g.delete_session_inner()
+    let fingerprint = {
+        let g = state.lock_inner()?;
+        destructive_grant::session_fingerprint(&g.playlist)
+    };
+    state.consume_destructive(
+        &destructive_grant::DestructiveKind::DeleteSession(fingerprint),
+        "The computer must ask you again before those files are deleted.",
+    )?;
+    let mut g = state.lock_inner()?;
+    let mut mpv = state.lock_mpv()?;
+    g.delete_session_inner(&mut mpv)?;
+    eprintln!("chaptercheck.audit delete_session_done");
+    Ok(())
 }
 
 #[tauri::command]
 fn get_chapters(app: AppHandle) -> Result<Vec<ChapterDto>, String> {
     let state = app.state::<AppState>();
-    let mut g = state.inner.lock().map_err(|e| e.to_string())?;
-    let raw = g
-        .mpv
+    let mut mpv = state.lock_mpv()?;
+    let raw = mpv
         .get_property_json("chapter-list")
         .map_err(|e| e.to_string())?;
     Ok(match raw {
@@ -3783,13 +4368,18 @@ pub fn run() {
     builder
         .setup(|app: &mut tauri::App| {
             mpv::cleanup_orphaned_processes();
+            if let Ok(covers) = catalog::covers_data_dir() {
+                if let Err(e) = app.asset_protocol_scope().allow_directory(&covers, true) {
+                    eprintln!("ChapterCheck: cover folder is not readable in the window: {e}");
+                }
+            }
             let db_path = data_db_path().map_err(|e| setup_err(e))?;
             let db = LibraryDb::open(&db_path).map_err(|e| setup_err(e.to_string()))?;
             app.manage(AppState::new(db));
             {
-                let state = app.state::<AppState>();
-                let mut g = state.inner.lock().map_err(|e| setup_err(e.to_string()))?;
-                let _ = CatalogService::new(&mut g.db).refresh_roots_availability();
+                if let Ok(mut side) = open_sidecar_catalog() {
+                    let _ = CatalogService::new(&mut side).refresh_roots_availability();
+                }
             }
             #[cfg(desktop)]
             {
@@ -3829,6 +4419,7 @@ pub fn run() {
                     }
                 }
             }
+            spawn_sleep_watchdog(app.handle().clone());
             #[cfg(target_os = "linux")]
             media_controls::spawn(app.handle().clone());
             Ok(())
@@ -3874,6 +4465,9 @@ pub fn run() {
             get_chapters,
             set_track_listened,
             mark_session_listened,
+            confirm_delete_track_file,
+            confirm_delete_session_files,
+            confirm_enable_online_metadata,
             delete_track_file,
             delete_session_files,
             list_library_roots,
@@ -3882,7 +4476,6 @@ pub fn run() {
             scan_library_root,
             refresh_library_roots,
             list_collections,
-            list_series_names,
             get_collection_detail,
             find_collection_file_id,
             find_collection_id_for_path,
@@ -3900,10 +4493,6 @@ pub fn run() {
             list_playlists,
             create_playlist,
             add_to_playlist,
-            list_album_groups,
-            add_album_to_playlist,
-            add_collection_to_playlist,
-            create_playlist_from_album,
             create_playlist_from_collection,
             list_metadata_groups,
             add_metadata_group_to_playlist,
@@ -3923,13 +4512,12 @@ pub fn run() {
             pick_relink_audio_file,
             fix_collection_track_order,
             set_playlist_pinned,
-            get_scan_status,
-            add_to_library,
             lookup_metadata_online,
             set_online_metadata_enabled,
-            update_library_root,
             export_db,
             play_playlist,
+            set_sleep_timer,
+            set_stop_after_track,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
@@ -3948,11 +4536,15 @@ mod playback_tests {
     use rusqlite::params;
     use std::fs;
     use std::path::PathBuf;
+    use std::time::Instant;
+
+    fn test_mpv() -> MpvController {
+        MpvController::default()
+    }
 
     fn test_inner(db: LibraryDb) -> InnerState {
         InnerState {
             db,
-            mpv: MpvController::default(),
             session_root: None,
             allowed_files: HashSet::new(),
             playlist: Vec::new(),
@@ -3964,6 +4556,10 @@ mod playback_tests {
             active_collection_id: None,
             active_playlist_id: None,
             playback_kind: "audiobook".into(),
+            sleep_deadline_ms: None,
+            stop_after_track: false,
+            sleep_hold: false,
+            sleep_hold_since_ms: None,
         }
     }
 
@@ -4029,8 +4625,9 @@ mod playback_tests {
     fn enqueue_empty_queue_end_starts_session_without_autoplay() {
         let (db, collection_id, tmp) = seed_enqueue_fixture();
         let mut state = test_inner(db);
+        let mut mpv = test_mpv();
         let result = state
-            .enqueue_collection_inner(collection_id, "end")
+            .enqueue_collection_inner(&mut mpv, collection_id, "end")
             .expect("enqueue");
         assert!(result.session_started);
         assert!(!result.autoplay_started);
@@ -4043,8 +4640,9 @@ mod playback_tests {
     fn enqueue_duplicate_collection_errors() {
         let (db, collection_id, tmp) = seed_enqueue_fixture();
         let mut state = test_inner(db);
-        state.enqueue_collection_inner(collection_id, "end").unwrap();
-        match state.enqueue_collection_inner(collection_id, "end") {
+        let mut mpv = test_mpv();
+        state.enqueue_collection_inner(&mut mpv, collection_id, "end").unwrap();
+        match state.enqueue_collection_inner(&mut mpv, collection_id, "end") {
             Err(msg) => assert!(msg.contains("already in your queue")),
             Ok(_) => panic!("expected duplicate enqueue to fail"),
         }
@@ -4055,14 +4653,548 @@ mod playback_tests {
     fn enqueue_empty_playlist_with_session_root_starts_fresh_session() {
         let (db, collection_id, tmp) = seed_enqueue_fixture();
         let mut state = test_inner(db);
+        let mut mpv = test_mpv();
         state.session_root = Some(tmp.join("track1.m4b"));
         state.playlist = vec![];
         let result = state
-            .enqueue_collection_inner(collection_id, "end")
+            .enqueue_collection_inner(&mut mpv, collection_id, "end")
             .expect("enqueue");
         assert!(result.session_started);
         assert!(!result.autoplay_started);
         assert_eq!(state.playlist.len(), 2);
         let _ = fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn resume_start_seconds_rewinds_near_end() {
+        assert_eq!(InnerState::resume_start_seconds(99.0, Some(100.0)), 0.0);
+        assert_eq!(InnerState::resume_start_seconds(50.0, Some(100.0)), 50.0);
+        assert_eq!(InnerState::resume_start_seconds(-1.0, Some(100.0)), 0.0);
+        assert_eq!(InnerState::resume_start_seconds(12.0, None), 12.0);
+    }
+
+    #[test]
+    fn remove_non_current_queue_item_keeps_playing_index() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!("cc_remove_queue_{stamp}"));
+        fs::create_dir_all(&base).unwrap();
+        let a = base.join("a.mp3");
+        let b = base.join("b.mp3");
+        let c = base.join("c.mp3");
+        fs::write(&a, b"x").unwrap();
+        fs::write(&b, b"x").unwrap();
+        fs::write(&c, b"x").unwrap();
+        let a = fs::canonicalize(&a).unwrap();
+        let b = fs::canonicalize(&b).unwrap();
+        let c = fs::canonicalize(&c).unwrap();
+
+        let mut state = test_inner(LibraryDb::open_in_memory().unwrap());
+        state.session_root = Some(base.clone());
+        state.playlist = vec![a.clone(), b.clone(), c.clone()];
+        state.allowed_files = state.playlist.iter().cloned().collect();
+        state.current_index = Some(0);
+
+        let dto = state
+            .remove_queue_item_inner(&mut test_mpv(), c.clone())
+            .expect("remove")
+            .expect("session remains");
+        assert_eq!(dto.items.len(), 2);
+        assert_eq!(state.current_index, Some(0));
+        assert!(!state.playlist.contains(&c));
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn continue_start_index_skips_finished_chapters_in_order() {
+        // (position, duration, listened)
+        assert_eq!(
+            InnerState::continue_start_index(&[(0.0, Some(100.0), false)]),
+            0
+        );
+        assert_eq!(
+            InnerState::continue_start_index(&[
+                (99.0, Some(100.0), false),
+                (10.0, Some(400.0), false),
+            ]),
+            1
+        );
+        assert_eq!(
+            InnerState::continue_start_index(&[
+                (3600.0, Some(3600.0), false),
+                (590.0, Some(600.0), false),
+            ]),
+            1
+        );
+        assert_eq!(
+            InnerState::continue_start_index(&[
+                (50.0, Some(100.0), true),
+                (0.0, Some(100.0), false),
+            ]),
+            1
+        );
+        assert_eq!(
+            InnerState::continue_start_index(&[(590.0, Some(600.0), false)]),
+            0
+        );
+        assert_eq!(
+            InnerState::continue_start_index(&[
+                (100.0, Some(100.0), false),
+                (100.0, Some(100.0), false),
+            ]),
+            0
+        );
+    }
+
+    #[test]
+    fn remove_current_last_queue_item_selects_previous_index() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!("cc_remove_current_{stamp}"));
+        fs::create_dir_all(&base).unwrap();
+        let a = fs::canonicalize({
+            let p = base.join("a.mp3");
+            fs::write(&p, b"x").unwrap();
+            p
+        })
+        .unwrap();
+        let b = fs::canonicalize({
+            let p = base.join("b.mp3");
+            fs::write(&p, b"x").unwrap();
+            p
+        })
+        .unwrap();
+
+        let mut state = test_inner(LibraryDb::open_in_memory().unwrap());
+        state.session_root = Some(base.clone());
+        state.playlist = vec![a.clone(), b.clone()];
+        state.allowed_files = state.playlist.iter().cloned().collect();
+        state.current_index = Some(1);
+
+        state
+            .remove_path_from_session(&b.to_string_lossy())
+            .expect("remove");
+        assert_eq!(state.current_index, Some(0));
+        assert_eq!(state.playlist, vec![a]);
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn export_library_db_copies_tables_via_backup_api() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("cc_export_db_{stamp}"));
+        fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("library.sqlite3");
+        let dest = dir.join("backup.sqlite3");
+        {
+            let mut db = LibraryDb::open(&src).unwrap();
+            db.set_setting("qa.marker", "present").unwrap();
+        }
+        export_library_db(&src, &dest).expect("backup");
+        let started = Instant::now();
+        let dest_db = LibraryDb::open(&dest).unwrap();
+        assert_eq!(
+            dest_db.get_setting("qa.marker").unwrap().as_deref(),
+            Some("present"),
+            "restore must read the backed-up setting"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "opening a backup copy must be a local restore, not a hang"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn past_sleep_deadline_is_claimed_once() {
+        let mut inner = test_inner(LibraryDb::open_in_memory().unwrap());
+        inner.sleep_deadline_ms = Some(1);
+        assert!(inner.claim_sleep_if_due(2));
+        assert!(inner.sleep_deadline_ms.is_none());
+        assert!(inner.sleep_hold, "fired timer must block EOF auto-advance");
+        assert_eq!(
+            inner.db.get_setting(SESSION_LAST_PLAYING).unwrap().as_deref(),
+            Some("0"),
+            "claim must persist stopped so restore cannot autoplay"
+        );
+        assert!(!inner.claim_sleep_if_due(99), "second claim must lose");
+    }
+
+    #[test]
+    fn sleep_toggle_blocked_during_grace_not_after() {
+        let mut inner = test_inner(LibraryDb::open_in_memory().unwrap());
+        inner.sleep_deadline_ms = Some(1);
+        assert!(inner.claim_sleep_if_due(1_000));
+        assert!(
+            inner.sleep_hold_blocks_toggle(1_000 + 500),
+            "PlayPause immediately after sleep must stay paused"
+        );
+        assert!(
+            !inner.sleep_hold_blocks_toggle(1_000 + SLEEP_TOGGLE_GRACE_MS),
+            "after grace, PlayPause may resume"
+        );
+        inner.sleep_hold = true;
+        inner.sleep_hold_since_ms = None;
+        assert!(
+            inner.sleep_hold_blocks_toggle(99_000),
+            "hold without timestamp must not toggle-resume"
+        );
+        inner.release_sleep_hold();
+        assert!(!inner.sleep_hold_blocks_toggle(99_000));
+    }
+
+    #[test]
+    fn future_sleep_deadline_is_not_claimed() {
+        let mut inner = test_inner(LibraryDb::open_in_memory().unwrap());
+        inner.sleep_deadline_ms = Some(50_000);
+        assert!(!inner.claim_sleep_if_due(1_000));
+        assert_eq!(inner.sleep_deadline_ms, Some(50_000));
+        assert!(!inner.sleep_hold);
+    }
+
+    #[test]
+    fn sleep_minutes_rejected_outside_range() {
+        assert!(sleep_deadline_from_minutes(0, 0).is_err());
+        assert!(sleep_deadline_from_minutes(181, 0).is_err());
+        assert_eq!(sleep_deadline_from_minutes(15, 1_000).unwrap(), 1_000 + 15 * 60_000);
+    }
+
+    #[test]
+    fn sleep_finish_after_pause_resumes_only_when_nobody_claimed() {
+        assert_eq!(sleep_finish_after_pause(true, true), SleepFinish::Fired);
+        assert_eq!(sleep_finish_after_pause(true, false), SleepFinish::Fired);
+        assert_eq!(
+            sleep_finish_after_pause(false, true),
+            SleepFinish::StayPaused,
+            "lost claim while hold is set: another worker already fired"
+        );
+        assert_eq!(
+            sleep_finish_after_pause(false, false),
+            SleepFinish::Resume,
+            "lost claim and hold clear: user extended or cancelled"
+        );
+    }
+
+    #[test]
+    fn apply_sleep_aborts_without_hold_when_deadline_extended() {
+        let state = AppState::new(LibraryDb::open_in_memory().unwrap());
+        {
+            let mut g = state.lock_inner().unwrap();
+            g.set_sleep_deadline(Some(1)).unwrap();
+        }
+        {
+            let mut g = state.lock_inner().unwrap();
+            g.set_sleep_deadline(Some(now_unix_ms() + 3_600_000)).unwrap();
+            assert!(!g.sleep_hold);
+        }
+        assert!(
+            !apply_sleep_if_due(&state),
+            "future deadline must not fire"
+        );
+        let g = state.lock_inner().unwrap();
+        assert!(g.sleep_deadline_ms.is_some());
+        assert!(!g.sleep_hold);
+    }
+
+    #[test]
+    fn library_root_link_requires_picker_or_os_grant() {
+        let state = AppState::new(LibraryDb::open_in_memory().unwrap());
+        let dir = std::env::temp_dir().join(format!(
+            "cc_grant_ipc_{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let err = state
+            .require_library_folder_grant(&dir)
+            .expect_err("webview must not link an unpicked folder");
+        assert!(
+            err.to_lowercase().contains("add my folder") || err.to_lowercase().contains("chose"),
+            "got {err}"
+        );
+        state.grant_picked_directory(&dir);
+        let canon = state.require_library_folder_grant(&dir).unwrap();
+        state.forget_library_folder_grant(&canon);
+        assert!(
+            state.require_library_folder_grant(&dir).is_err(),
+            "grant must be single-use after a successful link"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn failed_library_link_does_not_burn_the_picker_grant() {
+        let state = AppState::new(LibraryDb::open_in_memory().unwrap());
+        let dir = std::env::temp_dir().join(format!(
+            "cc_grant_keep_{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        state.grant_picked_directory(&dir);
+        let input = AddLibraryRootInput {
+            path: dir.to_string_lossy().into_owned(),
+            label: Some("L".repeat(501)),
+            content_kind: "music".into(),
+            scan_rule: None,
+            scan_subfolders: Some(false),
+        };
+        let err = match link_granted_library_root(&state, input, |input| {
+            let mut db = LibraryDb::open_in_memory().unwrap();
+            CatalogService::new(&mut db).add_root(input)
+        }) {
+            Err(e) => e,
+            Ok(_) => panic!("overlong label must fail the link"),
+        };
+        assert!(
+            err.to_lowercase().contains("long")
+                || err.to_lowercase().contains("folder")
+                || err.to_lowercase().contains("label"),
+            "got {err}"
+        );
+        assert!(
+            state.require_library_folder_grant(&dir).is_ok(),
+            "failed add_root must not consume the picker grant"
+        );
+        let ok_input = AddLibraryRootInput {
+            path: dir.to_string_lossy().into_owned(),
+            label: Some("Kept grant".into()),
+            content_kind: "music".into(),
+            scan_rule: Some("file-is-item".into()),
+            scan_subfolders: Some(false),
+        };
+        let linked = match link_granted_library_root(&state, ok_input, |input| {
+            let mut db = LibraryDb::open_in_memory().unwrap();
+            CatalogService::new(&mut db).add_root(input)
+        }) {
+            Ok(dto) => dto,
+            Err(e) => panic!("retry after a failed link must still have the grant: {e}"),
+        };
+        assert_eq!(linked.label, "Kept grant");
+        assert!(
+            state.require_library_folder_grant(&dir).is_err(),
+            "successful link must consume the grant"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn apply_sleep_if_due_clears_deadline_without_spawning_mpv() {
+        let state = AppState::new(LibraryDb::open_in_memory().unwrap());
+        {
+            let mut g = state.lock_inner().unwrap();
+            g.set_sleep_deadline(Some(1)).unwrap();
+        }
+        assert!(apply_sleep_if_due(&state));
+        {
+            let g = state.lock_inner().unwrap();
+            assert!(g.sleep_deadline_ms.is_none());
+            assert!(g.sleep_hold);
+        }
+        assert!(!apply_sleep_if_due(&state));
+        let mut mpv = state.lock_mpv().unwrap();
+        assert!(
+            mpv.peek_transport().is_none(),
+            "sleep must not spawn an mpv process"
+        );
+    }
+
+    #[test]
+    fn apply_sleep_skips_claim_while_mpv_lock_is_held() {
+        let state = AppState::new(LibraryDb::open_in_memory().unwrap());
+        {
+            let mut g = state.lock_inner().unwrap();
+            g.set_sleep_deadline(Some(1)).unwrap();
+        }
+        let _mpv = state.lock_mpv().unwrap();
+        let start = Instant::now();
+        assert!(
+            !apply_sleep_if_due(&state),
+            "must not block on a held mpv lock"
+        );
+        assert!(
+            start.elapsed() < Duration::from_millis(200),
+            "sleep tick must try_lock, not wait for an 8s command"
+        );
+        {
+            let g = state.lock_inner().unwrap();
+            assert!(
+                g.sleep_deadline_ms.is_some(),
+                "deadline stays armed until the engine lock is free"
+            );
+        }
+        drop(_mpv);
+        assert!(apply_sleep_if_due(&state));
+        let g = state.lock_inner().unwrap();
+        assert!(g.sleep_deadline_ms.is_none());
+    }
+
+    #[test]
+    fn persist_progress_is_idle_noop_and_does_not_spawn_mpv() {
+        let state = AppState::new(LibraryDb::open_in_memory().unwrap());
+        state
+            .persist_progress_without_holding_mpv()
+            .expect("idle save must succeed");
+        let mut mpv = state.lock_mpv().unwrap();
+        assert!(mpv.peek_transport().is_none());
+    }
+
+    #[test]
+    fn online_metadata_enable_requires_destructive_grant() {
+        let state = AppState::new(LibraryDb::open_in_memory().unwrap());
+        assert!(state
+            .consume_destructive(
+                &destructive_grant::DestructiveKind::EnableOnlineMetadata,
+                "missing",
+            )
+            .is_err());
+        state.grant_destructive(destructive_grant::DestructiveKind::EnableOnlineMetadata);
+        assert!(state
+            .consume_destructive(
+                &destructive_grant::DestructiveKind::EnableOnlineMetadata,
+                "missing",
+            )
+            .is_ok());
+    }
+
+    #[test]
+    fn destructive_delete_grant_is_required_and_one_shot() {
+        let state = AppState::new(LibraryDb::open_in_memory().unwrap());
+        let kind =
+            destructive_grant::DestructiveKind::DeleteFile(PathBuf::from("/tmp/cc_no_grant.m4b"));
+        assert!(state
+            .consume_destructive(&kind, "missing")
+            .is_err());
+        state.grant_destructive(kind.clone());
+        assert!(state.consume_destructive(&kind, "missing").is_ok());
+        assert!(
+            state.consume_destructive(&kind, "missing").is_err(),
+            "XSS cannot delete twice on one OS confirm"
+        );
+    }
+
+    #[test]
+    fn eof_and_chapter_reads_do_not_spawn_mpv() {
+        let mut mpv = test_mpv();
+        assert!(
+            !mpv.eof_reached_lenient(),
+            "eof check must not start an engine"
+        );
+        assert!(mpv.get_property_json("chapter-list").is_err());
+        assert!(
+            mpv.peek_transport().is_none(),
+            "passive reads must leave mpv unspawned"
+        );
+        assert_eq!(mpv.time_pos_lenient(), 0.0);
+    }
+
+    #[test]
+    fn pause_or_kill_does_not_spawn_mpv() {
+        let mut mpv = test_mpv();
+        mpv.pause_or_kill();
+        assert!(
+            mpv.peek_transport().is_none(),
+            "Pause must not start an engine just to set pause=true"
+        );
+    }
+
+    #[test]
+    fn new_sleep_timer_clears_hold_and_persists() {
+        let mut inner = test_inner(LibraryDb::open_in_memory().unwrap());
+        inner.sleep_hold = true;
+        let deadline = inner.set_sleep_deadline(Some(9_999_999)).unwrap();
+        assert_eq!(deadline, Some(9_999_999));
+        assert!(!inner.sleep_hold);
+        assert_eq!(
+            inner.db.get_setting(PREF_SLEEP_DEADLINE).unwrap().as_deref(),
+            Some("9999999")
+        );
+        inner.set_sleep_deadline(None).unwrap();
+        assert!(inner.sleep_deadline_ms.is_none());
+        assert!(inner.db.get_setting(PREF_SLEEP_DEADLINE).unwrap().is_none());
+    }
+
+    #[test]
+    fn catalog_lock_does_not_wait_on_held_mpv_lock() {
+        let state = AppState::new(LibraryDb::open_in_memory().unwrap());
+        let _mpv = state.lock_mpv().unwrap();
+        let start = std::time::Instant::now();
+        {
+            let g = state.lock_inner().unwrap();
+            let _ = g.db.get_setting("pref.ui_locale");
+        }
+        assert!(
+            start.elapsed() < Duration::from_millis(200),
+            "inner/catalog lock must not be blocked by the mpv mutex"
+        );
+    }
+
+    #[test]
+    fn recent_path_requires_stored_membership() {
+        let recents = vec![RecentOpenDto {
+            path: "/tmp/chaptercheck-recent-book".into(),
+            kind: "folder".into(),
+            label: "book".into(),
+        }];
+        assert!(recent_path_is_allowed(
+            &recents,
+            "/tmp/chaptercheck-recent-book"
+        ));
+        assert!(!recent_path_is_allowed(&recents, "/etc"));
+        assert!(!recent_path_is_allowed(&recents, "/tmp/other"));
+    }
+
+    #[test]
+    fn ipc_allowlist_matches_generate_handler() {
+        let src = include_str!("lib.rs");
+        let start = src.find("generate_handler![").expect("handler");
+        let rest = &src[start + "generate_handler![".len()..];
+        let end = rest.find(']').expect("handler end");
+        let handler: Vec<&str> = rest[..end]
+            .lines()
+            .filter_map(|l| {
+                let t = l.trim().trim_end_matches(',');
+                if t.is_empty() {
+                    None
+                } else {
+                    Some(t)
+                }
+            })
+            .collect();
+        assert_eq!(handler, crate::ipc_allowlist::APP_IPC_COMMANDS);
+    }
+
+    #[test]
+    fn capabilities_allow_only_allowlisted_commands() {
+        let raw = include_str!("../capabilities/default.json");
+        let v: serde_json::Value = serde_json::from_str(raw).expect("capabilities json");
+        let perms = v["permissions"].as_array().expect("permissions");
+        let mut allows: Vec<String> = perms
+            .iter()
+            .filter_map(|p| p.as_str())
+            .filter_map(|s| s.strip_prefix("allow-"))
+            .map(|s| s.replace('-', "_"))
+            .collect();
+        allows.sort();
+        let mut expected: Vec<String> = crate::ipc_allowlist::APP_IPC_COMMANDS
+            .iter()
+            .map(|c| (*c).to_string())
+            .collect();
+        expected.sort();
+        assert_eq!(
+            allows, expected,
+            "capabilities/default.json must allow exactly the IPC allow-list"
+        );
     }
 }

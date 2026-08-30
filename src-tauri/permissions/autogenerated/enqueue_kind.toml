@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-enqueue-kind"
+description = "Enables the enqueue_kind command without any pre-configured scope."
+commands.allow = ["enqueue_kind"]
+
+[[permission]]
+identifier = "deny-enqueue-kind"
+description = "Denies the enqueue_kind command without any pre-configured scope."
+commands.deny = ["enqueue_kind"]

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-find-collection-file-id"
+description = "Enables the find_collection_file_id command without any pre-configured scope."
+commands.allow = ["find_collection_file_id"]
+
+[[permission]]
+identifier = "deny-find-collection-file-id"
+description = "Denies the find_collection_file_id command without any pre-configured scope."
+commands.deny = ["find_collection_file_id"]

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-get-recent-opened"
+description = "Enables the get_recent_opened command without any pre-configured scope."
+commands.allow = ["get_recent_opened"]
+
+[[permission]]
+identifier = "deny-get-recent-opened"
+description = "Denies the get_recent_opened command without any pre-configured scope."
+commands.deny = ["get_recent_opened"]

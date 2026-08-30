@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-pick-relink-audio-file"
+description = "Enables the pick_relink_audio_file command without any pre-configured scope."
+commands.allow = ["pick_relink_audio_file"]
+
+[[permission]]
+identifier = "deny-pick-relink-audio-file"
+description = "Denies the pick_relink_audio_file command without any pre-configured scope."
+commands.deny = ["pick_relink_audio_file"]

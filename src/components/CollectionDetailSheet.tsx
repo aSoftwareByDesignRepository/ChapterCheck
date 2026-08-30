@@ -176,10 +176,10 @@ export function CollectionDetailSheet({
         collectionId: detail.id,
         metadata: {
           title: metaForm.title.trim() || null,
-          author: metaForm.author.trim() || null,
-          narrator: metaForm.narrator.trim() || null,
-          artist: metaForm.artist.trim() || null,
-          album: metaForm.album.trim() || null,
+          author: metaForm.author.trim(),
+          narrator: metaForm.narrator.trim(),
+          artist: metaForm.artist.trim(),
+          album: metaForm.album.trim(),
           series: null,
           series_index: null,
         },
@@ -515,7 +515,7 @@ export function CollectionDetailSheet({
         ) : !loadError && detail && metaForm ? (
           <>
             <header className="detail-sheet-head">
-              <div className="detail-sheet-cover">
+              <div className="detail-sheet-cover" aria-hidden="true">
                 <CoverImage
                   src={coverSrc}
                   kind={detail.kind}
@@ -887,7 +887,7 @@ export function CollectionDetailSheet({
                   type="button"
                   className="btn btn-secondary ghost-collection-panel-action"
                   disabled={!!busyAction}
-                  onClick={removeCollectionFromLibrary}
+                  onClick={() => removeCollectionFromLibrary()}
                 >
                   {t("catalog.removeCollection")}
                 </button>
@@ -904,7 +904,7 @@ export function CollectionDetailSheet({
                   type="button"
                   className="btn btn-secondary ghost-collection-panel-action"
                   disabled={!!busyAction}
-                  onClick={removeCollectionFromLibrary}
+                  onClick={() => removeCollectionFromLibrary()}
                 >
                   {t("catalog.removeCollection")}
                 </button>

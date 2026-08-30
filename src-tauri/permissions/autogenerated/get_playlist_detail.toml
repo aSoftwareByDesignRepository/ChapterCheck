@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-get-playlist-detail"
+description = "Enables the get_playlist_detail command without any pre-configured scope."
+commands.allow = ["get_playlist_detail"]
+
+[[permission]]
+identifier = "deny-get-playlist-detail"
+description = "Denies the get_playlist_detail command without any pre-configured scope."
+commands.deny = ["get_playlist_detail"]

@@ -153,12 +153,6 @@ export type ImportFolderToPlaylistResult = {
   library_linked: boolean;
 };
 
-export type AlbumGroupDto = {
-  artist: string;
-  album: string;
-  track_count: number;
-};
-
 export type MetadataGroupKind =
   | "album"
   | "artist"

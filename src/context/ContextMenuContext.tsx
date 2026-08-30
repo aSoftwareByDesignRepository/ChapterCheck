@@ -44,8 +44,12 @@ export function useContextMenu() {
   return ctx;
 }
 
+function isSeparator(it: ContextMenuEntry): it is { type: "separator" } {
+  return "type" in it && it.type === "separator";
+}
+
 function actionableItems(items: ContextMenuEntry[]) {
-  return items.filter((it): it is Extract<ContextMenuEntry, { id: string }> => it.type !== "separator");
+  return items.filter((it): it is Extract<ContextMenuEntry, { id: string }> => !isSeparator(it));
 }
 
 function ContextMenuPanel({ state, onClose }: { state: MenuState; onClose: () => void }) {
@@ -144,7 +148,7 @@ function ContextMenuPanel({ state, onClose }: { state: MenuState; onClose: () =>
       onKeyDown={onMenuKeyDown}
     >
       {state.items.map((item, i) => {
-        if (item.type === "separator") {
+        if (isSeparator(item)) {
           return <div key={`sep-${i}`} className="context-menu-sep" role="separator" />;
         }
         actionableIdx += 1;

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-relink-collection-file"
+description = "Enables the relink_collection_file command without any pre-configured scope."
+commands.allow = ["relink_collection_file"]
+
+[[permission]]
+identifier = "deny-relink-collection-file"
+description = "Denies the relink_collection_file command without any pre-configured scope."
+commands.deny = ["relink_collection_file"]

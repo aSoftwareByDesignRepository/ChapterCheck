@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-scan-library-root"
+description = "Enables the scan_library_root command without any pre-configured scope."
+commands.allow = ["scan_library_root"]
+
+[[permission]]
+identifier = "deny-scan-library-root"
+description = "Denies the scan_library_root command without any pre-configured scope."
+commands.deny = ["scan_library_root"]

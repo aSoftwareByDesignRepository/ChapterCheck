@@ -177,6 +177,1050 @@
       "description": "Permission identifier",
       "oneOf": [
         {
+          "description": "Enables the add_library_root command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-add-library-root",
+          "markdownDescription": "Enables the add_library_root command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the add_metadata_group_to_playlist command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-add-metadata-group-to-playlist",
+          "markdownDescription": "Enables the add_metadata_group_to_playlist command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the add_to_playlist command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-add-to-playlist",
+          "markdownDescription": "Enables the add_to_playlist command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the advance_after_eof command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-advance-after-eof",
+          "markdownDescription": "Enables the advance_after_eof command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the clear_recent_opened command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-clear-recent-opened",
+          "markdownDescription": "Enables the clear_recent_opened command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the confirm_delete_session_files command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-confirm-delete-session-files",
+          "markdownDescription": "Enables the confirm_delete_session_files command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the confirm_delete_track_file command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-confirm-delete-track-file",
+          "markdownDescription": "Enables the confirm_delete_track_file command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the confirm_enable_online_metadata command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-confirm-enable-online-metadata",
+          "markdownDescription": "Enables the confirm_enable_online_metadata command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the create_playlist command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-create-playlist",
+          "markdownDescription": "Enables the create_playlist command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the create_playlist_from_collection command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-create-playlist-from-collection",
+          "markdownDescription": "Enables the create_playlist_from_collection command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the create_playlist_from_metadata_group command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-create-playlist-from-metadata-group",
+          "markdownDescription": "Enables the create_playlist_from_metadata_group command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the delete_playlist command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-delete-playlist",
+          "markdownDescription": "Enables the delete_playlist command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the delete_session_files command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-delete-session-files",
+          "markdownDescription": "Enables the delete_session_files command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the delete_track_file command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-delete-track-file",
+          "markdownDescription": "Enables the delete_track_file command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the enqueue_collection command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-enqueue-collection",
+          "markdownDescription": "Enables the enqueue_collection command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the enqueue_kind command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-enqueue-kind",
+          "markdownDescription": "Enables the enqueue_kind command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the export_db command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-export-db",
+          "markdownDescription": "Enables the export_db command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the find_collection_file_id command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-find-collection-file-id",
+          "markdownDescription": "Enables the find_collection_file_id command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the find_collection_id_for_path command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-find-collection-id-for-path",
+          "markdownDescription": "Enables the find_collection_id_for_path command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the find_relax_playlist command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-find-relax-playlist",
+          "markdownDescription": "Enables the find_relax_playlist command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the fix_collection_track_order command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-fix-collection-track-order",
+          "markdownDescription": "Enables the fix_collection_track_order command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the get_app_prefs command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-get-app-prefs",
+          "markdownDescription": "Enables the get_app_prefs command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the get_chapters command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-get-chapters",
+          "markdownDescription": "Enables the get_chapters command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the get_collection_detail command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-get-collection-detail",
+          "markdownDescription": "Enables the get_collection_detail command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the get_current_playlist command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-get-current-playlist",
+          "markdownDescription": "Enables the get_current_playlist command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the get_home_summary command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-get-home-summary",
+          "markdownDescription": "Enables the get_home_summary command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the get_os_media_status command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-get-os-media-status",
+          "markdownDescription": "Enables the get_os_media_status command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the get_playlist_detail command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-get-playlist-detail",
+          "markdownDescription": "Enables the get_playlist_detail command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the get_recent_opened command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-get-recent-opened",
+          "markdownDescription": "Enables the get_recent_opened command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the get_transport command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-get-transport",
+          "markdownDescription": "Enables the get_transport command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the list_collection_ids command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-list-collection-ids",
+          "markdownDescription": "Enables the list_collection_ids command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the list_collections command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-list-collections",
+          "markdownDescription": "Enables the list_collections command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the list_library_roots command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-list-library-roots",
+          "markdownDescription": "Enables the list_library_roots command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the list_metadata_groups command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-list-metadata-groups",
+          "markdownDescription": "Enables the list_metadata_groups command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the list_playlists command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-list-playlists",
+          "markdownDescription": "Enables the list_playlists command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the lookup_metadata_online command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-lookup-metadata-online",
+          "markdownDescription": "Enables the lookup_metadata_online command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the mark_collection_listened command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-mark-collection-listened",
+          "markdownDescription": "Enables the mark_collection_listened command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the mark_session_listened command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-mark-session-listened",
+          "markdownDescription": "Enables the mark_session_listened command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the pick_import_folder_to_playlist command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-pick-import-folder-to-playlist",
+          "markdownDescription": "Enables the pick_import_folder_to_playlist command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the pick_library_folder command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-pick-library-folder",
+          "markdownDescription": "Enables the pick_library_folder command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the pick_open_file command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-pick-open-file",
+          "markdownDescription": "Enables the pick_open_file command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the pick_open_folder command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-pick-open-folder",
+          "markdownDescription": "Enables the pick_open_folder command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the pick_relink_audio_file command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-pick-relink-audio-file",
+          "markdownDescription": "Enables the pick_relink_audio_file command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the play_collection command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-play-collection",
+          "markdownDescription": "Enables the play_collection command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the play_index command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-play-index",
+          "markdownDescription": "Enables the play_index command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the play_kind command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-play-kind",
+          "markdownDescription": "Enables the play_kind command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the play_playlist command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-play-playlist",
+          "markdownDescription": "Enables the play_playlist command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the recover_mpv command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-recover-mpv",
+          "markdownDescription": "Enables the recover_mpv command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the refresh_library_roots command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-refresh-library-roots",
+          "markdownDescription": "Enables the refresh_library_roots command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the relink_collection_file command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-relink-collection-file",
+          "markdownDescription": "Enables the relink_collection_file command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the remove_collection_file_from_library command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-remove-collection-file-from-library",
+          "markdownDescription": "Enables the remove_collection_file_from_library command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the remove_collection_from_library command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-remove-collection-from-library",
+          "markdownDescription": "Enables the remove_collection_from_library command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the remove_from_playlist command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-remove-from-playlist",
+          "markdownDescription": "Enables the remove_from_playlist command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the remove_library_root command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-remove-library-root",
+          "markdownDescription": "Enables the remove_library_root command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the remove_queue_item command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-remove-queue-item",
+          "markdownDescription": "Enables the remove_queue_item command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the rename_playlist command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-rename-playlist",
+          "markdownDescription": "Enables the rename_playlist command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the reopen_recent command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-reopen-recent",
+          "markdownDescription": "Enables the reopen_recent command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the reorder_collection_files command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-reorder-collection-files",
+          "markdownDescription": "Enables the reorder_collection_files command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the reorder_playlist_items command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-reorder-playlist-items",
+          "markdownDescription": "Enables the reorder_playlist_items command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the reset_track_speed_to_default command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-reset-track-speed-to-default",
+          "markdownDescription": "Enables the reset_track_speed_to_default command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the resort_playlist command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-resort-playlist",
+          "markdownDescription": "Enables the resort_playlist command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the save_progress command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-save-progress",
+          "markdownDescription": "Enables the save_progress command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the scan_library_root command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-scan-library-root",
+          "markdownDescription": "Enables the scan_library_root command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the seek_delta command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-seek-delta",
+          "markdownDescription": "Enables the seek_delta command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the seek_seconds command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-seek-seconds",
+          "markdownDescription": "Enables the seek_seconds command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the set_collection_kind command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-set-collection-kind",
+          "markdownDescription": "Enables the set_collection_kind command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the set_collections_kind command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-set-collections-kind",
+          "markdownDescription": "Enables the set_collections_kind command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the set_default_playback_speed command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-set-default-playback-speed",
+          "markdownDescription": "Enables the set_default_playback_speed command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the set_online_metadata_enabled command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-set-online-metadata-enabled",
+          "markdownDescription": "Enables the set_online_metadata_enabled command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the set_paused command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-set-paused",
+          "markdownDescription": "Enables the set_paused command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the set_playback_speed_defaults command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-set-playback-speed-defaults",
+          "markdownDescription": "Enables the set_playback_speed_defaults command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the set_playlist_default_speed command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-set-playlist-default-speed",
+          "markdownDescription": "Enables the set_playlist_default_speed command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the set_playlist_pinned command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-set-playlist-pinned",
+          "markdownDescription": "Enables the set_playlist_pinned command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the set_playlist_shuffle_on_play command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-set-playlist-shuffle-on-play",
+          "markdownDescription": "Enables the set_playlist_shuffle_on_play command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the set_repeat_mode command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-set-repeat-mode",
+          "markdownDescription": "Enables the set_repeat_mode command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the set_resume_playing_on_launch command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-set-resume-playing-on-launch",
+          "markdownDescription": "Enables the set_resume_playing_on_launch command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the set_scan_subfolders command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-set-scan-subfolders",
+          "markdownDescription": "Enables the set_scan_subfolders command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the set_sleep_timer command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-set-sleep-timer",
+          "markdownDescription": "Enables the set_sleep_timer command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the set_speed command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-set-speed",
+          "markdownDescription": "Enables the set_speed command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the set_stop_after_track command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-set-stop-after-track",
+          "markdownDescription": "Enables the set_stop_after_track command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the set_track_listened command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-set-track-listened",
+          "markdownDescription": "Enables the set_track_listened command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the set_ui_locale command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-set-ui-locale",
+          "markdownDescription": "Enables the set_ui_locale command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the skip_next command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-skip-next",
+          "markdownDescription": "Enables the skip_next command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the skip_prev command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-skip-prev",
+          "markdownDescription": "Enables the skip_prev command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the toggle_pause command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-toggle-pause",
+          "markdownDescription": "Enables the toggle_pause command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the update_collection_metadata command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-update-collection-metadata",
+          "markdownDescription": "Enables the update_collection_metadata command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the update_file_display_title command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-update-file-display-title",
+          "markdownDescription": "Enables the update_file_display_title command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the add_library_root command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-add-library-root",
+          "markdownDescription": "Denies the add_library_root command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the add_metadata_group_to_playlist command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-add-metadata-group-to-playlist",
+          "markdownDescription": "Denies the add_metadata_group_to_playlist command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the add_to_playlist command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-add-to-playlist",
+          "markdownDescription": "Denies the add_to_playlist command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the advance_after_eof command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-advance-after-eof",
+          "markdownDescription": "Denies the advance_after_eof command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the clear_recent_opened command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-clear-recent-opened",
+          "markdownDescription": "Denies the clear_recent_opened command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the confirm_delete_session_files command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-confirm-delete-session-files",
+          "markdownDescription": "Denies the confirm_delete_session_files command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the confirm_delete_track_file command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-confirm-delete-track-file",
+          "markdownDescription": "Denies the confirm_delete_track_file command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the confirm_enable_online_metadata command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-confirm-enable-online-metadata",
+          "markdownDescription": "Denies the confirm_enable_online_metadata command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the create_playlist command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-create-playlist",
+          "markdownDescription": "Denies the create_playlist command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the create_playlist_from_collection command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-create-playlist-from-collection",
+          "markdownDescription": "Denies the create_playlist_from_collection command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the create_playlist_from_metadata_group command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-create-playlist-from-metadata-group",
+          "markdownDescription": "Denies the create_playlist_from_metadata_group command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the delete_playlist command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-delete-playlist",
+          "markdownDescription": "Denies the delete_playlist command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the delete_session_files command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-delete-session-files",
+          "markdownDescription": "Denies the delete_session_files command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the delete_track_file command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-delete-track-file",
+          "markdownDescription": "Denies the delete_track_file command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the enqueue_collection command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-enqueue-collection",
+          "markdownDescription": "Denies the enqueue_collection command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the enqueue_kind command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-enqueue-kind",
+          "markdownDescription": "Denies the enqueue_kind command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the export_db command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-export-db",
+          "markdownDescription": "Denies the export_db command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the find_collection_file_id command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-find-collection-file-id",
+          "markdownDescription": "Denies the find_collection_file_id command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the find_collection_id_for_path command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-find-collection-id-for-path",
+          "markdownDescription": "Denies the find_collection_id_for_path command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the find_relax_playlist command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-find-relax-playlist",
+          "markdownDescription": "Denies the find_relax_playlist command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the fix_collection_track_order command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-fix-collection-track-order",
+          "markdownDescription": "Denies the fix_collection_track_order command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the get_app_prefs command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-get-app-prefs",
+          "markdownDescription": "Denies the get_app_prefs command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the get_chapters command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-get-chapters",
+          "markdownDescription": "Denies the get_chapters command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the get_collection_detail command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-get-collection-detail",
+          "markdownDescription": "Denies the get_collection_detail command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the get_current_playlist command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-get-current-playlist",
+          "markdownDescription": "Denies the get_current_playlist command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the get_home_summary command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-get-home-summary",
+          "markdownDescription": "Denies the get_home_summary command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the get_os_media_status command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-get-os-media-status",
+          "markdownDescription": "Denies the get_os_media_status command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the get_playlist_detail command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-get-playlist-detail",
+          "markdownDescription": "Denies the get_playlist_detail command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the get_recent_opened command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-get-recent-opened",
+          "markdownDescription": "Denies the get_recent_opened command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the get_transport command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-get-transport",
+          "markdownDescription": "Denies the get_transport command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the list_collection_ids command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-list-collection-ids",
+          "markdownDescription": "Denies the list_collection_ids command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the list_collections command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-list-collections",
+          "markdownDescription": "Denies the list_collections command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the list_library_roots command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-list-library-roots",
+          "markdownDescription": "Denies the list_library_roots command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the list_metadata_groups command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-list-metadata-groups",
+          "markdownDescription": "Denies the list_metadata_groups command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the list_playlists command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-list-playlists",
+          "markdownDescription": "Denies the list_playlists command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the lookup_metadata_online command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-lookup-metadata-online",
+          "markdownDescription": "Denies the lookup_metadata_online command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the mark_collection_listened command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-mark-collection-listened",
+          "markdownDescription": "Denies the mark_collection_listened command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the mark_session_listened command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-mark-session-listened",
+          "markdownDescription": "Denies the mark_session_listened command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the pick_import_folder_to_playlist command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-pick-import-folder-to-playlist",
+          "markdownDescription": "Denies the pick_import_folder_to_playlist command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the pick_library_folder command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-pick-library-folder",
+          "markdownDescription": "Denies the pick_library_folder command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the pick_open_file command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-pick-open-file",
+          "markdownDescription": "Denies the pick_open_file command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the pick_open_folder command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-pick-open-folder",
+          "markdownDescription": "Denies the pick_open_folder command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the pick_relink_audio_file command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-pick-relink-audio-file",
+          "markdownDescription": "Denies the pick_relink_audio_file command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the play_collection command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-play-collection",
+          "markdownDescription": "Denies the play_collection command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the play_index command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-play-index",
+          "markdownDescription": "Denies the play_index command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the play_kind command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-play-kind",
+          "markdownDescription": "Denies the play_kind command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the play_playlist command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-play-playlist",
+          "markdownDescription": "Denies the play_playlist command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the recover_mpv command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-recover-mpv",
+          "markdownDescription": "Denies the recover_mpv command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the refresh_library_roots command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-refresh-library-roots",
+          "markdownDescription": "Denies the refresh_library_roots command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the relink_collection_file command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-relink-collection-file",
+          "markdownDescription": "Denies the relink_collection_file command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the remove_collection_file_from_library command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-remove-collection-file-from-library",
+          "markdownDescription": "Denies the remove_collection_file_from_library command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the remove_collection_from_library command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-remove-collection-from-library",
+          "markdownDescription": "Denies the remove_collection_from_library command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the remove_from_playlist command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-remove-from-playlist",
+          "markdownDescription": "Denies the remove_from_playlist command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the remove_library_root command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-remove-library-root",
+          "markdownDescription": "Denies the remove_library_root command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the remove_queue_item command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-remove-queue-item",
+          "markdownDescription": "Denies the remove_queue_item command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the rename_playlist command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-rename-playlist",
+          "markdownDescription": "Denies the rename_playlist command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the reopen_recent command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-reopen-recent",
+          "markdownDescription": "Denies the reopen_recent command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the reorder_collection_files command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-reorder-collection-files",
+          "markdownDescription": "Denies the reorder_collection_files command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the reorder_playlist_items command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-reorder-playlist-items",
+          "markdownDescription": "Denies the reorder_playlist_items command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the reset_track_speed_to_default command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-reset-track-speed-to-default",
+          "markdownDescription": "Denies the reset_track_speed_to_default command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the resort_playlist command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-resort-playlist",
+          "markdownDescription": "Denies the resort_playlist command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the save_progress command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-save-progress",
+          "markdownDescription": "Denies the save_progress command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the scan_library_root command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-scan-library-root",
+          "markdownDescription": "Denies the scan_library_root command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the seek_delta command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-seek-delta",
+          "markdownDescription": "Denies the seek_delta command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the seek_seconds command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-seek-seconds",
+          "markdownDescription": "Denies the seek_seconds command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the set_collection_kind command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-set-collection-kind",
+          "markdownDescription": "Denies the set_collection_kind command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the set_collections_kind command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-set-collections-kind",
+          "markdownDescription": "Denies the set_collections_kind command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the set_default_playback_speed command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-set-default-playback-speed",
+          "markdownDescription": "Denies the set_default_playback_speed command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the set_online_metadata_enabled command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-set-online-metadata-enabled",
+          "markdownDescription": "Denies the set_online_metadata_enabled command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the set_paused command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-set-paused",
+          "markdownDescription": "Denies the set_paused command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the set_playback_speed_defaults command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-set-playback-speed-defaults",
+          "markdownDescription": "Denies the set_playback_speed_defaults command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the set_playlist_default_speed command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-set-playlist-default-speed",
+          "markdownDescription": "Denies the set_playlist_default_speed command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the set_playlist_pinned command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-set-playlist-pinned",
+          "markdownDescription": "Denies the set_playlist_pinned command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the set_playlist_shuffle_on_play command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-set-playlist-shuffle-on-play",
+          "markdownDescription": "Denies the set_playlist_shuffle_on_play command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the set_repeat_mode command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-set-repeat-mode",
+          "markdownDescription": "Denies the set_repeat_mode command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the set_resume_playing_on_launch command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-set-resume-playing-on-launch",
+          "markdownDescription": "Denies the set_resume_playing_on_launch command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the set_scan_subfolders command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-set-scan-subfolders",
+          "markdownDescription": "Denies the set_scan_subfolders command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the set_sleep_timer command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-set-sleep-timer",
+          "markdownDescription": "Denies the set_sleep_timer command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the set_speed command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-set-speed",
+          "markdownDescription": "Denies the set_speed command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the set_stop_after_track command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-set-stop-after-track",
+          "markdownDescription": "Denies the set_stop_after_track command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the set_track_listened command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-set-track-listened",
+          "markdownDescription": "Denies the set_track_listened command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the set_ui_locale command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-set-ui-locale",
+          "markdownDescription": "Denies the set_ui_locale command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the skip_next command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-skip-next",
+          "markdownDescription": "Denies the skip_next command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the skip_prev command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-skip-prev",
+          "markdownDescription": "Denies the skip_prev command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the toggle_pause command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-toggle-pause",
+          "markdownDescription": "Denies the toggle_pause command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the update_collection_metadata command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-update-collection-metadata",
+          "markdownDescription": "Denies the update_collection_metadata command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the update_file_display_title command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-update-file-display-title",
+          "markdownDescription": "Denies the update_file_display_title command without any pre-configured scope."
+        },
+        {
           "description": "Default core plugins set.\n#### This default permission set includes:\n\n- `core:path:default`\n- `core:event:default`\n- `core:window:default`\n- `core:webview:default`\n- `core:app:default`\n- `core:image:default`\n- `core:resources:default`\n- `core:menu:default`\n- `core:tray:default`",
           "type": "string",
           "const": "core:default",

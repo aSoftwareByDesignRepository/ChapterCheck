@@ -74,6 +74,10 @@ export function LibraryView({
                   </span>
                   {!root.is_available ? (
                     <span className="library-root-status-badge">{t("library.unavailable")}</span>
+                  ) : root.last_scan_status === "error" ? (
+                    <span className="library-root-status-badge library-root-status-badge--error">
+                      {t("library.scanError")}
+                    </span>
                   ) : null}
                   <button
                     type="button"

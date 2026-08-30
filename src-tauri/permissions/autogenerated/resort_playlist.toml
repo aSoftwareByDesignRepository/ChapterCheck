@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-resort-playlist"
+description = "Enables the resort_playlist command without any pre-configured scope."
+commands.allow = ["resort_playlist"]
+
+[[permission]]
+identifier = "deny-resort-playlist"
+description = "Denies the resort_playlist command without any pre-configured scope."
+commands.deny = ["resort_playlist"]

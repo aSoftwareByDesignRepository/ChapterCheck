@@ -2,7 +2,8 @@
 
 use crate::db::LibraryDb;
 use crate::path_policy::{
-    canonicalize_existing, canonicalize_under_root, is_under_any_root, tracked_file_on_disk,
+    canonicalize_existing, canonicalize_under_root, is_forbidden_library_root, is_under_any_root,
+    tracked_file_on_disk,
 };
 use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -16,6 +17,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub const AUDIO_EXT: &[&str] = &[
     "mp3", "m4a", "m4b", "aac", "flac", "ogg", "opus", "wav", "wma", "aiff", "aif", "oga",
 ];
+
+/// Hard ceiling on recursive library walks. A symlink cycle or a user picking
+/// a huge tree must fail closed, not hang the scan flag until the process dies.
+pub const MAX_SCAN_AUDIO_FILES: usize = 25_000;
+pub const MAX_SCAN_DIRS: usize = 50_000;
 
 pub const PREF_ONLINE_METADATA: &str = "pref.online_metadata_enabled";
 pub const PREF_REPEAT_MODE: &str = "session.repeat_mode";
@@ -96,6 +102,52 @@ fn append_collection_filter_sql(base_sql: &mut String, filter: Option<&str>) {
         "in-progress" => base_sql.push_str(FILTER_IN_PROGRESS_SQL),
         "series" => base_sql.push_str(" AND c.series IS NOT NULL AND TRIM(c.series) != ''"),
         _ => {}
+    }
+}
+
+/// Escape `%`, `_`, and `!` so a folder path cannot be treated as a SQL LIKE pattern.
+fn sql_like_literal(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '!' | '%' | '_' => {
+                out.push('!');
+                out.push(c);
+            }
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Case-insensitive substring match with `%`/`_` treated as literals (`ESCAPE '!'`).
+fn sql_like_contains(s: &str) -> String {
+    format!("%{}%", sql_like_literal(&s.trim().to_lowercase()))
+}
+
+const MAX_PLAYLIST_NAME_CHARS: usize = 200;
+const MAX_LABEL_CHARS: usize = 500;
+const MAX_SERIES_INDEX: i32 = 10_000;
+
+fn validate_user_label(raw: &str, what: &str, max_chars: usize) -> Result<String, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(format!("{what} cannot be empty"));
+    }
+    if trimmed.chars().count() > max_chars {
+        return Err(format!(
+            "{what} is too long (max {max_chars} characters)"
+        ));
+    }
+    Ok(trimmed.to_string())
+}
+
+/// `None` = leave the column. `Some("")` = store NULL. `Some(text)` = validated text.
+fn optional_text_sql(value: Option<String>, what: &str) -> Result<Option<String>, String> {
+    match value {
+        None => Ok(None),
+        Some(s) if s.trim().is_empty() => Ok(Some(String::new())),
+        Some(s) => Ok(Some(validate_user_label(&s, what, MAX_LABEL_CHARS)?)),
     }
 }
 
@@ -359,13 +411,6 @@ pub struct SetCollectionsKindFailure {
 pub struct SetCollectionsKindResult {
     pub updated: usize,
     pub failures: Vec<SetCollectionsKindFailure>,
-}
-
-#[derive(Clone, Serialize)]
-pub struct AlbumGroupDto {
-    pub artist: String,
-    pub album: String,
-    pub track_count: i64,
 }
 
 #[derive(Clone, Serialize)]
@@ -655,6 +700,71 @@ fn classify_collection(files: &[ScannedFile], layout: LayoutKind) -> ContentKind
     ContentKind::Audiobook
 }
 
+fn collect_audio_files(root: &Path, start: &Path) -> Result<Vec<PathBuf>, String> {
+    collect_audio_files_bounded(root, start, MAX_SCAN_AUDIO_FILES, MAX_SCAN_DIRS)
+}
+
+fn collect_audio_files_bounded(
+    root: &Path,
+    start: &Path,
+    max_files: usize,
+    max_dirs: usize,
+) -> Result<Vec<PathBuf>, String> {
+    let start_canon = canonicalize_under_root(start, root).map_err(|e| e.to_string())?;
+    let mut stack = vec![start_canon];
+    let mut visited_dirs: HashSet<PathBuf> = HashSet::new();
+    let mut seen_files: HashSet<PathBuf> = HashSet::new();
+    let mut out = Vec::new();
+    while let Some(dir) = stack.pop() {
+        if !visited_dirs.insert(dir.clone()) {
+            continue;
+        }
+        if visited_dirs.len() > max_dirs {
+            return Err(format!(
+                "This folder has too many subfolders to scan (more than {max_dirs}). Choose a smaller folder."
+            ));
+        }
+        let entries =
+            fs::read_dir(&dir).map_err(|e| format!("Cannot read {}: {e}", dir.display()))?;
+        for ent in entries {
+            let ent = ent.map_err(|e| e.to_string())?;
+            let p = ent.path();
+            if p.is_dir() {
+                let canon = canonicalize_under_root(&p, root).map_err(|e| e.to_string())?;
+                stack.push(canon);
+            } else if p.is_file() && is_audio_file(&p) {
+                let canon = canonicalize_under_root(&p, root).map_err(|e| e.to_string())?;
+                if !seen_files.insert(canon.clone()) {
+                    continue;
+                }
+                if out.len() >= max_files {
+                    return Err(format!(
+                        "This folder has too many audio files to scan (more than {max_files}). Choose a smaller folder."
+                    ));
+                }
+                out.push(canon);
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn list_dir_children(dir: &Path, max: usize) -> Result<Vec<PathBuf>, String> {
+    let entries =
+        fs::read_dir(dir).map_err(|e| format!("Cannot read {}: {e}", dir.display()))?;
+    let mut out = Vec::new();
+    for ent in entries {
+        let ent = ent.map_err(|e| e.to_string())?;
+        if out.len() >= max {
+            return Err(format!(
+                "This folder has too many items to scan (more than {max}). Choose a smaller folder."
+            ));
+        }
+        out.push(ent.path());
+    }
+    Ok(out)
+}
+
 fn gather_audiobook_files(book_dir: &Path) -> (LayoutKind, Vec<ScannedFile>) {
     let mut direct_audio = Vec::new();
     let mut disc_dirs: Vec<(i32, String, PathBuf)> = Vec::new();
@@ -670,7 +780,7 @@ fn gather_audiobook_files(book_dir: &Path) -> (LayoutKind, Vec<ScannedFile>) {
                     .map(|s| s.to_string_lossy().to_string())
                     .unwrap_or_default();
                 if let Some(disc) = parse_disc_index(&dir_name) {
-                    disc_dirs.push((disc, p.file_name().unwrap().to_string_lossy().to_string(), p));
+                    disc_dirs.push((disc, dir_name, p));
                 } else {
                     // nested non-CD folder — recurse flat
                     if let Ok(sub) = fs::read_dir(&p) {
@@ -713,7 +823,10 @@ fn gather_audiobook_files(book_dir: &Path) -> (LayoutKind, Vec<ScannedFile>) {
                 .collect();
             natord_sort_paths(&mut files);
             for (ti, path) in files.into_iter().enumerate() {
-                let fname = path.file_name().unwrap().to_string_lossy().to_string();
+                let fname = path
+                    .file_name()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| format!("track-{}", ti + 1));
                 let (tag_title, _, _, track, disc) = probe_tags(&path);
                 let disc_index = disc.map(|d| d as i32).unwrap_or(disc_idx);
                 let track_index = track.map(|t| t as i32).unwrap_or(parse_track_index(&fname) as i32);
@@ -730,7 +843,10 @@ fn gather_audiobook_files(book_dir: &Path) -> (LayoutKind, Vec<ScannedFile>) {
     } else {
         natord_sort_paths(&mut direct_audio);
         for (i, path) in direct_audio.into_iter().enumerate() {
-            let fname = path.file_name().unwrap().to_string_lossy().to_string();
+            let fname = path
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| format!("track-{}", i + 1));
             let (tag_title, _, _, track, disc) = probe_tags(&path);
             let display = tag_title.unwrap_or_else(|| format!("Part {}", i + 1));
             out.push(ScannedFile {
@@ -861,6 +977,12 @@ impl<'a> CatalogService<'a> {
         if !path.is_dir() {
             return Err("Library root must be a folder".into());
         }
+        if is_forbidden_library_root(&path) {
+            return Err(
+                "That folder cannot be used as a library (system or filesystem root)."
+                    .into(),
+            );
+        }
         let path_str = path.to_string_lossy().to_string();
         let now = now_unix();
 
@@ -875,14 +997,20 @@ impl<'a> CatalogService<'a> {
             return self.root_dto_by_id(existing_id);
         }
 
-        let label = input
-            .label
-            .filter(|s| !s.trim().is_empty())
-            .unwrap_or_else(|| {
-                path.file_name()
+        let label = match input.label.as_deref() {
+            Some(s) if !s.trim().is_empty() => {
+                validate_user_label(s, "Folder name", MAX_LABEL_CHARS)?
+            }
+            _ => {
+                let fallback = path
+                    .file_name()
                     .map(|s| s.to_string_lossy().to_string())
-                    .unwrap_or_else(|| path_str.clone())
-            });
+                    .filter(|s| !s.trim().is_empty())
+                    .unwrap_or_else(|| "Library".into());
+                validate_user_label(&fallback, "Folder name", MAX_LABEL_CHARS)
+                    .unwrap_or_else(|_| "Library".into())
+            }
+        };
         let scan_sub = input
             .scan_subfolders
             .unwrap_or(kind == ContentKind::Audiobook || kind == ContentKind::Mixed);
@@ -910,7 +1038,10 @@ impl<'a> CatalogService<'a> {
                 }
             })?;
         let id = self.conn().last_insert_rowid();
-        self.scan_root(id)?;
+        if let Err(e) = self.scan_root(id) {
+            let _ = self.remove_root(id);
+            return Err(e);
+        }
         self.root_dto_by_id(id)
     }
 
@@ -918,33 +1049,6 @@ impl<'a> CatalogService<'a> {
         self.conn_mut()
             .execute("DELETE FROM library_roots WHERE id = ?1", [root_id])
             .map_err(|e| e.to_string())?;
-        Ok(())
-    }
-
-    pub fn update_root_path(&mut self, root_id: i64, new_path: &str) -> Result<(), String> {
-        let path = canonicalize_existing(Path::new(new_path.trim())).map_err(|e| e.to_string())?;
-        if !path.is_dir() {
-            return Err("Path must be a folder".into());
-        }
-        if let Some(other_id) = self.find_root_id_by_canonical_path(&path)? {
-            if other_id != root_id {
-                return Err("This folder is already in your library.".into());
-            }
-        }
-        let now = now_unix();
-        self.conn_mut()
-            .execute(
-                "UPDATE library_roots SET path = ?1, is_available = 1, updated_at = ?2 WHERE id = ?3",
-                params![path.to_string_lossy().as_ref(), now, root_id],
-            )
-            .map_err(|e| {
-                if e.to_string().contains("UNIQUE constraint failed: library_roots.path") {
-                    "This folder is already in your library.".into()
-                } else {
-                    e.to_string()
-                }
-            })?;
-        self.scan_root(root_id)?;
         Ok(())
     }
 
@@ -967,6 +1071,18 @@ impl<'a> CatalogService<'a> {
     }
 
     pub fn scan_root(&mut self, root_id: i64) -> Result<ScanStatusDto, String> {
+        let result = self.scan_root_execute(root_id);
+        if result.is_err() {
+            let now = now_unix();
+            let _ = self.conn_mut().execute(
+                "UPDATE library_roots SET last_scan_at = ?1, last_scan_status = 'error', updated_at = ?1 WHERE id = ?2",
+                params![now, root_id],
+            );
+        }
+        result
+    }
+
+    fn scan_root_execute(&mut self, root_id: i64) -> Result<ScanStatusDto, String> {
         let row: (String, String, String, i32) = self
             .conn()
             .query_row(
@@ -1007,10 +1123,8 @@ impl<'a> CatalogService<'a> {
 
         match (kind, rule) {
             (ContentKind::Audiobook, ScanRule::SubfolderIsItem) => {
-                if let Ok(entries) = fs::read_dir(&root_canon) {
-                    for ent in entries.flatten() {
-                        let p = ent.path();
-                        if p.is_file() && is_audio_file(&p) {
+                for p in list_dir_children(&root_canon, MAX_SCAN_DIRS)? {
+                    if p.is_file() && is_audio_file(&p) {
                             let canon = canonicalize_under_root(&p, &root_canon)
                                 .map_err(|e| e.to_string())?;
                             let title = canon
@@ -1054,10 +1168,9 @@ impl<'a> CatalogService<'a> {
                             }
                         }
                     }
-                }
             }
             (ContentKind::Audiobook, ScanRule::FileIsItem) => {
-                let loose = self.collect_audio_files(&root_canon, &root_canon)?;
+                let loose = collect_audio_files(&root_canon, &root_canon)?;
                 for file in loose {
                     let title = file
                         .file_stem()
@@ -1083,7 +1196,7 @@ impl<'a> CatalogService<'a> {
             }
             (ContentKind::Music, ScanRule::TagArtistAlbum) | (_, ScanRule::TagArtistAlbum) => {
                 let mut by_album: HashMap<(String, String), Vec<PathBuf>> = HashMap::new();
-                for file in self.collect_audio_files(&root_canon, &root_canon)? {
+                for file in collect_audio_files(&root_canon, &root_canon)? {
                     let (_, artist, album, _, _) = probe_tags(&file);
                     let artist = artist.unwrap_or_else(|| "Unknown Artist".into());
                     let album = album.unwrap_or_else(|| {
@@ -1133,19 +1246,17 @@ impl<'a> CatalogService<'a> {
                 }
             }
             (ContentKind::Music, ScanRule::SubfolderIsItem) => {
-                if let Ok(entries) = fs::read_dir(&root_canon) {
-                    for ent in entries.flatten() {
-                        let p = ent.path();
-                        if !p.is_dir() {
-                            continue;
-                        }
+                for p in list_dir_children(&root_canon, MAX_SCAN_DIRS)? {
+                    if !p.is_dir() {
+                        continue;
+                    }
                         let album_dir = canonicalize_under_root(&p, &root_canon)
                             .map_err(|e| e.to_string())?;
                         let title = album_dir
                             .file_name()
                             .map(|s| s.to_string_lossy().to_string())
                             .unwrap_or_else(|| "Album".into());
-                        let mut paths = self.collect_audio_files(&root_canon, &album_dir)?;
+                        let mut paths = collect_audio_files(&root_canon, &album_dir)?;
                         if paths.is_empty() {
                             continue;
                         }
@@ -1188,10 +1299,9 @@ impl<'a> CatalogService<'a> {
                             Some(scan_started),
                         )? as i64;
                     }
-                }
             }
             (ContentKind::Music, ScanRule::FileIsItem) => {
-                let loose = self.collect_audio_files(&root_canon, &root_canon)?;
+                let loose = collect_audio_files(&root_canon, &root_canon)?;
                 for file in loose {
                     let (tag_title, artist, album, _, _) = probe_tags(&file);
                     let title = tag_title.unwrap_or_else(|| {
@@ -1287,27 +1397,6 @@ impl<'a> CatalogService<'a> {
         })
     }
 
-    fn collect_audio_files(&self, root: &Path, start: &Path) -> Result<Vec<PathBuf>, String> {
-        let mut stack = vec![start.to_path_buf()];
-        let mut out = Vec::new();
-        while let Some(dir) = stack.pop() {
-            let entries =
-                fs::read_dir(&dir).map_err(|e| format!("Cannot read {}: {e}", dir.display()))?;
-            for ent in entries {
-                let ent = ent.map_err(|e| e.to_string())?;
-                let p = ent.path();
-                if p.is_dir() {
-                    let canon = canonicalize_under_root(&p, root).map_err(|e| e.to_string())?;
-                    stack.push(canon);
-                } else if p.is_file() && is_audio_file(&p) {
-                    let canon = canonicalize_under_root(&p, root).map_err(|e| e.to_string())?;
-                    out.push(canon);
-                }
-            }
-        }
-        Ok(out)
-    }
-
     fn mark_collection_manual(&mut self, collection_id: i64) -> Result<(), String> {
         let now = now_unix();
         self.conn_mut()
@@ -1373,10 +1462,8 @@ impl<'a> CatalogService<'a> {
         scan_started: i64,
     ) -> Result<usize, String> {
         let mut found = 0usize;
-        if let Ok(entries) = fs::read_dir(root_canon) {
-            for ent in entries.flatten() {
-                let p = ent.path();
-                if p.is_file() && is_audio_file(&p) {
+        for p in list_dir_children(root_canon, MAX_SCAN_DIRS)? {
+            if p.is_file() && is_audio_file(&p) {
                     let canon = canonicalize_under_root(&p, root_canon).map_err(|e| e.to_string())?;
                     let title = canon
                         .file_stem()
@@ -1439,7 +1526,6 @@ impl<'a> CatalogService<'a> {
                         Some(scan_started),
                     )?;
                 }
-            }
         }
         Ok(found)
     }
@@ -1634,10 +1720,10 @@ impl<'a> CatalogService<'a> {
             params_vec.push(Box::new(k.to_string()));
         }
         if let Some(s) = search {
-            let q = format!("%{}%", s.trim().to_lowercase());
+            let q = sql_like_contains(s);
             base_sql.push_str(
-                " AND (LOWER(c.title) LIKE ? OR LOWER(COALESCE(c.author,'')) LIKE ?
-                 OR LOWER(COALESCE(c.artist,'')) LIKE ? OR LOWER(COALESCE(c.series,'')) LIKE ?)",
+                " AND (LOWER(c.title) LIKE ? ESCAPE '!' OR LOWER(COALESCE(c.author,'')) LIKE ? ESCAPE '!'
+                 OR LOWER(COALESCE(c.artist,'')) LIKE ? ESCAPE '!' OR LOWER(COALESCE(c.series,'')) LIKE ? ESCAPE '!')",
             );
             params_vec.push(Box::new(q.clone()));
             params_vec.push(Box::new(q.clone()));
@@ -2512,10 +2598,10 @@ impl<'a> CatalogService<'a> {
             params_vec.push(Box::new(k.to_string()));
         }
         if let Some(s) = search {
-            let q = format!("%{}%", s.trim().to_lowercase());
+            let q = sql_like_contains(s);
             base_sql.push_str(
-                " AND (LOWER(c.title) LIKE ? OR LOWER(COALESCE(c.author,'')) LIKE ?
-                 OR LOWER(COALESCE(c.artist,'')) LIKE ? OR LOWER(COALESCE(c.series,'')) LIKE ?)",
+                " AND (LOWER(c.title) LIKE ? ESCAPE '!' OR LOWER(COALESCE(c.author,'')) LIKE ? ESCAPE '!'
+                 OR LOWER(COALESCE(c.artist,'')) LIKE ? ESCAPE '!' OR LOWER(COALESCE(c.series,'')) LIKE ? ESCAPE '!')",
             );
             params_vec.push(Box::new(q.clone()));
             params_vec.push(Box::new(q.clone()));
@@ -2754,26 +2840,6 @@ impl<'a> CatalogService<'a> {
         })
     }
 
-    pub fn list_series_names(&self, kind: Option<&str>) -> Result<Vec<String>, String> {
-        let mut sql = String::from(
-            "SELECT DISTINCT c.series FROM collections c
-             WHERE c.series IS NOT NULL AND TRIM(c.series) != ''",
-        );
-        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-        if let Some(k) = kind {
-            sql.push_str(" AND c.kind = ?");
-            params.push(Box::new(k.to_string()));
-        }
-        sql.push_str(" ORDER BY LOWER(c.series)");
-        let conn = self.conn();
-        let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
-        let refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
-        let rows = stmt
-            .query_map(refs.as_slice(), |r| r.get::<_, String>(0))
-            .map_err(|e| e.to_string())?;
-        Ok(rows.filter_map(|x| x.ok()).collect())
-    }
-
     /// Validated playback paths: root must be available; each file must exist and stay under root.
     pub fn collection_playback_paths(
         &mut self,
@@ -2868,10 +2934,10 @@ impl<'a> CatalogService<'a> {
         let mut params_vec: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
         params_vec.push(Box::new(kind.to_string()));
         if let Some(s) = search {
-            let q = format!("%{}%", s.trim().to_lowercase());
+            let q = sql_like_contains(s);
             base_sql.push_str(
-                " AND (LOWER(c.title) LIKE ? OR LOWER(COALESCE(c.author,'')) LIKE ?
-                 OR LOWER(COALESCE(c.artist,'')) LIKE ? OR LOWER(COALESCE(c.series,'')) LIKE ?)",
+                " AND (LOWER(c.title) LIKE ? ESCAPE '!' OR LOWER(COALESCE(c.author,'')) LIKE ? ESCAPE '!'
+                 OR LOWER(COALESCE(c.artist,'')) LIKE ? ESCAPE '!' OR LOWER(COALESCE(c.series,'')) LIKE ? ESCAPE '!')",
             );
             params_vec.push(Box::new(q.clone()));
             params_vec.push(Box::new(q.clone()));
@@ -3100,12 +3166,13 @@ impl<'a> CatalogService<'a> {
     pub fn find_collection_for_folder(&self, folder: &Path) -> Result<Option<i64>, String> {
         let canon = canonicalize_existing(folder).map_err(|e| e.to_string())?;
         let prefix = format!("{}/", canon.to_string_lossy().trim_end_matches('/'));
+        let pattern = format!("{}%", sql_like_literal(&prefix));
         let mut stmt = self
             .conn()
             .prepare(
                 "SELECT cf.collection_id,
                         COUNT(*) AS total,
-                        SUM(CASE WHEN cf.path LIKE ?1 || '%' THEN 1 ELSE 0 END) AS under_prefix
+                        SUM(CASE WHEN cf.path LIKE ?1 ESCAPE '!' THEN 1 ELSE 0 END) AS under_prefix
                  FROM collection_files cf
                  WHERE cf.unavailable = 0
                  GROUP BY cf.collection_id
@@ -3113,7 +3180,7 @@ impl<'a> CatalogService<'a> {
             )
             .map_err(|e| e.to_string())?;
         let matches: Vec<i64> = stmt
-            .query_map([&prefix], |r| r.get::<_, i64>(0))
+            .query_map([&pattern], |r| r.get::<_, i64>(0))
             .map_err(|e| e.to_string())?
             .filter_map(|x| x.ok())
             .collect();
@@ -3147,34 +3214,54 @@ impl<'a> CatalogService<'a> {
         collection_id: i64,
         meta: CollectionMetadataInput,
     ) -> Result<(), String> {
+        let title = match meta.title {
+            Some(s) => Some(validate_user_label(&s, "Title", MAX_LABEL_CHARS)?),
+            None => None,
+        };
+        let author = optional_text_sql(meta.author, "Author")?;
+        let narrator = optional_text_sql(meta.narrator, "Narrator")?;
+        let artist = optional_text_sql(meta.artist, "Artist")?;
+        let album = optional_text_sql(meta.album, "Album")?;
+        let series = optional_text_sql(meta.series, "Series")?;
+        if let Some(idx) = meta.series_index {
+            if !(0..=MAX_SERIES_INDEX).contains(&idx) {
+                return Err(format!(
+                    "Series number must be between 0 and {MAX_SERIES_INDEX}"
+                ));
+            }
+        }
         let now = now_unix();
-        self.conn_mut()
+        let n = self
+            .conn_mut()
             .execute(
                 "UPDATE collections SET
                     title = COALESCE(?1, title),
                     sort_title = COALESCE(LOWER(?1), sort_title),
-                    author = COALESCE(?2, author),
-                    narrator = COALESCE(?3, narrator),
-                    artist = COALESCE(?4, artist),
-                    album = COALESCE(?5, album),
-                    series = COALESCE(?6, series),
+                    author = CASE WHEN ?2 IS NULL THEN author WHEN ?2 = '' THEN NULL ELSE ?2 END,
+                    narrator = CASE WHEN ?3 IS NULL THEN narrator WHEN ?3 = '' THEN NULL ELSE ?3 END,
+                    artist = CASE WHEN ?4 IS NULL THEN artist WHEN ?4 = '' THEN NULL ELSE ?4 END,
+                    album = CASE WHEN ?5 IS NULL THEN album WHEN ?5 = '' THEN NULL ELSE ?5 END,
+                    series = CASE WHEN ?6 IS NULL THEN series WHEN ?6 = '' THEN NULL ELSE ?6 END,
                     series_index = COALESCE(?7, series_index),
                     is_manual = 1,
                     updated_at = ?8
                  WHERE id = ?9",
                 params![
-                    meta.title,
-                    meta.author,
-                    meta.narrator,
-                    meta.artist,
-                    meta.album,
-                    meta.series,
+                    title,
+                    author,
+                    narrator,
+                    artist,
+                    album,
+                    series,
                     meta.series_index,
                     now,
                     collection_id,
                 ],
             )
             .map_err(|e| e.to_string())?;
+        if n == 0 {
+            return Err("Collection not found".into());
+        }
         Ok(())
     }
 
@@ -3244,11 +3331,12 @@ impl<'a> CatalogService<'a> {
     }
 
     pub fn create_playlist(&mut self, name: &str, pin: bool) -> Result<i64, String> {
+        let name = validate_user_label(name, "Playlist name", MAX_PLAYLIST_NAME_CHARS)?;
         let now = now_unix();
         self.conn_mut()
             .execute(
                 "INSERT INTO user_playlists (name, kind, is_pinned, created_at, updated_at) VALUES (?1,'music',?2,?3,?3)",
-                params![name.trim(), pin as i32, now],
+                params![name, pin as i32, now],
             )
             .map_err(|e| e.to_string())?;
         Ok(self.conn().last_insert_rowid())
@@ -3310,17 +3398,18 @@ impl<'a> CatalogService<'a> {
     fn collection_file_ids_under_folder(&self, folder: &Path) -> Result<Vec<i64>, String> {
         let canon = canonicalize_existing(folder).map_err(|e| e.to_string())?;
         let prefix = format!("{}/", canon.to_string_lossy().trim_end_matches('/'));
+        let pattern = format!("{}%", sql_like_literal(&prefix));
         let mut stmt = self
             .conn()
             .prepare(
                 "SELECT cf.id FROM collection_files cf
                  JOIN collections c ON c.id = cf.collection_id
-                 WHERE cf.unavailable = 0 AND cf.path LIKE ?1 || '%'
+                 WHERE cf.unavailable = 0 AND cf.path LIKE ?1 ESCAPE '!'
                  ORDER BY c.sort_title, cf.track_order, cf.path",
             )
             .map_err(|e| e.to_string())?;
         let rows = stmt
-            .query_map([&prefix], |r| r.get(0))
+            .query_map([pattern], |r| r.get(0))
             .map_err(|e| e.to_string())?
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| e.to_string())?;
@@ -3587,6 +3676,8 @@ impl<'a> CatalogService<'a> {
         limit: i64,
         offset: i64,
     ) -> Result<Vec<MetadataGroupDto>, String> {
+        let limit = limit.clamp(1, 200);
+        let offset = offset.max(0);
         let artist_expr = Self::album_artist_expr();
         let album_expr = Self::album_name_expr();
         let author_expr = Self::author_expr();
@@ -3603,9 +3694,9 @@ impl<'a> CatalogService<'a> {
                      WHERE c.kind = 'music'"
                 );
                 if let Some(s) = search.filter(|x| !x.trim().is_empty()) {
-                    let q = format!("%{}%", s.trim().to_lowercase());
+                    let q = sql_like_contains(s);
                     sql.push_str(&format!(
-                        " AND (LOWER({artist_expr}) LIKE ? OR LOWER({album_expr}) LIKE ?)"
+                        " AND (LOWER({artist_expr}) LIKE ? ESCAPE '!' OR LOWER({album_expr}) LIKE ? ESCAPE '!')"
                     ));
                     params_vec.push(Box::new(q.clone()));
                     params_vec.push(Box::new(q));
@@ -3626,8 +3717,8 @@ impl<'a> CatalogService<'a> {
                      WHERE c.kind = 'music'"
                 );
                 if let Some(s) = search.filter(|x| !x.trim().is_empty()) {
-                    sql.push_str(&format!(" AND LOWER({artist_expr}) LIKE ?"));
-                    params_vec.push(Box::new(format!("%{}%", s.trim().to_lowercase())));
+                    sql.push_str(&format!(" AND LOWER({artist_expr}) LIKE ? ESCAPE '!'"));
+                    params_vec.push(Box::new(sql_like_contains(s)));
                 }
                 sql.push_str(&format!(
                     " GROUP BY LOWER({artist_expr})
@@ -3645,9 +3736,9 @@ impl<'a> CatalogService<'a> {
                      WHERE c.kind = 'audiobook'"
                 );
                 if let Some(s) = search.filter(|x| !x.trim().is_empty()) {
-                    let q = format!("%{}%", s.trim().to_lowercase());
+                    let q = sql_like_contains(s);
                     sql.push_str(&format!(
-                        " AND (LOWER(c.title) LIKE ? OR LOWER({author_expr}) LIKE ? OR LOWER({narrator_expr}) LIKE ?)"
+                        " AND (LOWER(c.title) LIKE ? ESCAPE '!' OR LOWER({author_expr}) LIKE ? ESCAPE '!' OR LOWER({narrator_expr}) LIKE ? ESCAPE '!')"
                     ));
                     params_vec.push(Box::new(q.clone()));
                     params_vec.push(Box::new(q.clone()));
@@ -3669,8 +3760,8 @@ impl<'a> CatalogService<'a> {
                      WHERE c.kind = 'audiobook'"
                 );
                 if let Some(s) = search.filter(|x| !x.trim().is_empty()) {
-                    sql.push_str(&format!(" AND LOWER({author_expr}) LIKE ?"));
-                    params_vec.push(Box::new(format!("%{}%", s.trim().to_lowercase())));
+                    sql.push_str(&format!(" AND LOWER({author_expr}) LIKE ? ESCAPE '!'"));
+                    params_vec.push(Box::new(sql_like_contains(s)));
                 }
                 sql.push_str(&format!(
                     " GROUP BY LOWER({author_expr})
@@ -3689,8 +3780,8 @@ impl<'a> CatalogService<'a> {
                      WHERE c.kind = 'audiobook'"
                 );
                 if let Some(s) = search.filter(|x| !x.trim().is_empty()) {
-                    sql.push_str(&format!(" AND LOWER({narrator_expr}) LIKE ?"));
-                    params_vec.push(Box::new(format!("%{}%", s.trim().to_lowercase())));
+                    sql.push_str(&format!(" AND LOWER({narrator_expr}) LIKE ? ESCAPE '!'"));
+                    params_vec.push(Box::new(sql_like_contains(s)));
                 }
                 sql.push_str(&format!(
                     " GROUP BY LOWER({narrator_expr})
@@ -3709,8 +3800,8 @@ impl<'a> CatalogService<'a> {
                      WHERE c.kind = 'audiobook' AND c.series IS NOT NULL AND TRIM(c.series) != ''"
                 );
                 if let Some(s) = search.filter(|x| !x.trim().is_empty()) {
-                    sql.push_str(&format!(" AND LOWER({series_expr}) LIKE ?"));
-                    params_vec.push(Box::new(format!("%{}%", s.trim().to_lowercase())));
+                    sql.push_str(&format!(" AND LOWER({series_expr}) LIKE ? ESCAPE '!'"));
+                    params_vec.push(Box::new(sql_like_contains(s)));
                 }
                 sql.push_str(&format!(
                     " GROUP BY LOWER({series_expr})
@@ -3903,88 +3994,6 @@ impl<'a> CatalogService<'a> {
         })
     }
 
-    pub fn list_album_groups(
-        &self,
-        search: Option<&str>,
-        limit: i64,
-        offset: i64,
-    ) -> Result<Vec<AlbumGroupDto>, String> {
-        let artist_expr = Self::album_artist_expr();
-        let album_expr = Self::album_name_expr();
-        let mut sql = format!(
-            "SELECT {artist_expr} AS artist, {album_expr} AS album, COUNT(cf.id) AS track_count
-             FROM collections c
-             JOIN collection_files cf ON cf.collection_id = c.id AND cf.unavailable = 0
-             JOIN library_roots r ON r.id = c.root_id AND r.is_available = 1
-             WHERE c.kind = 'music'"
-        );
-        let mut params_vec: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-        if let Some(s) = search.filter(|x| !x.trim().is_empty()) {
-            let q = format!("%{}%", s.trim().to_lowercase());
-            sql.push_str(&format!(
-                " AND (LOWER({artist_expr}) LIKE ? OR LOWER({album_expr}) LIKE ?)"
-            ));
-            params_vec.push(Box::new(q.clone()));
-            params_vec.push(Box::new(q));
-        }
-        sql.push_str(&format!(
-            " GROUP BY LOWER({artist_expr}), LOWER({album_expr})
-              ORDER BY LOWER({artist_expr}), LOWER({album_expr})
-              LIMIT ? OFFSET ?"
-        ));
-        params_vec.push(Box::new(limit));
-        params_vec.push(Box::new(offset));
-
-        let conn = self.conn();
-        let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
-        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-            params_vec.iter().map(|p| p.as_ref()).collect();
-        let rows = stmt
-            .query_map(param_refs.as_slice(), |r| {
-                Ok(AlbumGroupDto {
-                    artist: r.get(0)?,
-                    album: r.get(1)?,
-                    track_count: r.get(2)?,
-                })
-            })
-            .map_err(|e| e.to_string())?;
-        rows.collect::<Result<Vec<_>, _>>()
-            .map_err(|e| e.to_string())
-    }
-
-    fn album_file_ids(&self, artist: &str, album: &str) -> Result<Vec<i64>, String> {
-        let artist_expr = Self::album_artist_expr();
-        let album_expr = Self::album_name_expr();
-        let sql = format!(
-            "SELECT cf.id FROM collection_files cf
-             JOIN collections c ON c.id = cf.collection_id
-             JOIN library_roots r ON r.id = c.root_id AND r.is_available = 1
-             WHERE c.kind = 'music' AND cf.unavailable = 0
-               AND LOWER({artist_expr}) = LOWER(?1)
-               AND LOWER({album_expr}) = LOWER(?2)
-             ORDER BY LOWER({artist_expr}), LOWER({album_expr}), c.sort_title, cf.disc_index, cf.track_order, cf.path"
-        );
-        let mut stmt = self.conn().prepare(&sql).map_err(|e| e.to_string())?;
-        let rows = stmt
-            .query_map(params![artist, album], |r| r.get(0))
-            .map_err(|e| e.to_string())?;
-        rows.collect::<Result<Vec<_>, _>>()
-            .map_err(|e| e.to_string())
-    }
-
-    pub fn add_album_to_playlist(
-        &mut self,
-        playlist_id: i64,
-        artist: &str,
-        album: &str,
-    ) -> Result<AddToPlaylistBulkResult, String> {
-        let file_ids = self.album_file_ids(artist, album)?;
-        if file_ids.is_empty() {
-            return Err("No tracks found for this album".into());
-        }
-        self.add_file_ids_to_playlist(playlist_id, file_ids)
-    }
-
     pub fn add_collection_to_playlist(
         &mut self,
         playlist_id: i64,
@@ -4013,20 +4022,6 @@ impl<'a> CatalogService<'a> {
         self.add_file_ids_to_playlist(playlist_id, file_ids)
     }
 
-    pub fn create_playlist_from_album(&mut self, artist: &str, album: &str) -> Result<i64, String> {
-        let file_ids = self.album_file_ids(artist, album)?;
-        if file_ids.is_empty() {
-            return Err("No tracks found for this album".into());
-        }
-        let name = self.ensure_unique_playlist_name(&Self::playlist_name_for_album(
-            artist.trim(),
-            album.trim(),
-        ))?;
-        let playlist_id = self.create_playlist(&name, false)?;
-        self.add_file_ids_to_playlist(playlist_id, file_ids)?;
-        Ok(playlist_id)
-    }
-
     pub fn create_playlist_from_collection(&mut self, collection_id: i64) -> Result<i64, String> {
         let row: (String, Option<String>, Option<String>) = self
             .conn()
@@ -4052,10 +4047,7 @@ impl<'a> CatalogService<'a> {
     }
 
     pub fn rename_playlist(&mut self, playlist_id: i64, name: &str) -> Result<(), String> {
-        let trimmed = name.trim();
-        if trimmed.is_empty() {
-            return Err("Playlist name cannot be empty".into());
-        }
+        let trimmed = validate_user_label(name, "Playlist name", MAX_PLAYLIST_NAME_CHARS)?;
         let now = now_unix();
         let n = self
             .conn_mut()
@@ -4298,11 +4290,31 @@ impl<'a> CatalogService<'a> {
 
     pub fn reorder_playlist_items(&mut self, playlist_id: i64, item_ids: Vec<i64>) -> Result<(), String> {
         if item_ids.is_empty() {
-            return Ok(());
+            return Err("No items to reorder".into());
         }
-        let conn = self.conn_mut();
+        let mut unique = item_ids.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        if unique.len() != item_ids.len() {
+            return Err("Duplicate items in reorder list".into());
+        }
+        let expected: i64 = self
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM user_playlist_items WHERE playlist_id = ?1",
+                [playlist_id],
+                |r| r.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        if item_ids.len() as i64 != expected {
+            return Err("Item list does not match playlist".into());
+        }
+        let tx = self
+            .conn_mut()
+            .transaction()
+            .map_err(|e| e.to_string())?;
         for (order, item_id) in item_ids.iter().enumerate() {
-            let n = conn
+            let n = tx
                 .execute(
                     "UPDATE user_playlist_items SET track_order = ?1 WHERE id = ?2 AND playlist_id = ?3",
                     params![order as i32, item_id, playlist_id],
@@ -4312,6 +4324,7 @@ impl<'a> CatalogService<'a> {
                 return Err("Playlist item not found".into());
             }
         }
+        tx.commit().map_err(|e| e.to_string())?;
         Ok(())
     }
 
@@ -4378,10 +4391,7 @@ impl<'a> CatalogService<'a> {
         file_id: i64,
         display_title: &str,
     ) -> Result<(), String> {
-        let trimmed = display_title.trim();
-        if trimmed.is_empty() {
-            return Err("Title cannot be empty".into());
-        }
+        let trimmed = validate_user_label(display_title, "Title", MAX_LABEL_CHARS)?;
         let collection_id: i64 = self
             .conn()
             .query_row(
@@ -4578,7 +4588,7 @@ impl<'a> CatalogService<'a> {
                 let mut audio = if source_dir.is_file() {
                     vec![source_dir.clone()]
                 } else {
-                    self.collect_audio_files(&root_canon, &source_dir)?
+                    collect_audio_files(&root_canon, &source_dir)?
                 };
                 if audio.is_empty() {
                     return Err("No audio files found in collection folder".into());
@@ -4650,23 +4660,6 @@ impl<'a> CatalogService<'a> {
         Ok(())
     }
 
-    pub fn scan_status_all(&self) -> Result<Vec<ScanStatusDto>, String> {
-        let roots = self.list_roots()?;
-        Ok(roots
-            .into_iter()
-            .map(|r| ScanStatusDto {
-                root_id: r.id,
-                scanning: false,
-                last_scan_at: r.last_scan_at,
-                last_scan_status: r.last_scan_status,
-                collections_found: r.collection_count,
-                collections_total: r.collection_count,
-                tracks_total: r.track_count,
-                tracks_updated: 0,
-            })
-            .collect())
-    }
-
     pub fn collection_mpris_meta(
         &self,
         collection_id: i64,
@@ -4725,15 +4718,14 @@ impl<'a> CatalogService<'a> {
         let root_id = match root_id {
             Some(id) => id,
             None => {
-                let parent = if path.is_dir() {
-                    path.clone()
-                } else {
-                    path.parent()
-                        .ok_or("Invalid path")?
-                        .to_path_buf()
-                };
+                if path.is_file() {
+                    return Err(
+                        "This file is not inside a linked library folder. Link the folder first."
+                            .into(),
+                    );
+                }
                 let dto = self.add_root(AddLibraryRootInput {
-                    path: parent.to_string_lossy().to_string(),
+                    path: path.to_string_lossy().to_string(),
                     label: None,
                     content_kind: kind.as_str().to_string(),
                     scan_rule: Some(ScanRule::default_for(kind).as_str().to_string()),
@@ -4773,7 +4765,7 @@ impl<'a> CatalogService<'a> {
 
         let (layout, files) = match grouping {
             "file-is-item" if path.is_dir() => {
-                let mut audio = self.collect_audio_files(&root_canon, &path)?;
+                let mut audio = collect_audio_files(&root_canon, &path)?;
                 if audio.is_empty() {
                     return Err("No audio files found in folder".into());
                 }
@@ -4816,7 +4808,7 @@ impl<'a> CatalogService<'a> {
             }
             _ if path.is_dir() && kind == ContentKind::Audiobook => gather_audiobook_files(&path),
             _ if path.is_dir() => {
-                let mut audio = self.collect_audio_files(&root_canon, &path)?;
+                let mut audio = collect_audio_files(&root_canon, &path)?;
                 if audio.is_empty() {
                     return Err("No audio files found in folder".into());
                 }
@@ -4996,11 +4988,19 @@ pub fn fetch_metadata_online(req: &MetadataLookupRequest) -> Result<Vec<Metadata
     }
 }
 
-fn covers_data_dir() -> Result<PathBuf, String> {
+pub(crate) fn app_data_dir() -> Result<PathBuf, String> {
     let pd = directories::ProjectDirs::from("com", "chaptercheck", "ChapterCheck")
         .ok_or_else(|| "Cannot resolve application data directory".to_string())?;
-    let dir = pd.data_dir().join("covers");
+    let dir = pd.data_dir();
+    fs::create_dir_all(dir).map_err(|e| format!("Cannot create data directory: {e}"))?;
+    let _ = crate::fs_privacy::restrict_dir_owner_only(dir);
+    Ok(dir.to_path_buf())
+}
+
+pub(crate) fn covers_data_dir() -> Result<PathBuf, String> {
+    let dir = app_data_dir()?.join("covers");
     fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let _ = crate::fs_privacy::restrict_dir_owner_only(&dir);
     Ok(dir)
 }
 
@@ -5016,8 +5016,20 @@ const METADATA_CACHE_TTL_SECS: i64 = 60 * 60 * 24 * 30; // 30 days
 /// the SSRF backstop: every outbound request is checked against it, so a future
 /// bug that lets user input influence the URL can never reach an arbitrary host.
 fn http_allowed(url: &str) -> bool {
-    url.starts_with("https://openlibrary.org/search.json?")
-        || url.starts_with("https://musicbrainz.org/ws/2/")
+    let Ok(parsed) = reqwest::Url::parse(url) else {
+        return false;
+    };
+    if parsed.scheme() != "https" {
+        return false;
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return false;
+    }
+    match parsed.host_str() {
+        Some("openlibrary.org") => parsed.path() == "/search.json",
+        Some("musicbrainz.org") => parsed.path().starts_with("/ws/2/"),
+        _ => false,
+    }
 }
 
 /// Perform a hardened blocking GET and decode JSON.
@@ -5040,6 +5052,7 @@ fn http_get_json_with_retry(url: &str, is_retry: bool) -> Result<serde_json::Val
         .timeout(std::time::Duration::from_secs(12))
         .connect_timeout(std::time::Duration::from_secs(6))
         .user_agent(HTTP_USER_AGENT)
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|e| e.to_string())?;
     let resp = client
@@ -5134,13 +5147,7 @@ fn lookup_musicbrainz(
     if title.is_empty() {
         return Ok(Vec::new());
     }
-    // Build a Lucene query, escaping user input so special characters can never
-    // change the query's meaning, then percent-encode the whole value so the URL
-    // is always well-formed.
-    let mut query = format!("release:{}", lucene_escape(title));
-    if let Some(a) = artist.map(str::trim).filter(|s| !s.is_empty()) {
-        query.push_str(&format!(" AND artist:{}", lucene_escape(a)));
-    }
+    let query = musicbrainz_lucene_query(title, artist);
     let url = format!(
         "https://musicbrainz.org/ws/2/release/?query={}&fmt=json&limit=5",
         urlencoding_encode(&query)
@@ -5213,6 +5220,14 @@ fn lucene_escape(s: &str) -> String {
     out
 }
 
+fn musicbrainz_lucene_query(title: &str, artist: Option<&str>) -> String {
+    let mut query = format!("release:\"{}\"", lucene_escape(title));
+    if let Some(a) = artist.map(str::trim).filter(|s| !s.is_empty()) {
+        query.push_str(&format!(" AND artist:\"{}\"", lucene_escape(a)));
+    }
+    query
+}
+
 fn urlencoding_encode(s: &str) -> String {
     let mut out = String::new();
     for b in s.bytes() {
@@ -5224,6 +5239,12 @@ fn urlencoding_encode(s: &str) -> String {
         }
     }
     out
+}
+
+pub(crate) const MAX_COVER_BYTES: usize = 8 * 1024 * 1024;
+
+pub(crate) fn embedded_cover_fits(len: usize) -> bool {
+    len > 0 && len <= MAX_COVER_BYTES
 }
 
 fn extract_cover_from_file(
@@ -5240,6 +5261,9 @@ fn extract_cover_from_file(
         .iter()
         .find(|p| p.pic_type() == PictureType::CoverFront)
         .or_else(|| tag.pictures().first())?;
+    if !embedded_cover_fits(picture.data().len()) {
+        return None;
+    }
     let ext = match picture.mime_type() {
         Some(lofty::picture::MimeType::Png) => "png",
         Some(lofty::picture::MimeType::Jpeg) => "jpg",
@@ -5247,6 +5271,7 @@ fn extract_cover_from_file(
     };
     let dest = covers_dir.join(format!("{collection_id}.{ext}"));
     fs::write(&dest, picture.data()).ok()?;
+    let _ = crate::fs_privacy::restrict_file_owner_only(&dest);
     Some(dest)
 }
 
@@ -5257,6 +5282,8 @@ mod tests {
     use rusqlite::params;
     use std::fs;
     use std::path::PathBuf;
+    use std::sync::mpsc;
+    use std::time::Duration;
 
     fn seed_collection(
         db: &mut LibraryDb,
@@ -5436,5 +5463,805 @@ mod tests {
         assert_eq!(in_progress.total, 1);
         assert_eq!(in_progress.items[0].title, "Alpha");
         let _ = fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn import_folder_like_underscore_does_not_match_sibling() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!("cc_like_wild_{stamp}"));
+        let folder_a = base.join("book_a");
+        let folder_b = base.join("bookXa");
+        fs::create_dir_all(&folder_a).unwrap();
+        fs::create_dir_all(&folder_b).unwrap();
+        let file_a = folder_a.join("ch1.mp3");
+        let file_b = folder_b.join("other.mp3");
+        fs::write(&file_a, b"a").unwrap();
+        fs::write(&file_b, b"b").unwrap();
+        let file_a = fs::canonicalize(&file_a).unwrap();
+        let file_b = fs::canonicalize(&file_b).unwrap();
+        let folder_a = fs::canonicalize(&folder_a).unwrap();
+
+        let mut db = LibraryDb::open_in_memory().unwrap();
+        let now = 1_i64;
+        let root_path = fs::canonicalize(&base).unwrap().to_string_lossy().to_string();
+        db.connection_mut()
+            .execute(
+                "INSERT INTO library_roots (path, label, content_kind, scan_rule, scan_subfolders, is_available, created_at, updated_at)
+                 VALUES (?1, 'T', 'music', 'file-is-item', 1, 1, ?2, ?2)",
+                params![root_path.as_str(), now],
+            )
+            .unwrap();
+        let root_id = db.connection().last_insert_rowid();
+        db.connection_mut()
+            .execute(
+                "INSERT INTO collections (root_id, kind, title, sort_title, layout_kind, created_at, updated_at)
+                 VALUES (?1, 'music', 'A', 'A', 'single_file', ?2, ?2)",
+                params![root_id, now],
+            )
+            .unwrap();
+        let col_a = db.connection().last_insert_rowid();
+        db.connection_mut()
+            .execute(
+                "INSERT INTO collections (root_id, kind, title, sort_title, layout_kind, created_at, updated_at)
+                 VALUES (?1, 'music', 'B', 'B', 'single_file', ?2, ?2)",
+                params![root_id, now],
+            )
+            .unwrap();
+        let col_b = db.connection().last_insert_rowid();
+        db.connection_mut()
+            .execute(
+                "INSERT INTO collection_files (collection_id, path, display_title, label, track_order, created_at, updated_at)
+                 VALUES (?1, ?2, 'a', 'a', 0, ?3, ?3)",
+                params![col_a, file_a.to_string_lossy().as_ref(), now],
+            )
+            .unwrap();
+        db.connection_mut()
+            .execute(
+                "INSERT INTO collection_files (collection_id, path, display_title, label, track_order, created_at, updated_at)
+                 VALUES (?1, ?2, 'b', 'b', 0, ?3, ?3)",
+                params![col_b, file_b.to_string_lossy().as_ref(), now],
+            )
+            .unwrap();
+
+        let cat = CatalogService::new(&mut db);
+        let ids = cat.collection_file_ids_under_folder(&folder_a).unwrap();
+        assert_eq!(
+            ids.len(),
+            1,
+            "underscore in folder name must not LIKE-match a sibling folder; got {ids:?}"
+        );
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn http_allowed_rejects_offlist_and_prefix_tricks() {
+        assert!(http_allowed(
+            "https://openlibrary.org/search.json?title=Dune"
+        ));
+        assert!(http_allowed(
+            "https://musicbrainz.org/ws/2/release/?query=x"
+        ));
+        assert!(!http_allowed("http://openlibrary.org/search.json?title=Dune"));
+        assert!(!http_allowed("https://evil.example/search.json?"));
+        assert!(!http_allowed(
+            "https://openlibrary.org.evil.example/search.json?title=x"
+        ));
+        assert!(!http_allowed("https://musicbrainz.org.evil/ws/2/"));
+        assert!(!http_allowed("file:///etc/passwd"));
+        assert!(!http_allowed(""));
+        assert!(
+            !http_allowed("https://evil@openlibrary.org/search.json?title=x"),
+            "userinfo must not smuggle a second host"
+        );
+        assert!(!http_allowed(
+            "https://openlibrary.org@evil.example/search.json?title=x"
+        ));
+        assert!(!http_allowed("https://openlibrary.org/search.json/../admin"));
+    }
+
+    #[test]
+    fn optional_text_sql_keeps_clears_and_sets() {
+        assert_eq!(optional_text_sql(None, "Author").unwrap(), None);
+        assert_eq!(
+            optional_text_sql(Some("   ".into()), "Author").unwrap(),
+            Some(String::new())
+        );
+        assert_eq!(
+            optional_text_sql(Some("  Ada  ".into()), "Author").unwrap(),
+            Some("Ada".into())
+        );
+        assert!(optional_text_sql(Some("x".repeat(501)), "Author").is_err());
+    }
+
+    #[test]
+    fn lucene_query_quotes_operator_words() {
+        let q = musicbrainz_lucene_query("War AND Peace", Some("Leo OR Tolstoy"));
+        assert_eq!(q, "release:\"War AND Peace\" AND artist:\"Leo OR Tolstoy\"");
+        let q = musicbrainz_lucene_query("Sign o' the Times (Deluxe)", None);
+        assert!(q.starts_with("release:\""));
+        assert!(q.contains("\\("));
+        assert!(q.contains("\\)"));
+    }
+
+    #[test]
+    fn sql_like_literal_escapes_wildcards() {
+        assert_eq!(sql_like_literal("book_a/"), "book!_a/");
+        assert_eq!(sql_like_literal("100%"), "100!%");
+        assert_eq!(sql_like_literal("a!b"), "a!!b");
+    }
+
+    #[test]
+    fn list_collections_search_treats_percent_and_underscore_as_literals() {
+        let mut db = LibraryDb::open_in_memory().unwrap();
+        let now = 1_i64;
+        db.connection_mut()
+            .execute(
+                "INSERT INTO library_roots (path, label, content_kind, scan_rule, scan_subfolders, is_available, created_at, updated_at)
+                 VALUES ('/tmp/cc-like-search', 'Test', 'audiobook', 'subfolder-is-item', 1, 1, ?1, ?1)",
+                params![now],
+            )
+            .unwrap();
+        let root_id = db.connection().last_insert_rowid();
+        seed_collection(
+            &mut db,
+            root_id,
+            "100",
+            "audiobook",
+            None,
+            true,
+            &[("/tmp/cc-like-search/a.m4b", 0.0, Some(10.0), None)],
+        );
+        seed_collection(
+            &mut db,
+            root_id,
+            "100%",
+            "audiobook",
+            None,
+            true,
+            &[("/tmp/cc-like-search/b.m4b", 0.0, Some(10.0), None)],
+        );
+        seed_collection(
+            &mut db,
+            root_id,
+            "bookXa",
+            "audiobook",
+            None,
+            true,
+            &[("/tmp/cc-like-search/c.m4b", 0.0, Some(10.0), None)],
+        );
+        seed_collection(
+            &mut db,
+            root_id,
+            "book_a",
+            "audiobook",
+            None,
+            true,
+            &[("/tmp/cc-like-search/d.m4b", 0.0, Some(10.0), None)],
+        );
+        let mut cat = CatalogService::new(&mut db);
+        let pct = cat
+            .list_collections(Some("audiobook"), None, Some("100%"), None, 50, 0)
+            .unwrap();
+        let titles: Vec<&str> = pct.items.iter().map(|i| i.title.as_str()).collect();
+        assert_eq!(titles, vec!["100%"], "LIKE % must not match title 100");
+        let under = cat
+            .list_collections(Some("audiobook"), None, Some("book_a"), None, 50, 0)
+            .unwrap();
+        let titles: Vec<&str> = under.items.iter().map(|i| i.title.as_str()).collect();
+        assert_eq!(titles, vec!["book_a"], "LIKE _ must not match bookXa");
+    }
+
+    #[test]
+    fn add_root_rejects_filesystem_root() {
+        let mut db = LibraryDb::open_in_memory().unwrap();
+        let mut cat = CatalogService::new(&mut db);
+        let result = cat.add_root(AddLibraryRootInput {
+            path: "/".into(),
+            label: None,
+            content_kind: "music".into(),
+            scan_rule: None,
+            scan_subfolders: Some(false),
+        });
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("filesystem root must not be accepted as a library"),
+        };
+        assert!(
+            err.contains("cannot be used as a library"),
+            "got {err}"
+        );
+        assert!(cat.list_roots().unwrap().is_empty());
+    }
+
+    #[test]
+    fn add_to_library_file_outside_roots_does_not_scan_parent() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!("cc_addlib_file_{stamp}"));
+        fs::create_dir_all(&base).unwrap();
+        let track = base.join("lonely.mp3");
+        fs::write(&track, b"x").unwrap();
+
+        let mut db = LibraryDb::open_in_memory().unwrap();
+        let mut cat = CatalogService::new(&mut db);
+        let err = cat
+            .add_to_library(AddToLibraryInput {
+                path: track.to_string_lossy().to_string(),
+                content_kind: "music".into(),
+                grouping: "file-is-item".into(),
+                metadata: CollectionMetadataInput {
+                    title: None,
+                    author: None,
+                    narrator: None,
+                    artist: None,
+                    album: None,
+                    series: None,
+                    series_index: None,
+                },
+            })
+            .unwrap_err();
+        assert!(
+            err.contains("not inside a linked library folder"),
+            "got {err}"
+        );
+        assert!(cat.list_roots().unwrap().is_empty());
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn create_playlist_rejects_empty_and_overlong_names() {
+        let mut db = LibraryDb::open_in_memory().unwrap();
+        let mut cat = CatalogService::new(&mut db);
+        assert!(cat.create_playlist("   ", false).is_err());
+        assert!(cat.create_playlist("", false).is_err());
+        let long = "p".repeat(201);
+        assert!(cat.create_playlist(&long, false).is_err());
+        let id = cat.create_playlist(" Relax ", false).unwrap();
+        assert!(id > 0);
+        let detail = cat.get_playlist_detail(id).unwrap();
+        assert_eq!(detail.name, "Relax");
+    }
+
+    #[test]
+    fn update_collection_metadata_rejects_empty_missing_and_overlong() {
+        let mut db = LibraryDb::open_in_memory().unwrap();
+        db.connection_mut()
+            .execute(
+                "INSERT INTO library_roots (path, label, content_kind, scan_rule, scan_subfolders, is_available, created_at, updated_at)
+                 VALUES ('/tmp/cc_meta_root', 'T', 'music', 'file-is-item', 0, 1, 1, 1)",
+                [],
+            )
+            .unwrap();
+        let root_id = db.connection().last_insert_rowid();
+        db.connection_mut()
+            .execute(
+                "INSERT INTO collections (root_id, kind, title, sort_title, layout_kind, created_at, updated_at)
+                 VALUES (?1, 'music', 'Old', 'old', 'single_file', 1, 1)",
+                [root_id],
+            )
+            .unwrap();
+        let col_id = db.connection().last_insert_rowid();
+        db.connection_mut()
+            .execute(
+                "INSERT INTO collection_files (collection_id, path, display_title, label, track_order, created_at, updated_at)
+                 VALUES (?1, '/tmp/cc_meta_root/a.mp3', 'ch', 'ch', 0, 1, 1)",
+                [col_id],
+            )
+            .unwrap();
+
+        let mut cat = CatalogService::new(&mut db);
+        let empty = CollectionMetadataInput {
+            title: Some("   ".into()),
+            author: None,
+            narrator: None,
+            artist: None,
+            album: None,
+            series: None,
+            series_index: None,
+        };
+        let err = cat
+            .update_collection_metadata(col_id, empty)
+            .expect_err("blank title must not be stored");
+        assert!(
+            err.to_lowercase().contains("empty") || err.to_lowercase().contains("title"),
+            "got {err}"
+        );
+
+        let long = CollectionMetadataInput {
+            title: Some("T".repeat(501)),
+            author: None,
+            narrator: None,
+            artist: None,
+            album: None,
+            series: None,
+            series_index: None,
+        };
+        assert!(
+            cat.update_collection_metadata(col_id, long).is_err(),
+            "501-character title must be rejected"
+        );
+
+        let missing = CollectionMetadataInput {
+            title: Some("Nope".into()),
+            author: None,
+            narrator: None,
+            artist: None,
+            album: None,
+            series: None,
+            series_index: None,
+        };
+        assert!(
+            cat.update_collection_metadata(99_999, missing).is_err(),
+            "unknown collection id must not report success"
+        );
+
+        let ok = CollectionMetadataInput {
+            title: Some(" New Title ".into()),
+            author: None,
+            narrator: None,
+            artist: None,
+            album: None,
+            series: None,
+            series_index: None,
+        };
+        cat.update_collection_metadata(col_id, ok).unwrap();
+        let detail = cat.get_collection_detail(col_id).unwrap();
+        assert_eq!(detail.title, "New Title");
+
+        cat.update_collection_metadata(
+            col_id,
+            CollectionMetadataInput {
+                title: None,
+                author: Some("  Frank  ".into()),
+                narrator: None,
+                artist: None,
+                album: None,
+                series: None,
+                series_index: Some(3),
+            },
+        )
+        .unwrap();
+        let detail = cat.get_collection_detail(col_id).unwrap();
+        assert_eq!(detail.author.as_deref(), Some("Frank"));
+        assert_eq!(detail.series_index, Some(3));
+
+        cat.update_collection_metadata(
+            col_id,
+            CollectionMetadataInput {
+                title: None,
+                author: Some("   ".into()),
+                narrator: None,
+                artist: None,
+                album: None,
+                series: None,
+                series_index: None,
+            },
+        )
+        .unwrap();
+        let detail = cat.get_collection_detail(col_id).unwrap();
+        assert!(
+            detail.author.is_none(),
+            "empty author must clear the stored value, got {:?}",
+            detail.author
+        );
+        assert_eq!(detail.series_index, Some(3), "omitted series_index must stay");
+
+        let bad_index = CollectionMetadataInput {
+            title: None,
+            author: None,
+            narrator: None,
+            artist: None,
+            album: None,
+            series: None,
+            series_index: Some(-1),
+        };
+        assert!(
+            cat.update_collection_metadata(col_id, bad_index).is_err(),
+            "negative series index must be rejected"
+        );
+        let huge_index = CollectionMetadataInput {
+            title: None,
+            author: None,
+            narrator: None,
+            artist: None,
+            album: None,
+            series: None,
+            series_index: Some(10_001),
+        };
+        assert!(
+            cat.update_collection_metadata(col_id, huge_index).is_err(),
+            "series index above 10000 must be rejected"
+        );
+
+        assert!(
+            cat.update_file_display_title(1, "   ").is_err(),
+            "blank display title must be rejected"
+        );
+        assert!(cat.update_file_display_title(1, &"x".repeat(501)).is_err());
+        cat.update_file_display_title(1, " Chapter 1 ").unwrap();
+        let detail = cat.get_collection_detail(col_id).unwrap();
+        assert_eq!(detail.files[0].display_title, "Chapter 1");
+    }
+
+    #[test]
+    fn list_metadata_groups_clamps_huge_limit() {
+        let mut db = LibraryDb::open_in_memory().unwrap();
+        let cat = CatalogService::new(&mut db);
+        let got = cat
+            .list_metadata_groups("artist", None, i64::MAX, -5)
+            .unwrap();
+        assert!(got.is_empty());
+    }
+
+    #[test]
+    fn path_delete_allowed_requires_available_registered_root() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!("cc_del_root_{stamp}"));
+        fs::create_dir_all(&base).unwrap();
+        let inside = base.join("ch.mp3");
+        fs::write(&inside, b"x").unwrap();
+        let outside = std::env::temp_dir().join(format!("cc_del_out_{stamp}.mp3"));
+        fs::write(&outside, b"x").unwrap();
+
+        let mut db = LibraryDb::open_in_memory().unwrap();
+        let mut cat = CatalogService::new(&mut db);
+        cat.add_root(AddLibraryRootInput {
+            path: base.to_string_lossy().into_owned(),
+            label: Some("del-test".into()),
+            content_kind: "audiobook".into(),
+            scan_rule: None,
+            scan_subfolders: Some(false),
+        })
+        .unwrap();
+
+        assert!(
+            cat.path_delete_allowed(&inside).is_ok(),
+            "file under an available root must be deletable"
+        );
+        let err = cat.path_delete_allowed(&outside).unwrap_err();
+        assert!(
+            err.contains("not under a registered library root"),
+            "got {err}"
+        );
+
+        db.connection_mut()
+            .execute("UPDATE library_roots SET is_available = 0", [])
+            .unwrap();
+        let err = CatalogService::new(&mut db)
+            .path_delete_allowed(&inside)
+            .unwrap_err();
+        assert!(
+            err.contains("not connected") || err.contains("not accessible"),
+            "got {err}"
+        );
+
+        let _ = fs::remove_file(&outside);
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn embedded_cover_fits_rejects_empty_and_oversize() {
+        assert!(!embedded_cover_fits(0));
+        assert!(embedded_cover_fits(1));
+        assert!(embedded_cover_fits(MAX_COVER_BYTES));
+        assert!(!embedded_cover_fits(MAX_COVER_BYTES + 1));
+    }
+
+    #[test]
+    fn covers_live_beside_library_db_not_under_tauri_bundle_id() {
+        let data = app_data_dir().unwrap();
+        let name = data.file_name().and_then(|s| s.to_str()).unwrap_or("");
+        assert_eq!(
+            name, "chaptercheck",
+            "directories crate data dir must be …/chaptercheck, not Tauri $DATA (…/com.chaptercheck)"
+        );
+        assert_eq!(covers_data_dir().unwrap(), data.join("covers"));
+        let conf = include_str!("../tauri.conf.json");
+        assert!(
+            conf.contains("$HOME/.local/share/chaptercheck/covers/**"),
+            "asset scope must match the default cover cache"
+        );
+        assert!(
+            !conf.contains("$DATA/chaptercheck/covers"),
+            "$DATA is ~/.local/share/com.chaptercheck — that is not where covers are written"
+        );
+    }
+
+    #[test]
+    fn add_root_rejects_overlong_label_and_home_directory() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!("cc_addroot_label_{stamp}"));
+        fs::create_dir_all(&base).unwrap();
+
+        let mut db = LibraryDb::open_in_memory().unwrap();
+        let mut cat = CatalogService::new(&mut db);
+        let err = match cat.add_root(AddLibraryRootInput {
+            path: base.to_string_lossy().into_owned(),
+            label: Some("L".repeat(501)),
+            content_kind: "music".into(),
+            scan_rule: None,
+            scan_subfolders: Some(false),
+        }) {
+            Err(e) => e,
+            Ok(_) => panic!("501-character library label must be rejected"),
+        };
+        assert!(
+            err.to_lowercase().contains("long")
+                || err.to_lowercase().contains("folder")
+                || err.to_lowercase().contains("label"),
+            "got {err}"
+        );
+        assert!(
+            cat.list_roots().unwrap().is_empty(),
+            "rejected label must not insert a library root"
+        );
+
+        if let Ok(home) = std::env::var("HOME") {
+            if PathBuf::from(&home).is_dir() {
+                let (tx, rx) = mpsc::channel();
+                std::thread::spawn(move || {
+                    let mut db = LibraryDb::open_in_memory().unwrap();
+                    let mut cat = CatalogService::new(&mut db);
+                    let result = cat.add_root(AddLibraryRootInput {
+                        path: home,
+                        label: None,
+                        content_kind: "music".into(),
+                        scan_rule: None,
+                        scan_subfolders: Some(false),
+                    });
+                    let _ = tx.send(result.map(|_| ()));
+                });
+                let result = rx
+                    .recv_timeout(Duration::from_secs(3))
+                    .expect("add_root($HOME) must reject before scanning the home tree");
+                let err = result.expect_err("home directory must not be accepted as a library root");
+                assert!(
+                    err.contains("cannot be used as a library"),
+                    "got {err}"
+                );
+            }
+        }
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn reorder_playlist_rejects_partial_item_list() {
+        let mut db = LibraryDb::open_in_memory().unwrap();
+        db.connection_mut()
+            .execute(
+                "INSERT INTO library_roots (path, label, content_kind, scan_rule, scan_subfolders, is_available, created_at, updated_at)
+                 VALUES ('/tmp/cc_reorder_root', 'T', 'music', 'file-is-item', 0, 1, 1, 1)",
+                [],
+            )
+            .unwrap();
+        let root_id = db.connection().last_insert_rowid();
+        db.connection_mut()
+            .execute(
+                "INSERT INTO collections (root_id, kind, title, sort_title, layout_kind, created_at, updated_at)
+                 VALUES (?1, 'music', 'Album', 'album', 'flat_multi', 1, 1)",
+                [root_id],
+            )
+            .unwrap();
+        let col_id = db.connection().last_insert_rowid();
+        for (i, name) in ["a.mp3", "b.mp3", "c.mp3"].iter().enumerate() {
+            db.connection_mut()
+                .execute(
+                    "INSERT INTO collection_files (collection_id, path, display_title, label, track_order, created_at, updated_at)
+                     VALUES (?1, ?2, ?3, ?3, ?4, 1, 1)",
+                    params![
+                        col_id,
+                        format!("/tmp/cc_reorder_root/{name}"),
+                        name,
+                        i as i32
+                    ],
+                )
+                .unwrap();
+        }
+        let file_ids: Vec<i64> = db
+            .connection()
+            .prepare("SELECT id FROM collection_files WHERE collection_id = ?1 ORDER BY track_order")
+            .unwrap()
+            .query_map([col_id], |r| r.get(0))
+            .unwrap()
+            .filter_map(|x| x.ok())
+            .collect();
+        assert_eq!(file_ids.len(), 3);
+
+        let mut cat = CatalogService::new(&mut db);
+        let playlist_id = cat.create_playlist("Queue", false).unwrap();
+        for fid in &file_ids {
+            cat.add_to_playlist(playlist_id, *fid).unwrap();
+        }
+        let before = cat.get_playlist_detail(playlist_id).unwrap();
+        assert_eq!(before.items.len(), 3);
+        let original_ids: Vec<i64> = before.items.iter().map(|i| i.id).collect();
+
+        let err = cat
+            .reorder_playlist_items(playlist_id, vec![original_ids[1], original_ids[0]])
+            .expect_err("partial reorder must be rejected");
+        assert!(
+            err.to_lowercase().contains("match") || err.to_lowercase().contains("item"),
+            "got {err}"
+        );
+
+        let after = cat.get_playlist_detail(playlist_id).unwrap();
+        let after_ids: Vec<i64> = after.items.iter().map(|i| i.id).collect();
+        assert_eq!(
+            after_ids, original_ids,
+            "failed partial reorder must leave the original order"
+        );
+
+        let reversed: Vec<i64> = original_ids.iter().rev().copied().collect();
+        cat.reorder_playlist_items(playlist_id, reversed.clone())
+            .unwrap();
+        let flipped: Vec<i64> = cat
+            .get_playlist_detail(playlist_id)
+            .unwrap()
+            .items
+            .iter()
+            .map(|i| i.id)
+            .collect();
+        assert_eq!(flipped, reversed, "a full permutation must be stored");
+    }
+
+    #[test]
+    fn collect_audio_files_survives_symlink_directory_cycle() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!("cc_scan_cycle_{stamp}"));
+        fs::create_dir_all(base.join("a")).unwrap();
+        fs::create_dir_all(base.join("b")).unwrap();
+        fs::write(base.join("a/one.mp3"), b"x").unwrap();
+        fs::write(base.join("b/two.mp3"), b"x").unwrap();
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(base.join("b"), base.join("a/to_b")).unwrap();
+            std::os::unix::fs::symlink(base.join("a"), base.join("b/to_a")).unwrap();
+        }
+        let (tx, rx) = mpsc::channel();
+        let root = base.clone();
+        std::thread::spawn(move || {
+            let result = collect_audio_files(&root, &root);
+            let _ = tx.send(result);
+        });
+        let files = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("symlink cycle must not hang the scanner")
+            .expect("cycle walk must succeed");
+        assert_eq!(files.len(), 2, "each track once, not an infinite walk");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn collect_audio_files_bounded_rejects_over_file_cap() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!("cc_scan_cap_{stamp}"));
+        fs::create_dir_all(&base).unwrap();
+        for i in 0..5 {
+            fs::write(base.join(format!("{i}.mp3")), b"x").unwrap();
+        }
+        let err = collect_audio_files_bounded(&base, &base, 3, 50).unwrap_err();
+        assert!(
+            err.contains("too many audio files"),
+            "got {err}"
+        );
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn add_root_rolls_back_when_scan_hits_a_symlink_escape() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let parent = std::env::temp_dir().join(format!("cc_scan_rollback_{stamp}"));
+        let base = parent.join("library");
+        fs::create_dir_all(&base).unwrap();
+        fs::write(parent.join("secret.mp3"), b"x").unwrap();
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(parent.join("secret.mp3"), base.join("escape.mp3")).unwrap();
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = fs::remove_dir_all(&parent);
+            return;
+        }
+        let mut db = LibraryDb::open_in_memory().unwrap();
+        let mut cat = CatalogService::new(&mut db);
+        let result = cat.add_root(AddLibraryRootInput {
+            path: base.to_string_lossy().into_owned(),
+            label: Some("Rollback".into()),
+            content_kind: "music".into(),
+            scan_rule: Some("file-is-item".into()),
+            scan_subfolders: Some(false),
+        });
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("symlink escape during scan must fail the link"),
+        };
+        assert!(
+            err.to_lowercase().contains("outside") || err.to_lowercase().contains("library root"),
+            "got {err}"
+        );
+        assert!(
+            cat.list_roots().unwrap().is_empty(),
+            "failed first-time scan must not leave an orphan library root"
+        );
+        let _ = fs::remove_dir_all(&parent);
+    }
+
+    #[test]
+    fn list_dir_children_rejects_over_item_cap() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!("cc_scan_items_{stamp}"));
+        fs::create_dir_all(&base).unwrap();
+        for i in 0..5 {
+            fs::create_dir_all(base.join(format!("book{i}"))).unwrap();
+        }
+        let err = list_dir_children(&base, 3).unwrap_err();
+        assert!(err.contains("too many items"), "got {err}");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn failed_rescan_marks_error_and_keeps_the_root() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let parent = std::env::temp_dir().join(format!("cc_scan_errstat_{stamp}"));
+        let base = parent.join("library");
+        fs::create_dir_all(&base).unwrap();
+        let mut db = LibraryDb::open_in_memory().unwrap();
+        let mut cat = CatalogService::new(&mut db);
+        cat.add_root(AddLibraryRootInput {
+            path: base.to_string_lossy().into_owned(),
+            label: Some("Keep me".into()),
+            content_kind: "music".into(),
+            scan_rule: Some("file-is-item".into()),
+            scan_subfolders: Some(false),
+        })
+        .expect("empty folder should link");
+        fs::write(parent.join("secret.mp3"), b"x").unwrap();
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(parent.join("secret.mp3"), base.join("escape.mp3")).unwrap();
+        }
+        let err = match cat.scan_root(cat.list_roots().unwrap()[0].id) {
+            Err(e) => e,
+            Ok(_) => panic!("escape during rescan must fail"),
+        };
+        assert!(
+            err.to_lowercase().contains("outside") || err.to_lowercase().contains("library root"),
+            "got {err}"
+        );
+        let roots = cat.list_roots().unwrap();
+        assert_eq!(roots.len(), 1, "existing library must survive a failed rescan");
+        assert_eq!(
+            roots[0].last_scan_status.as_deref(),
+            Some("error"),
+            "UI must see that the last scan did not finish"
+        );
+        let _ = fs::remove_dir_all(&parent);
     }
 }

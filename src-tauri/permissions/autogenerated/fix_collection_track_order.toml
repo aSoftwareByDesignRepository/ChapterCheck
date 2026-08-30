@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-fix-collection-track-order"
+description = "Enables the fix_collection_track_order command without any pre-configured scope."
+commands.allow = ["fix_collection_track_order"]
+
+[[permission]]
+identifier = "deny-fix-collection-track-order"
+description = "Denies the fix_collection_track_order command without any pre-configured scope."
+commands.deny = ["fix_collection_track_order"]

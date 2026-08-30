@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-confirm-enable-online-metadata"
+description = "Enables the confirm_enable_online_metadata command without any pre-configured scope."
+commands.allow = ["confirm_enable_online_metadata"]
+
+[[permission]]
+identifier = "deny-confirm-enable-online-metadata"
+description = "Denies the confirm_enable_online_metadata command without any pre-configured scope."
+commands.deny = ["confirm_enable_online_metadata"]

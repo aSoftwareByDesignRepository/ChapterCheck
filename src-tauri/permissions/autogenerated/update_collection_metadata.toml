@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-update-collection-metadata"
+description = "Enables the update_collection_metadata command without any pre-configured scope."
+commands.allow = ["update_collection_metadata"]
+
+[[permission]]
+identifier = "deny-update-collection-metadata"
+description = "Denies the update_collection_metadata command without any pre-configured scope."
+commands.deny = ["update_collection_metadata"]

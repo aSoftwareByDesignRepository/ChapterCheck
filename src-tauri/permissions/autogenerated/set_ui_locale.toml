@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-set-ui-locale"
+description = "Enables the set_ui_locale command without any pre-configured scope."
+commands.allow = ["set_ui_locale"]
+
+[[permission]]
+identifier = "deny-set-ui-locale"
+description = "Denies the set_ui_locale command without any pre-configured scope."
+commands.deny = ["set_ui_locale"]

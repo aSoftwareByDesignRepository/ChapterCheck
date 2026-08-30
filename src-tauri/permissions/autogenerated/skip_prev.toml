@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-skip-prev"
+description = "Enables the skip_prev command without any pre-configured scope."
+commands.allow = ["skip_prev"]
+
+[[permission]]
+identifier = "deny-skip-prev"
+description = "Denies the skip_prev command without any pre-configured scope."
+commands.deny = ["skip_prev"]

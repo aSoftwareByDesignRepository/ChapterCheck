@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-list-collection-ids"
+description = "Enables the list_collection_ids command without any pre-configured scope."
+commands.allow = ["list_collection_ids"]
+
+[[permission]]
+identifier = "deny-list-collection-ids"
+description = "Denies the list_collection_ids command without any pre-configured scope."
+commands.deny = ["list_collection_ids"]

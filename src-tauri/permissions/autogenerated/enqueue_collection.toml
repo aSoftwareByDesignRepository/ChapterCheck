@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-enqueue-collection"
+description = "Enables the enqueue_collection command without any pre-configured scope."
+commands.allow = ["enqueue_collection"]
+
+[[permission]]
+identifier = "deny-enqueue-collection"
+description = "Denies the enqueue_collection command without any pre-configured scope."
+commands.deny = ["enqueue_collection"]

@@ -20,6 +20,15 @@ pub struct LibraryDb {
 }
 
 impl LibraryDb {
+    pub fn is_sqlite_busy(err: &rusqlite::Error) -> bool {
+        matches!(
+            err,
+            rusqlite::Error::SqliteFailure(f, _)
+                if f.code == rusqlite::ErrorCode::DatabaseBusy
+                    || f.code == rusqlite::ErrorCode::DatabaseLocked
+        )
+    }
+
     fn apply_migrations(conn: &Connection) -> Result<(), DbError> {
         conn.execute_batch(
             "
@@ -165,13 +174,20 @@ impl LibraryDb {
             let _ = std::fs::create_dir_all(parent);
         }
         let conn = Connection::open(path)?;
+        // WAL allows a sidecar scan connection; writers wait instead of SQLITE_BUSY.
+        conn.busy_timeout(std::time::Duration::from_millis(8_000))?;
         Self::apply_migrations(&conn)?;
+        if let Some(parent) = path.parent() {
+            let _ = crate::fs_privacy::restrict_dir_owner_only(parent);
+        }
+        crate::fs_privacy::restrict_sqlite_sidecars(path);
         Ok(Self { conn })
     }
 
     #[cfg(test)]
     pub fn open_in_memory() -> Result<Self, DbError> {
         let conn = Connection::open_in_memory()?;
+        conn.busy_timeout(std::time::Duration::from_millis(8_000))?;
         Self::apply_migrations(&conn)?;
         Ok(Self { conn })
     }
@@ -436,5 +452,55 @@ impl LibraryDb {
             .flatten()
             .and_then(|s| s.parse::<f64>().ok())
             .filter(|v| v.is_finite())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::thread;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn is_sqlite_busy_ignores_ordinary_errors() {
+        assert!(!LibraryDb::is_sqlite_busy(
+            &rusqlite::Error::InvalidParameterName("x".into())
+        ));
+    }
+
+    #[test]
+    fn wal_two_connections_can_write_without_busy() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("cc_wal_{stamp}"));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("library.sqlite3");
+        let mut db = LibraryDb::open(&path).unwrap();
+        db.set_setting("init", "1").unwrap();
+        drop(db);
+
+        let path_a = path.clone();
+        let path_b = path.clone();
+        let t1 = thread::spawn(move || {
+            let mut db = LibraryDb::open(&path_a).unwrap();
+            for i in 0..40 {
+                db.set_setting("k", &format!("a{i}")).unwrap();
+            }
+        });
+        let t2 = thread::spawn(move || {
+            let mut db = LibraryDb::open(&path_b).unwrap();
+            for i in 0..40 {
+                db.set_setting("k", &format!("b{i}")).unwrap();
+            }
+        });
+        t1.join().expect("writer a");
+        t2.join().expect("writer b");
+        let db = LibraryDb::open(&path).unwrap();
+        let v = db.get_setting("k").unwrap();
+        assert!(v.is_some());
+        let _ = fs::remove_dir_all(dir);
     }
 }

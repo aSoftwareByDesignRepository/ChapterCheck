@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-set-playback-speed-defaults"
+description = "Enables the set_playback_speed_defaults command without any pre-configured scope."
+commands.allow = ["set_playback_speed_defaults"]
+
+[[permission]]
+identifier = "deny-set-playback-speed-defaults"
+description = "Denies the set_playback_speed_defaults command without any pre-configured scope."
+commands.deny = ["set_playback_speed_defaults"]

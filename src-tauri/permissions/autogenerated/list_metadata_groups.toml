@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-list-metadata-groups"
+description = "Enables the list_metadata_groups command without any pre-configured scope."
+commands.allow = ["list_metadata_groups"]
+
+[[permission]]
+identifier = "deny-list-metadata-groups"
+description = "Denies the list_metadata_groups command without any pre-configured scope."
+commands.deny = ["list_metadata_groups"]

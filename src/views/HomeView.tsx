@@ -1,9 +1,10 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { MediaRow } from "../components/MediaRow";
 import { useI18n } from "../i18n/I18nContext";
 import type { HomeSummaryDto } from "../types/catalog";
+import { homeHasVisibleContent, shouldApplyAsyncResult } from "../utils/viewLogic";
 
 type Props = {
   refreshKey: number;
@@ -12,7 +13,6 @@ type Props = {
   onOpenDetail: (id: number) => void;
   onShuffleRelax: () => void;
   onLinkFolder: () => void;
-  onOpenFolder: () => void;
   onOpenFile: () => void;
   onBrowseAudiobooks: () => void;
   onBrowseMusic: () => void;
@@ -26,7 +26,6 @@ export function HomeView({
   onOpenDetail,
   onShuffleRelax,
   onLinkFolder,
-  onOpenFolder,
   onOpenFile,
   onBrowseAudiobooks,
   onBrowseMusic,
@@ -35,13 +34,17 @@ export function HomeView({
   const { t } = useI18n();
   const [home, setHome] = useState<HomeSummaryDto | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const requestId = useRef(0);
 
   const load = useCallback(async () => {
+    const id = ++requestId.current;
     try {
       const data = await invoke<HomeSummaryDto>("get_home_summary");
+      if (!shouldApplyAsyncResult(id, requestId.current)) return;
       setHome(data);
       setError(null);
     } catch (e) {
+      if (!shouldApplyAsyncResult(id, requestId.current)) return;
       setError(String(e));
     }
   }, []);
@@ -54,23 +57,32 @@ export function HomeView({
   }, [load, refreshKey, home?.scan_in_progress]);
 
   useEffect(() => {
+    let cancelled = false;
     let unlisten: (() => void) | undefined;
     void listen<boolean>("abp:scan-status", () => {
       void load();
     }).then((fn) => {
+      if (cancelled) {
+        fn();
+        return;
+      }
       unlisten = fn;
     });
     return () => {
+      cancelled = true;
       unlisten?.();
     };
   }, [load]);
 
-  if (error) {
+  if (error && !home) {
     return (
-      <div className="view-panel view-panel--center">
+      <div className="view-panel view-panel--center home-error">
         <p className="view-error" role="alert">
           {error}
         </p>
+        <button type="button" className="btn btn-primary" onClick={() => void load()}>
+          {t("home.retry")}
+        </button>
       </div>
     );
   }
@@ -88,53 +100,58 @@ export function HomeView({
   if (!home.has_library) {
     return (
       <div className="view-panel view-panel--center home-welcome home-welcome--simple">
-        <h1 className="view-title">{t("home.welcomeTitle")}</h1>
+        {error ? (
+          <p className="view-error" role="alert">
+            {error}
+          </p>
+        ) : null}
+        <h1 className="view-title home-welcome-brand">{t("app.title")}</h1>
         <p className="view-lead">{t("home.welcomeSimple")}</p>
         <div className="home-welcome-actions">
           <button type="button" className="btn btn-primary btn-hero" onClick={onLinkFolder}>
-            {t("library.linkFolder")}
-          </button>
-          <button type="button" className="btn btn-ghost btn-hero" onClick={onOpenFolder}>
-            {t("sidebar.openFolder")}
-          </button>
-          <button type="button" className="btn btn-ghost btn-hero" onClick={onOpenFile}>
-            {t("sidebar.openFile")}
+            {t("home.addFolderCta")}
           </button>
         </div>
+        <button type="button" className="home-quiet-link" onClick={onOpenFile}>
+          {t("home.playFileOnce")}
+        </button>
       </div>
     );
   }
 
   const continueItem = home.continue_item;
-  const hasShelves = home.in_progress.length > 0 || home.music_shelf.length > 0;
+  const continueId = continueItem && !continueItem.unavailable ? continueItem.id : null;
+  const inProgress = home.in_progress.filter((item) => item.id !== continueId);
+  const showContinue = continueId != null;
+  const showEmpty = !homeHasVisibleContent({
+    continueItem,
+    inProgressCount: inProgress.length,
+    musicCount: home.music_shelf.length,
+  });
 
   return (
     <div className="view-panel home-view">
+      {error ? (
+        <div className="library-prompt-banner" role="alert">
+          <div className="library-prompt-row">
+            <p>{error}</p>
+            <button type="button" className="btn btn-secondary btn-compact" onClick={() => void load()}>
+              {t("home.retry")}
+            </button>
+          </div>
+        </div>
+      ) : null}
       {home.scan_in_progress ? (
         <div className="library-prompt-banner library-prompt-banner--info home-scan-banner" role="status">
           <p>{t("home.scanning")}</p>
         </div>
       ) : null}
-      <header className="home-head">
-        <h1 className="view-title">{t("nav.home")}</h1>
-        <div className="home-head-actions">
-          <button type="button" className="btn btn-ghost btn-compact" onClick={onBrowseAudiobooks}>
-            {t("nav.audiobooks")}
-          </button>
-          <button type="button" className="btn btn-ghost btn-compact" onClick={onBrowseMusic}>
-            {t("nav.music")}
-          </button>
-          <button type="button" className="btn btn-ghost btn-compact" onClick={onShuffleRelax}>
-            {t("home.shuffleRelax")}
-          </button>
-        </div>
-      </header>
 
-      {continueItem && !continueItem.unavailable ? (
+      {showContinue && continueItem ? (
         <section className="home-shelf home-shelf--continue" aria-labelledby="home-continue-heading">
-          <h2 id="home-continue-heading" className="section-title">
+          <h1 id="home-continue-heading" className="section-title">
             {t("home.continueBook")}
-          </h2>
+          </h1>
           <div className="media-list">
             <MediaRow
               item={continueItem}
@@ -145,35 +162,36 @@ export function HomeView({
             />
           </div>
         </section>
-      ) : null}
+      ) : (
+        <header className="home-head">
+          <h1 className="view-title">{t("nav.home")}</h1>
+        </header>
+      )}
 
-      {!hasShelves && !continueItem ? (
+      {showEmpty ? (
         <div className="view-empty view-empty--actions">
           <p className="view-empty-title">{t("home.emptyLibraryTitle")}</p>
           <p className="view-empty-body">{t("home.emptyLibraryBody")}</p>
           <div className="view-empty-actions">
-            <button type="button" className="btn btn-primary" onClick={onBrowseAudiobooks}>
-              {t("nav.audiobooks")}
-            </button>
-            <button type="button" className="btn btn-secondary" onClick={onBrowseMusic}>
-              {t("nav.music")}
+            <button type="button" className="btn btn-primary" onClick={onLinkFolder}>
+              {t("home.addFolderCta")}
             </button>
           </div>
         </div>
       ) : null}
 
-      {home.in_progress.length > 0 ? (
+      {inProgress.length > 0 ? (
         <section className="home-shelf" aria-labelledby="home-inprogress-heading">
           <div className="section-header section-header--row">
             <h2 id="home-inprogress-heading" className="section-title">
               {t("home.inProgress")}
             </h2>
-            <button type="button" className="btn btn-ghost btn-compact" onClick={onBrowseAudiobooks}>
+            <button type="button" className="home-quiet-link" onClick={onBrowseAudiobooks}>
               {t("home.seeAll")}
             </button>
           </div>
           <div className="media-list">
-            {home.in_progress.map((item) => (
+            {inProgress.map((item) => (
               <MediaRow
                 key={item.id}
                 item={item}
@@ -193,9 +211,14 @@ export function HomeView({
             <h2 id="home-music-heading" className="section-title">
               {t("home.yourMusic")}
             </h2>
-            <button type="button" className="btn btn-ghost btn-compact" onClick={onBrowseMusic}>
-              {t("home.seeAll")}
-            </button>
+            <div className="home-shelf-tools">
+              <button type="button" className="btn btn-secondary btn-compact" onClick={onShuffleRelax}>
+                {t("home.shuffleRelax")}
+              </button>
+              <button type="button" className="home-quiet-link" onClick={onBrowseMusic}>
+                {t("home.seeAll")}
+              </button>
+            </div>
           </div>
           <div className="media-list">
             {home.music_shelf.map((item) => (

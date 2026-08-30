@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-find-collection-id-for-path"
+description = "Enables the find_collection_id_for_path command without any pre-configured scope."
+commands.allow = ["find_collection_id_for_path"]
+
+[[permission]]
+identifier = "deny-find-collection-id-for-path"
+description = "Denies the find_collection_id_for_path command without any pre-configured scope."
+commands.deny = ["find_collection_id_for_path"]

@@ -18,8 +18,12 @@ import { AddToPlaylistButton } from "./components/AddToPlaylistButton";
 import { useAddToPlaylist } from "./context/AddToPlaylistContext";
 import { useContextMenu, type ContextMenuEntry } from "./context/ContextMenuContext";
 import { CollectionDetailSheet } from "./components/CollectionDetailSheet";
+import { SleepTimerSheet } from "./components/SleepTimerSheet";
 import { CatalogView } from "./views/CatalogView";
 import { coverUrl } from "./utils/coverUrl";
+import { formatSleepRemaining } from "./utils/sleepDisplay";
+import { nextPausedIntent } from "./utils/playbackIntent";
+import { classifyHostError, sleepPresetSucceeded } from "./utils/viewLogic";
 import { HomeView } from "./views/HomeView";
 import { NowPlayingView } from "./views/NowPlayingView";
 import { LibraryView } from "./views/LibraryView";
@@ -69,6 +73,8 @@ type TransportDto = {
   playback_kind?: string | null;
   active_collection_id?: number | null;
   active_collection_kind?: string | null;
+  sleep_deadline_ms?: number | null;
+  stop_after_track?: boolean;
 };
 
 type RecentOpenDto = {
@@ -272,38 +278,6 @@ function formatQueueItemMeta(artist: string | null | undefined, album: string | 
   return null;
 }
 
-function IconPlay() {
-  return (
-    <svg className="ctrl-icon" viewBox="0 0 24 24" aria-hidden="true">
-      <path fill="currentColor" d="M8 5.25v13.5L18.75 12 8 5.25Z" />
-    </svg>
-  );
-}
-
-function IconPause() {
-  return (
-    <svg className="ctrl-icon" viewBox="0 0 24 24" aria-hidden="true">
-      <path fill="currentColor" d="M6 4.5h4.5v15H6v-15Zm7.5 0H18v15h-4.5v-15Z" />
-    </svg>
-  );
-}
-
-function IconSkipPrev() {
-  return (
-    <svg className="ctrl-icon" viewBox="0 0 24 24" aria-hidden="true">
-      <path fill="currentColor" d="M4 6h2v12H4V6zm12-1L8 12l8 7V5z" />
-    </svg>
-  );
-}
-
-function IconSkipNext() {
-  return (
-    <svg className="ctrl-icon" viewBox="0 0 24 24" aria-hidden="true">
-      <path fill="currentColor" d="M8 5l8 7-8 7V5zm9 1h2v12h-2V6z" />
-    </svg>
-  );
-}
-
 function IconCheck() {
   return (
     <svg className="qa-icon" viewBox="0 0 24 24" aria-hidden="true">
@@ -333,6 +307,9 @@ function IconTrash() {
 export default function App() {
   const [playlist, setPlaylist] = useState<PlaylistDto | null>(null);
   const [transport, setTransport] = useState<TransportDto | null>(null);
+  /** Last known paused flag for Play/Pause (never mpv toggle — that undoes a just-fired sleep timer). */
+  const uiPausedRef = useRef(true);
+  uiPausedRef.current = transport?.paused ?? true;
   const [osMediaActive, setOsMediaActive] = useState(false);
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -355,7 +332,7 @@ export default function App() {
   const modalCloseRef = useRef<HTMLButtonElement>(null);
   const [menuOpen, setMenuOpen] = useState<null | "file" | "playback" | "view" | "help">(null);
   const [modalSheet, setModalSheet] = useState<
-    null | "shortcuts" | "about" | "preferences" | "sleep" | "confirm" | "addLibrary"
+    null | "shortcuts" | "about" | "preferences" | "sleep" | "confirm"
   >(null);
   const [activeView, setActiveView] = useState<AppView>("home");
   const [libraryRoots, setLibraryRoots] = useState<LibraryRootDto[]>([]);
@@ -375,6 +352,7 @@ export default function App() {
   const [confirmDialog, setConfirmDialog] = useState<{
     title: string;
     body: string;
+    extraHint?: string;
     confirmLabel: string;
     danger?: boolean;
     onConfirm: () => void | Promise<void>;
@@ -383,6 +361,7 @@ export default function App() {
     (cfg: {
       title: string;
       body: string;
+      extraHint?: string;
       confirmLabel: string;
       danger?: boolean;
       onConfirm: () => void | Promise<void>;
@@ -413,16 +392,21 @@ export default function App() {
   const [appPrefs, setAppPrefs] = useState<AppPrefsDto | null>(null);
   const [chapters, setChapters] = useState<ChapterDto[]>([]);
   const [sleepDeadlineMs, setSleepDeadlineMs] = useState<number | null>(null);
-  const [sleepPreset, setSleepPreset] = useState<string>("off");
   const [sleepTick, setSleepTick] = useState(0);
+  const [sleepCommandBusy, setSleepCommandBusy] = useState(false);
+  const sleepCommandRef = useRef(false);
   const [stopAfterTrackUi, setStopAfterTrackUi] = useState(false);
-  const stopAfterTrackRef = useRef(false);
-
-  useEffect(() => {
-    stopAfterTrackRef.current = stopAfterTrackUi;
-  }, [stopAfterTrackUi]);
+  const [sleepFiredNotice, setSleepFiredNotice] = useState(false);
 
   const { t, locale, setLocale } = useI18n();
+  const reportError = useCallback(
+    (e: unknown) => {
+      const kind = classifyHostError(e);
+      if (kind === "cancelled") return;
+      setError(t(`hostError.${kind}`));
+    },
+    [t],
+  );
   const { openContextMenu } = useContextMenu();
   const { appendPlaylistContextEntries } = useAddToPlaylist();
 
@@ -553,7 +537,7 @@ export default function App() {
       const t = await invoke<TransportDto>("get_transport");
       setTransport(t);
     } catch (e) {
-      setError(String(e));
+      reportError(e);
     }
   }, []);
 
@@ -659,7 +643,7 @@ export default function App() {
       setModalSheet(null);
       setActiveView((prev) => (prev === "library" ? prev : "home"));
     } catch (e) {
-      setError(String(e));
+      reportError(e);
     } finally {
       setBusy(null);
     }
@@ -780,22 +764,24 @@ export default function App() {
   }, [t]);
 
   useEffect(() => {
-    setSleepDeadlineMs(null);
-  }, [transport?.current_path]);
+    if (!transport) return;
+    setSleepDeadlineMs(transport.sleep_deadline_ms ?? null);
+    setStopAfterTrackUi(!!transport.stop_after_track);
+  }, [transport?.sleep_deadline_ms, transport?.stop_after_track]);
 
   useEffect(() => {
     if (sleepDeadlineMs == null) return;
     const id = window.setInterval(() => {
       setSleepTick((x) => x + 1);
-      if (Date.now() >= sleepDeadlineMs) {
-        setSleepDeadlineMs(null);
-        void invoke("set_paused", { paused: true })
-          .then(() => refreshTransport())
-          .catch((e) => setError(String(e)));
-      }
     }, 500);
     return () => window.clearInterval(id);
-  }, [sleepDeadlineMs, refreshTransport]);
+  }, [sleepDeadlineMs]);
+
+  useEffect(() => {
+    if (!sleepFiredNotice) return;
+    const id = window.setTimeout(() => setSleepFiredNotice(false), 8000);
+    return () => window.clearTimeout(id);
+  }, [sleepFiredNotice]);
 
   useEffect(() => {
     if (!isTauri() || !transport?.current_path || transport.mpv_error) {
@@ -941,6 +927,12 @@ export default function App() {
         void refreshTransport();
         void refreshOsMedia();
       }),
+      listen("abp:sleep-fired", () => {
+        if (!mounted) return;
+        setSleepDeadlineMs(null);
+        setSleepFiredNotice(true);
+        void refreshTransport();
+      }),
     ])
       .then((unlisteners) => {
         const all = () => unlisteners.forEach((u) => u());
@@ -960,7 +952,16 @@ export default function App() {
   useEffect(() => {
     if (!modalSheet) return;
     const savedFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
-    const raf = window.requestAnimationFrame(() => modalCloseRef.current?.focus());
+    const raf = window.requestAnimationFrame(() => {
+      if (modalSheet === "sleep") {
+        const first = modalSheetRef.current?.querySelector<HTMLElement>(
+          ".sleep-preset:not([disabled])",
+        );
+        (first ?? modalCloseRef.current)?.focus();
+        return;
+      }
+      modalCloseRef.current?.focus();
+    });
 
     const trapTab = (e: KeyboardEvent) => {
       if (e.key !== "Tab") return;
@@ -1011,15 +1012,13 @@ export default function App() {
     if (!t) return;
     const eof = !!t.eof;
     if (eof && !eofPrev.current) {
-      if (stopAfterTrackRef.current) {
-        stopAfterTrackRef.current = false;
-        setStopAfterTrackUi(false);
-        eofPrev.current = eof;
-        return;
-      }
+      eofPrev.current = eof;
       void invoke("advance_after_eof")
         .then(() => refreshTransport())
-        .catch((e) => setError(String(e)));
+        .catch((e) => {
+          eofPrev.current = false;
+          reportError(e);
+        });
     }
     eofPrev.current = eof;
   }, [transport, refreshTransport]);
@@ -1054,7 +1053,7 @@ export default function App() {
   useEffect(() => {
     const runTransport = (fn: () => Promise<void>) => {
       setError(null);
-      void fn().catch((e) => setError(String(e)));
+      void fn().catch((e) => reportError(e));
     };
 
     const onLinux =
@@ -1067,11 +1066,15 @@ export default function App() {
       if (tag === "input" || tag === "select" || tag === "textarea" || target?.isContentEditable) {
         return;
       }
+      const role = target?.getAttribute?.("role");
+      if (tag === "button" || tag === "a" || role === "menuitem" || role === "slider" || role === "option") {
+        return;
+      }
 
       if (ev.code === "Space") {
         ev.preventDefault();
         runTransport(async () => {
-          await invoke("toggle_pause");
+          await invoke("set_paused", { paused: nextPausedIntent(uiPausedRef.current) });
           await refreshTransport();
         });
         return;
@@ -1164,7 +1167,7 @@ export default function App() {
       if (ev.code === "MediaPlayPause") {
         ev.preventDefault();
         runTransport(async () => {
-          await invoke("toggle_pause");
+          await invoke("set_paused", { paused: nextPausedIntent(uiPausedRef.current) });
           await refreshTransport();
         });
         return;
@@ -1209,7 +1212,7 @@ export default function App() {
       setActiveView("nowPlaying");
       await refreshTransport();
     } catch (e) {
-      setError(String(e));
+      reportError(e);
     } finally {
       setBusy(null);
     }
@@ -1240,7 +1243,7 @@ export default function App() {
               setCollectionDetailId(null);
             }
           } catch (e) {
-            setError(String(e));
+            reportError(e);
             onCollectionDetailChanged();
           }
         },
@@ -1269,57 +1272,9 @@ export default function App() {
       setActiveView("nowPlaying");
       await refreshTransport();
     } catch (e) {
-      setError(String(e));
+      reportError(e);
     } finally {
       setBusy(null);
-    }
-  };
-
-  const enqueueKindCatalog = async (
-    kind: "music",
-    filter: string | null,
-    search: string | null,
-    position: "next" | "end" = "end",
-  ) => {
-    if (!isTauri()) return;
-    setError(null);
-    const sourceTitle = t("nav.music");
-    try {
-      const result = await invoke<{
-        playlist: PlaylistDto;
-        tracks_added: number;
-        collection_title: string;
-        session_started: boolean;
-        autoplay_started: boolean;
-      }>("enqueue_kind", { kind, filter, search, position });
-      setPlaylist(result.playlist);
-      if (result.session_started && result.autoplay_started) {
-        setActiveView("nowPlaying");
-      } else if (result.session_started) {
-        setScanNotice(
-          t("queue.loadedSession", {
-            count: result.tracks_added,
-            title: sourceTitle,
-          }),
-        );
-        window.setTimeout(() => setScanNotice(null), 6000);
-      } else {
-        const notice =
-          position === "next"
-            ? t("queue.addedNext", {
-                count: result.tracks_added,
-                title: sourceTitle,
-              })
-            : t("queue.addedEnd", {
-                count: result.tracks_added,
-                title: sourceTitle,
-              });
-        setQueueNotice(notice);
-        window.setTimeout(() => setQueueNotice(null), 4000);
-      }
-      await refreshTransport();
-    } catch (e) {
-      setError(String(e));
     }
   };
 
@@ -1364,7 +1319,7 @@ export default function App() {
       }
       await refreshTransport();
     } catch (e) {
-      setError(String(e));
+      reportError(e);
     }
   };
 
@@ -1381,7 +1336,7 @@ export default function App() {
       setActiveView("nowPlaying");
       await refreshTransport();
     } catch (e) {
-      setError(String(e));
+      reportError(e);
     } finally {
       setBusy(null);
     }
@@ -1411,7 +1366,7 @@ export default function App() {
       const pick = available[Math.floor(Math.random() * available.length)]!;
       await playCollection(pick.id, "start", true);
     } catch (e) {
-      setError(String(e));
+      reportError(e);
     }
   };
 
@@ -1432,7 +1387,7 @@ export default function App() {
       );
       window.setTimeout(() => setScanNotice(null), 8000);
     } catch (e) {
-      setError(String(e));
+      reportError(e);
     } finally {
       setBusy(null);
     }
@@ -1445,7 +1400,7 @@ export default function App() {
     try {
       await invoke<string | null>("export_db");
     } catch (e) {
-      setError(String(e));
+      reportError(e);
     } finally {
       setBusy(null);
     }
@@ -1465,7 +1420,7 @@ export default function App() {
           await loadLibraryRoots();
           setLibraryRefreshKey((k) => k + 1);
         } catch (e) {
-          setError(String(e));
+          reportError(e);
         }
       },
     });
@@ -1478,7 +1433,7 @@ export default function App() {
       const dto = await invoke<PlaylistDto | null>("pick_open_folder");
       if (dto) await handleUserSessionOpen(dto, true);
     } catch (e) {
-      setError(String(e));
+      reportError(e);
     } finally {
       setBusy(null);
     }
@@ -1491,7 +1446,7 @@ export default function App() {
       const dto = await invoke<PlaylistDto | null>("pick_open_file");
       if (dto) await handleUserSessionOpen(dto, false);
     } catch (e) {
-      setError(String(e));
+      reportError(e);
     } finally {
       setBusy(null);
     }
@@ -1507,7 +1462,7 @@ export default function App() {
       });
       if (dto) await handleUserSessionOpen(dto, entry.kind === "folder");
     } catch (e) {
-      setError(String(e));
+      reportError(e);
     } finally {
       setBusy(null);
     }
@@ -1525,7 +1480,7 @@ export default function App() {
           await invoke("clear_recent_opened");
           await loadRecent();
         } catch (e) {
-          setError(String(e));
+          reportError(e);
         }
       },
     });
@@ -1538,7 +1493,7 @@ export default function App() {
       const dto = await invoke<PlaylistDto>("resort_playlist", { sort });
       setPlaylist(dto);
     } catch (e) {
-      setError(String(e));
+      reportError(e);
     }
   };
 
@@ -1563,7 +1518,7 @@ export default function App() {
       await invoke("set_repeat_mode", { mode: next });
       await refreshTransport();
     } catch (e) {
-      setError(String(e));
+      reportError(e);
     }
   };
 
@@ -1575,7 +1530,7 @@ export default function App() {
       const p = await invoke<AppPrefsDto>("set_resume_playing_on_launch", { enabled });
       setAppPrefs(p);
     } catch (e) {
-      setError(String(e));
+      reportError(e);
       void loadAppPrefs();
     }
   };
@@ -1588,7 +1543,7 @@ export default function App() {
       const p = await invoke<AppPrefsDto>("set_playlist_shuffle_on_play", { enabled });
       setAppPrefs(p);
     } catch (e) {
-      setError(String(e));
+      reportError(e);
       void loadAppPrefs();
     }
   };
@@ -1602,7 +1557,7 @@ export default function App() {
       if (r.playlist) setPlaylist(r.playlist);
       await refreshTransport();
     } catch (e) {
-      setError(String(e));
+      reportError(e);
     }
   };
 
@@ -1610,10 +1565,13 @@ export default function App() {
     if (!isTauri()) return;
     setError(null);
     try {
+      if (enabled) {
+        await invoke("confirm_enable_online_metadata");
+      }
       const p = await invoke<AppPrefsDto>("set_online_metadata_enabled", { enabled });
       setAppPrefs(p);
     } catch (e) {
-      setError(String(e));
+      reportError(e);
     }
   };
 
@@ -1624,7 +1582,7 @@ export default function App() {
     try {
       await invoke("mark_collection_listened", { collectionId: cid, listened: true });
     } catch (e) {
-      setError(String(e));
+      reportError(e);
     }
   };
 
@@ -1639,7 +1597,7 @@ export default function App() {
       setAppPrefs(p);
       setLocale(normalizeLocale(p.ui_locale));
     } catch (e) {
-      setError(String(e));
+      reportError(e);
     }
   };
 
@@ -1650,19 +1608,66 @@ export default function App() {
       await invoke("recover_mpv");
       await refreshTransport();
     } catch (e) {
-      setError(String(e));
+      reportError(e);
     }
   };
 
-  const startSleep = () => {
-    const m = Number(sleepPreset);
-    if (!Number.isFinite(m) || m <= 0) return;
-    setSleepDeadlineMs(Date.now() + m * 60_000);
-    setSleepTick((x) => x + 1);
+  const startSleep = async (minutes: number): Promise<boolean> => {
+    if (!isTauri()) return false;
+    if (sleepCommandRef.current) return false;
+    sleepCommandRef.current = true;
+    setSleepCommandBusy(true);
+    setError(null);
+    try {
+      const deadline = await invoke<number | null>("set_sleep_timer", { minutes });
+      setSleepDeadlineMs(deadline ?? null);
+      setSleepTick((x) => x + 1);
+      setSleepFiredNotice(false);
+      await refreshTransport();
+      return sleepPresetSucceeded(deadline);
+    } catch (e) {
+      reportError(e);
+      return false;
+    } finally {
+      sleepCommandRef.current = false;
+      setSleepCommandBusy(false);
+    }
   };
 
-  const cancelSleep = () => {
-    setSleepDeadlineMs(null);
+  const cancelSleep = async (): Promise<boolean> => {
+    if (sleepCommandRef.current) return false;
+    if (!isTauri()) {
+      setSleepDeadlineMs(null);
+      return true;
+    }
+    sleepCommandRef.current = true;
+    setSleepCommandBusy(true);
+    setError(null);
+    try {
+      await invoke("set_sleep_timer", { minutes: null });
+      setSleepDeadlineMs(null);
+      await refreshTransport();
+      return true;
+    } catch (e) {
+      reportError(e);
+      return false;
+    } finally {
+      sleepCommandRef.current = false;
+      setSleepCommandBusy(false);
+    }
+  };
+
+  const setStopAfterTrack = async (enabled: boolean) => {
+    setStopAfterTrackUi(enabled);
+    if (!isTauri()) return;
+    setError(null);
+    try {
+      const next = await invoke<boolean>("set_stop_after_track", { enabled });
+      setStopAfterTrackUi(next);
+    } catch (e) {
+      setStopAfterTrackUi(!enabled);
+      reportError(e);
+    }
   };
 
   const playIndex = async (index: number) => {
@@ -1671,7 +1676,7 @@ export default function App() {
       await invoke("play_index", { index });
       await refreshTransport();
     } catch (e) {
-      setError(String(e));
+      reportError(e);
     }
   };
 
@@ -1685,7 +1690,7 @@ export default function App() {
       });
       setPlaylist(dto);
     } catch (e) {
-      setError(String(e));
+      reportError(e);
     }
   };
 
@@ -1703,7 +1708,7 @@ export default function App() {
       if (result.playlist) setPlaylist(result.playlist);
       await refreshTransport();
     } catch (e) {
-      setError(String(e));
+      reportError(e);
     }
   };
 
@@ -1721,7 +1726,7 @@ export default function App() {
           setLibraryRefreshKey((k) => k + 1);
           await refreshTransport();
         } catch (e) {
-          setError(String(e));
+          reportError(e);
         }
       },
     });
@@ -1735,7 +1740,7 @@ export default function App() {
       setPlaylist(dto);
       await refreshTransport();
     } catch (e) {
-      setError(String(e));
+      reportError(e);
     }
   };
 
@@ -1744,11 +1749,13 @@ export default function App() {
     openConfirm({
       title: t("confirm.deleteTrackTitle"),
       body: t("confirm.deleteTrack", { label: item.label }),
+      extraHint: t("confirm.osWillAsk"),
       confirmLabel: t("confirm.deleteTrackBtn"),
       danger: true,
       onConfirm: async () => {
         setError(null);
         try {
+          await invoke("confirm_delete_track_file", { path: item.path });
           const dto = await invoke<PlaylistDto | null>("delete_track_file", {
             path: item.path,
           });
@@ -1756,7 +1763,7 @@ export default function App() {
           await refreshTransport();
           await loadRecent();
         } catch (e) {
-          setError(String(e));
+          reportError(e);
         }
       },
     });
@@ -1769,7 +1776,7 @@ export default function App() {
       const dto = await invoke<PlaylistDto>("mark_session_listened", { listened });
       setPlaylist(dto);
     } catch (e) {
-      setError(String(e));
+      reportError(e);
     }
   };
 
@@ -1778,17 +1785,19 @@ export default function App() {
     openConfirm({
       title: sessionDeleteCopy.confirmTitle,
       body: sessionDeleteCopy.confirmBody,
+      extraHint: t("confirm.osWillAsk"),
       confirmLabel: sessionDeleteCopy.confirmLabel,
       danger: true,
       onConfirm: async () => {
         setError(null);
         try {
+          await invoke("confirm_delete_session_files");
           await invoke("delete_session_files");
           setPlaylist(null);
           await refreshTransport();
           await loadRecent();
         } catch (e) {
-          setError(String(e));
+          reportError(e);
         }
       },
     });
@@ -1797,10 +1806,10 @@ export default function App() {
   const togglePause = async () => {
     setError(null);
     try {
-      await invoke("toggle_pause");
+      await invoke("set_paused", { paused: nextPausedIntent(uiPausedRef.current) });
       await refreshTransport();
     } catch (e) {
-      setError(String(e));
+      reportError(e);
     }
   };
 
@@ -1810,7 +1819,7 @@ export default function App() {
       await invoke("seek_seconds", { seconds });
       await refreshTransport();
     } catch (e) {
-      setError(String(e));
+      reportError(e);
     }
   };
 
@@ -1820,7 +1829,7 @@ export default function App() {
       await invoke("seek_delta", { delta });
       await refreshTransport();
     } catch (e) {
-      setError(String(e));
+      reportError(e);
     }
   };
 
@@ -1830,7 +1839,7 @@ export default function App() {
       await invoke<number>("set_speed", { speed });
       await refreshTransport();
     } catch (e) {
-      setError(String(e));
+      reportError(e);
     }
   };
 
@@ -1842,7 +1851,7 @@ export default function App() {
       setAppPrefs(p);
       await refreshTransport();
     } catch (e) {
-      setError(String(e));
+      reportError(e);
     }
   };
 
@@ -1852,7 +1861,7 @@ export default function App() {
       await invoke<number>("reset_track_speed_to_default");
       await refreshTransport();
     } catch (e) {
-      setError(String(e));
+      reportError(e);
     }
   };
 
@@ -1864,7 +1873,7 @@ export default function App() {
       setAppPrefs(p);
       await refreshTransport();
     } catch (e) {
-      setError(String(e));
+      reportError(e);
     }
   };
 
@@ -1874,7 +1883,7 @@ export default function App() {
       await invoke("skip_next");
       await refreshTransport();
     } catch (e) {
-      setError(String(e));
+      reportError(e);
     }
   };
 
@@ -1884,7 +1893,7 @@ export default function App() {
       await invoke("skip_prev");
       await refreshTransport();
     } catch (e) {
-      setError(String(e));
+      reportError(e);
     }
   };
 
@@ -1921,12 +1930,6 @@ export default function App() {
     if (t.paused) return "paused";
     return "playing";
   }, [transport]);
-
-  const rootDisplay = useMemo(() => {
-    const r = playlist?.root;
-    if (!r) return null;
-    return r.length > 42 ? `…${r.slice(-40)}` : r;
-  }, [playlist?.root]);
 
   const hasQueue = (playlist?.items.length ?? 0) > 0;
   const hasSession = hasQueue;
@@ -1991,14 +1994,8 @@ export default function App() {
   }, [playlist?.items, queueSearchNorm]);
 
   const sleepRemainLabel = useMemo(() => {
-    if (sleepDeadlineMs == null) return null;
     void sleepTick;
-    const sec = Math.max(0, Math.ceil((sleepDeadlineMs - Date.now()) / 1000));
-    const h = Math.floor(sec / 3600);
-    const m = Math.floor((sec % 3600) / 60);
-    const s = sec % 60;
-    if (h > 0) return `${h}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
-    return `${m}:${String(s).padStart(2, "0")}`;
+    return formatSleepRemaining(sleepDeadlineMs, Date.now());
   }, [sleepDeadlineMs, sleepTick]);
 
   return (
@@ -2360,6 +2357,21 @@ export default function App() {
             </div>
           </div>
         ) : null}
+        {sleepFiredNotice ? (
+          <div className="library-prompt-banner library-prompt-banner--info" role="status">
+            <div className="library-prompt-row">
+              <p>{t("sleep.fired")}</p>
+              <button
+                type="button"
+                className="btn btn-ghost btn-compact"
+                aria-label={t("alert.dismiss")}
+                onClick={() => setSleepFiredNotice(false)}
+              >
+                {t("alert.dismiss")}
+              </button>
+            </div>
+          </div>
+        ) : null}
         {driveNotice ? (
           <div className="library-prompt-banner library-prompt-banner--info" role="status">
             <div className="library-prompt-row">
@@ -2452,7 +2464,7 @@ export default function App() {
       </div>
 
       <div
-        className={`app-body${showQueuePanel ? " app-body--playing" : " app-body--library"}`}
+        className={`app-body${showQueuePanel ? " app-body--playing" : " app-body--library"}${showMiniPlayer ? " app-body--mini" : ""}`}
         {...(modalSheet ? { inert: "" as const } : {})}
       >
         <aside className="sidebar sidebar--left sidebar--nav" aria-label={t("nav.aria")}>
@@ -2466,8 +2478,6 @@ export default function App() {
             linkedFolderCount={libraryRoots.length}
             onLinkFolder={() => void linkLibraryFolder()}
             onManageLibrary={openManageLibrary}
-            onOpenFolder={() => void openFolder()}
-            onOpenFile={() => void openFile()}
           />
           {recent.length > 0 ? (
             <div className="sidebar-section sidebar-section--recent">
@@ -2512,7 +2522,6 @@ export default function App() {
               onOpenDetail={openCollectionDetail}
               onShuffleRelax={() => void shuffleRelax()}
               onLinkFolder={() => void linkLibraryFolder()}
-              onOpenFolder={() => void openFolder()}
               onOpenFile={() => void openFile()}
               onBrowseAudiobooks={() => setActiveView("audiobooks")}
               onBrowseMusic={() => setActiveView("music")}
@@ -2528,7 +2537,6 @@ export default function App() {
               onLibraryChanged={onCollectionDetailChanged}
               openConfirm={openConfirm}
               onLinkFolder={() => void linkLibraryFolder()}
-              onOpenFolder={() => void openFolder()}
               onRemoveCollection={confirmRemoveCollection}
             />
           ) : activeView === "music" ? (
@@ -2546,18 +2554,9 @@ export default function App() {
                   shuffle,
                 )
               }
-              onAddAllToQueue={({ filter, search, position }) =>
-                void enqueueKindCatalog(
-                  "music",
-                  filter === "all" ? null : filter,
-                  search.trim() || null,
-                  position,
-                )
-              }
               onLibraryChanged={onCollectionDetailChanged}
               openConfirm={openConfirm}
               onLinkFolder={() => void linkLibraryFolder()}
-              onOpenFolder={() => void openFolder()}
               onRemoveCollection={confirmRemoveCollection}
             />
           ) : activeView === "library" ? (
@@ -2948,10 +2947,27 @@ export default function App() {
         {showMiniPlayer ? (
           <MiniPlayerBar
             title={currentTitle}
-            paused={!!transport?.paused || !!transport?.eof}
+            paused={!!transport?.paused || !!transport?.eof || !!transport?.idle}
             currentPath={transport?.current_path ?? null}
+            coverSrc={nowCoverSrc}
+            coverKind={playingCollectionKind ?? transport?.playback_kind ?? "audiobook"}
+            position={position}
+            duration={duration}
+            progressMax={progressMax}
+            sliderValue={sliderValue}
+            setSeekUi={setSeekUi}
+            formatClock={formatClock}
+            canSkip={canSkipTransport}
+            canSeek={canSeekTransport}
+            canToggle={canTogglePlayback}
             onExpand={() => setActiveView("nowPlaying")}
             onToggle={() => void togglePause()}
+            onSkipPrev={() => void skipPrev()}
+            onSkipNext={() => void skipNext()}
+            onSeekTo={(sec) => void seekTo(sec)}
+            onSleep={() => setModalSheet("sleep")}
+            sleepActive={sleepDeadlineMs != null}
+            sleepRemainLabel={sleepRemainLabel}
             onOpenDetails={
               playingCollectionId != null
                 ? () => openCollectionDetail(playingCollectionId)
@@ -2973,7 +2989,7 @@ export default function App() {
         >
           <div
             className={`modal-sheet${
-              modalSheet === "preferences" || modalSheet === "sleep" || modalSheet === "addLibrary"
+              modalSheet === "preferences" || modalSheet === "sleep"
                 ? " modal-sheet--prefs"
                 : ""
             }${modalSheet === "confirm" ? " modal-sheet--confirm" : ""}`}
@@ -2987,13 +3003,19 @@ export default function App() {
                   ? "help-about-title"
                   : modalSheet === "preferences"
                     ? "preferences-dialog-title"
-                    : modalSheet === "addLibrary"
-                      ? "add-library-dialog-title"
-                      : modalSheet === "confirm"
-                        ? "confirm-dialog-title"
-                        : "sleep-dialog-title"
+                    : modalSheet === "confirm"
+                      ? "confirm-dialog-title"
+                      : "sleep-dialog-title"
             }
-            aria-describedby={modalSheet === "confirm" ? "confirm-dialog-body" : undefined}
+            aria-describedby={
+              modalSheet === "confirm"
+                ? confirmDialog?.extraHint
+                  ? "confirm-dialog-body confirm-dialog-os-hint"
+                  : "confirm-dialog-body"
+                : modalSheet === "sleep"
+                  ? "sleep-lead"
+                  : undefined
+            }
             onClick={(e) => e.stopPropagation()}
           >
             {modalSheet === "confirm" && confirmDialog ? (
@@ -3004,6 +3026,11 @@ export default function App() {
                 <p className="modal-body modal-body--confirm" id="confirm-dialog-body">
                   {confirmDialog.body}
                 </p>
+                {confirmDialog.extraHint ? (
+                  <p className="modal-body modal-hint" id="confirm-dialog-os-hint">
+                    {confirmDialog.extraHint}
+                  </p>
+                ) : null}
               </>
             ) : modalSheet === "shortcuts" ? (
               <>
@@ -3179,86 +3206,25 @@ export default function App() {
                   </fieldset>
                 </div>
               </>
-            ) : modalSheet === "addLibrary" ? (
-              <>
-                <h2 className="modal-title" id="add-library-dialog-title">
-                  {t("addLibrary.title")}
-                </h2>
-                <p className="modal-body modal-body--tight">{t("addLibrary.body")}</p>
-                <div className="add-library-actions">
-                  <button
-                    type="button"
-                    className="btn btn-primary"
-                    disabled={!isTauri()}
-                    onClick={() => void linkLibraryFolder()}
-                  >
-                    {t("library.linkFolder")}
-                  </button>
-                </div>
-              </>
             ) : (
               <>
                 <h2 className="modal-title" id="sleep-dialog-title">
                   {t("sleep.modalTitle")}
                 </h2>
-                <div className="sleep-card sleep-card--modal" aria-label={t("sleep.cardAria")}>
-                  <div className="speed-card-head">
-                    <span className="field-label">{t("sleep.status")}</span>
-                    {sleepRemainLabel ? (
-                      <div className="speed-readout" aria-live="polite">
-                        {sleepRemainLabel}
-                      </div>
-                    ) : (
-                      <span className="speed-readout speed-readout--dim">{t("sleep.off")}</span>
-                    )}
-                  </div>
-                  <div className="sleep-row">
-                    <label className="sr-only" htmlFor="sleep-preset">
-                      {t("sleep.minutesLabel")}
-                    </label>
-                    <select
-                      id="sleep-preset"
-                      className="select sleep-select"
-                      value={sleepPreset}
-                      onChange={(e) => setSleepPreset(e.target.value)}
-                    >
-                      <option value="off">{t("sleep.preset.off")}</option>
-                      <option value="15">{t("sleep.preset.15")}</option>
-                      <option value="30">{t("sleep.preset.30")}</option>
-                      <option value="45">{t("sleep.preset.45")}</option>
-                      <option value="60">{t("sleep.preset.60")}</option>
-                      <option value="90">{t("sleep.preset.90")}</option>
-                    </select>
-                    <button
-                      className="btn btn-secondary"
-                      type="button"
-                      disabled={sleepPreset === "off" || sleepDeadlineMs != null}
-                      onClick={() => startSleep()}
-                    >
-                      {t("sleep.start")}
-                    </button>
-                    <button
-                      className="btn btn-ghost"
-                      type="button"
-                      disabled={sleepDeadlineMs == null}
-                      onClick={() => cancelSleep()}
-                    >
-                      {t("sleep.cancel")}
-                    </button>
-                  </div>
-                  <label className="prefs-row sleep-stop-row">
-                    <input
-                      type="checkbox"
-                      checked={stopAfterTrackUi}
-                      onChange={(e) => {
-                        setStopAfterTrackUi(e.target.checked);
-                        stopAfterTrackRef.current = e.target.checked;
-                      }}
-                    />
-                    <span>{t("sleep.stopAfter")}</span>
-                  </label>
-                  <p className="hint">{t("sleep.hint")}</p>
-                </div>
+                <SleepTimerSheet
+                  remainingLabel={sleepRemainLabel}
+                  stopAfterTrack={stopAfterTrackUi}
+                  presetsDisabled={!isTauri() || sleepCommandBusy}
+                  onPickMinutes={async (mins) => {
+                    const ok = await startSleep(mins);
+                    if (ok) setModalSheet(null);
+                  }}
+                  onTurnOff={async () => {
+                    const ok = await cancelSleep();
+                    if (ok) setModalSheet(null);
+                  }}
+                  onStopAfterChange={(enabled) => void setStopAfterTrack(enabled)}
+                />
               </>
             )}
             {modalSheet === "confirm" && confirmDialog ? (

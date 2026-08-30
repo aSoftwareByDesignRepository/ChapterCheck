@@ -27,7 +27,6 @@ export function MediaRow({
   onPlay,
   onAddToQueue,
   onOpen,
-  onChanged,
   onRemoveCollection,
   featured,
   selectMode = false,
@@ -66,13 +65,8 @@ export function MediaRow({
   };
 
   const removeCollection = () => {
-    if (onRemoveCollection) {
-      onRemoveCollection(item.id, item.title);
-      return;
-    }
-    void invoke("remove_collection_from_library", { collectionId: item.id })
-      .then(() => onChanged?.())
-      .catch(() => onChanged?.());
+    // Never call remove IPC without a confirm callback — silent remove is an XSS footgun.
+    onRemoveCollection?.(item.id, item.title);
   };
 
   const contextItems = (): ContextMenuEntry[] => {
@@ -116,12 +110,14 @@ export function MediaRow({
         label: t("catalog.fixMissingFiles"),
         onClick: () => onOpen(item.id),
       });
-      items.push({
-        id: "remove-collection",
-        label: t("catalog.removeCollection"),
-        danger: true,
-        onClick: removeCollection,
-      });
+      if (onRemoveCollection) {
+        items.push({
+          id: "remove-collection",
+          label: t("catalog.removeCollection"),
+          danger: true,
+          onClick: removeCollection,
+        });
+      }
     }
     items.push({ type: "separator" });
     items.push({
