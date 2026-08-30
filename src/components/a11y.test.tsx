@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 import axe from "axe-core";
 import { AppNav } from "./AppNav";
 import { MediaCard } from "./MediaCard";
+import { MediaRow } from "./MediaRow";
 import { MiniPlayerBar } from "./MiniPlayerBar";
 import { I18nProvider } from "../i18n/I18nContext";
 import { renderWithProviders } from "../test/renderWithProviders";
@@ -65,6 +66,26 @@ describe("WCAG 2.1 AA (axe-core, jsdom)", () => {
       </I18nProvider>,
     );
     expect(getByRole("button", { name: /continue/i })).toBeTruthy();
+    await expectWcag21Aa(container);
+  });
+
+  it("catalog row exposes one play control and a separate open-details control", async () => {
+    const onPlay = vi.fn();
+    const onOpen = vi.fn();
+    const { container, getByRole } = renderWithProviders(
+      <MediaRow
+        item={sampleCard}
+        onPlay={onPlay}
+        onOpen={onOpen}
+        onAddToQueue={() => undefined}
+      />,
+    );
+    const play = getByRole("button", { name: /continue dune/i });
+    play.click();
+    expect(onPlay).toHaveBeenCalledWith(1, "continue");
+    const open = getByRole("button", { name: /open .dune/i });
+    open.click();
+    expect(onOpen).toHaveBeenCalledWith(1);
     await expectWcag21Aa(container);
   });
 

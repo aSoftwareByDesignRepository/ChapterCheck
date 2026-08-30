@@ -24,6 +24,13 @@ import { coverUrl } from "./utils/coverUrl";
 import { formatSleepRemaining } from "./utils/sleepDisplay";
 import { nextPausedIntent } from "./utils/playbackIntent";
 import { classifyHostError, sleepPresetSucceeded } from "./utils/viewLogic";
+import {
+  applyThemePreference,
+  normalizeThemePreference,
+  readStoredThemePreference,
+  writeStoredThemePreference,
+  type ThemePreference,
+} from "./utils/theme";
 import { HomeView } from "./views/HomeView";
 import { NowPlayingView } from "./views/NowPlayingView";
 import { LibraryView } from "./views/LibraryView";
@@ -390,6 +397,9 @@ export default function App() {
   const [recent, setRecent] = useState<RecentOpenDto[]>([]);
   const [queueSearch, setQueueSearch] = useState("");
   const [appPrefs, setAppPrefs] = useState<AppPrefsDto | null>(null);
+  const [themePreference, setThemePreference] = useState<ThemePreference>(() =>
+    typeof document !== "undefined" ? readStoredThemePreference() : "dark",
+  );
   const [chapters, setChapters] = useState<ChapterDto[]>([]);
   const [sleepDeadlineMs, setSleepDeadlineMs] = useState<number | null>(null);
   const [sleepTick, setSleepTick] = useState(0);
@@ -1600,6 +1610,45 @@ export default function App() {
       reportError(e);
     }
   };
+
+  const changeThemePreference = useCallback(async (next: ThemePreference) => {
+    const pref = normalizeThemePreference(next);
+    setThemePreference(pref);
+    writeStoredThemePreference(pref);
+    const effective = applyThemePreference(pref);
+    if (!isTauri()) return;
+    try {
+      const { getCurrentWindow } = await import("@tauri-apps/api/window");
+      await getCurrentWindow().setTheme(effective);
+    } catch {
+      /* window theme API optional on some hosts */
+    }
+  }, []);
+
+  useEffect(() => {
+    const effective = applyThemePreference(themePreference);
+    if (!isTauri()) return;
+    let cancelled = false;
+    void import("@tauri-apps/api/window")
+      .then(({ getCurrentWindow }) => {
+        if (cancelled) return;
+        return getCurrentWindow().setTheme(effective);
+      })
+      .catch(() => undefined);
+    const mq = window.matchMedia("(prefers-color-scheme: light)");
+    const onScheme = () => {
+      if (themePreference !== "system") return;
+      const next = applyThemePreference("system");
+      void import("@tauri-apps/api/window")
+        .then(({ getCurrentWindow }) => getCurrentWindow().setTheme(next))
+        .catch(() => undefined);
+    };
+    mq.addEventListener("change", onScheme);
+    return () => {
+      cancelled = true;
+      mq.removeEventListener("change", onScheme);
+    };
+  }, [themePreference]);
 
   const recoverMpv = async () => {
     if (!isTauri()) return;
@@ -3080,6 +3129,27 @@ export default function App() {
                         <option value="de">{t("prefs.lang.de")}</option>
                       </select>
                     </label>
+                    <label className="prefs-row prefs-row--select">
+                      <span id="prefs-theme-label">{t("prefs.theme")}</span>
+                      <select
+                        className="select prefs-locale-select"
+                        value={themePreference}
+                        aria-labelledby="prefs-theme-label"
+                        aria-describedby="prefs-theme-hint"
+                        onChange={(e) =>
+                          void changeThemePreference(
+                            normalizeThemePreference(e.target.value),
+                          )
+                        }
+                      >
+                        <option value="dark">{t("prefs.theme.dark")}</option>
+                        <option value="light">{t("prefs.theme.light")}</option>
+                        <option value="system">{t("prefs.theme.system")}</option>
+                      </select>
+                    </label>
+                    <p className="hint prefs-hint" id="prefs-theme-hint">
+                      {t("prefs.themeHint")}
+                    </p>
                   </fieldset>
 
                   <fieldset className="prefs-section">

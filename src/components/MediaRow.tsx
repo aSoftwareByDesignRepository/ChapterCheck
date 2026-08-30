@@ -214,12 +214,13 @@ export function MediaRow({
       <button
         type="button"
         className="media-row-main"
+        aria-label={t("catalog.openDetails", { title: item.title })}
         onClick={() => {
           if (selectMode) {
             onSelectToggle?.(item.id);
             return;
           }
-          handlePlay();
+          onOpen(item.id);
         }}
       >
         <div className="media-row-cover" aria-hidden="true">

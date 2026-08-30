@@ -1,9 +1,29 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" data-theme="dark" style="color-scheme: dark">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="dark light" />
     <title>ChapterCheck</title>
+    <script>
+      /* Before paint: default dark. OS "default"/light must not flash a pale skin. */
+      (function () {
+        try {
+          var raw = localStorage.getItem("chaptercheck.ui_theme");
+          var pref =
+            raw === "light" || raw === "system" || raw === "dark" ? raw : "dark";
+          document.documentElement.setAttribute("data-theme", pref);
+          var light =
+            pref === "light" ||
+            (pref === "system" &&
+              window.matchMedia("(prefers-color-scheme: light)").matches);
+          document.documentElement.style.colorScheme = light ? "light" : "dark";
+        } catch (e) {
+          document.documentElement.setAttribute("data-theme", "dark");
+          document.documentElement.style.colorScheme = "dark";
+        }
+      })();
+    </script>
   </head>
   <body>
     <div id="root"></div>
