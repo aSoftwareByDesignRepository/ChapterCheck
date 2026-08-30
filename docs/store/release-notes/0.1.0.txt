@@ -1,0 +1,18 @@
+<en-US>
+First public ChapterCheck release for Linux.
+
+• Link local folders for audiobooks and music
+• Resume progress, variable speed, and a process-level sleep timer
+• Dark-friendly UI with clear play vs details controls
+• Optional online metadata only after an OS confirm dialog
+• Playback via mpv · no ads · no analytics
+</en-US>
+<de-DE>
+Erste öffentliche ChapterCheck-Version für Linux.
+
+• Lokale Ordner für Hörbücher und Musik verknüpfen
+• Fortschritt, variable Geschwindigkeit und Prozess-Schlaf-Timer
+• Dunkles, ruhiges UI mit klarer Trennung Play vs. Details
+• Online-Metadaten nur nach OS-Bestätigung
+• Wiedergabe über mpv · keine Werbung · keine Analyse
+</de-DE>

@@ -51,6 +51,17 @@ npm run install:deb
 
 That copies the newest `.deb` from `src-tauri/target/release/bundle/deb/` to `/tmp` and installs it with `apt-get` (so apt’s `_apt` sandbox can read the file). Do not run `sudo apt install ./…/*.deb` directly from the repo — paths under `$HOME` trigger permission warnings even when the install succeeds.
 
+## Store publishing (Flathub / Snap / .deb)
+
+ChapterCheck is a **Linux desktop** app (not Google Play / App Store). The AZC-style publication kit lives in [`docs/store/`](docs/store/):
+
+- Listings EN + DE, privacy HTML, data-safety & content-rating answers
+- 512×512 icon + 1024×500 feature graphic
+- Draft AppStream metainfo for Flathub (`de.softwarebydesign.ChapterCheck`)
+- Release checklist + `npm run store:preflight`
+
+Screenshots still need to be captured into `docs/store/assets/screenshots/`. Privacy pages must be deployed before Flathub submission (see `docs/store/PUBLISH-PRIVACY.md`).
+
 ## Author
 
 **Alexander Mäule** — [info@software-by-design.de](mailto:info@software-by-design.de)  

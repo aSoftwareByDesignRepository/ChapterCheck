@@ -1,0 +1,58 @@
+=== LINUX STORE LISTING — ENGLISH (en-US) ===
+AppStream / Flathub ID (target): de.softwarebydesign.ChapterCheck
+Desktop package (.deb): chapter-check
+Category: AudioVideo; Audio; Player
+Keywords: audiobook, music player, mpv, resume, offline, linux
+Release notes v0.1.0: paste release-notes/0.1.0.txt
+Copy into Flathub / Snap listing fields and website product page.
+
+--- App name ---
+ChapterCheck
+
+--- Short description (≈ 1 line / AppStream <summary>) ---
+Local audiobook and music player for Linux with resume, speed, and sleep timer.
+
+--- Full description ---
+ChapterCheck is a quiet desktop player for long-form audio on Linux. Link your own folders, continue where you left off, change speed, and set a sleep timer — without a streaming account.
+
+SEARCHING FOR
+Linux audiobook player, local music player, mpv front-end, resume playback SQLite, offline Hörbuch player, sleep timer audiobook, folder playlist Linux.
+
+WHO IT IS FOR
+• People who keep audiobooks and music as files on disk
+• Listeners who want resume and speed without cloud lock-in
+• Linux Mint / Ubuntu users who prefer a simple .deb or Flatpak
+
+WHAT YOU NEED
+• Linux desktop (x86_64)
+• mpv on PATH (bundled as a package dependency for .deb)
+• Folders or files you own (no hosted demo library)
+
+WHAT THE APP DOES
+• Link library folders once — scan audiobooks and music collections
+• Resume progress in a local SQLite library under your user profile
+• Variable playback speed and a process-level sleep timer
+• Playlists, continue listening, and hardware media keys (MPRIS)
+• Optional online cover/title lookup (Open Library / MusicBrainz) — off until you allow it
+• Playback engine: mpv
+
+PRIVACY
+• No ads, no analytics SDKs
+• Library paths and progress stay on your machine
+• Optional metadata lookup only after an explicit OS confirm dialog
+• See the privacy policy URL in the store listing
+
+ALSO AVAILABLE
+• AudioCheck — Nextcloud audiobook & music app for phones (separate product)
+• Nextcloud apps: https://nextcloud.software-by-design.de/en/
+
+Publisher: Software by Design GbR, Schleswig, Germany · info@software-by-design.de
+
+--- Contact email ---
+info@software-by-design.de
+
+--- Website ---
+https://github.com/aSoftwareByDesignRepository/ChapterCheck
+
+--- Privacy policy URL ---
+https://nextcloud.software-by-design.de/en/privacy-chaptercheck.html

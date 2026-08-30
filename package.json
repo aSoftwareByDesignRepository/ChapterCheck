@@ -31,7 +31,9 @@
     "tauri": "tauri",
     "install:deb": "bash scripts/install-deb.sh",
     "ship": "npm run tauri build && npm run install:deb",
-    "run:release": "src-tauri/target/release/audioplayer"
+    "run:release": "src-tauri/target/release/audioplayer",
+    "store:graphics": "python3 scripts/generate-store-graphics.py",
+    "store:preflight": "bash scripts/store-preflight.sh"
   },
   "dependencies": {
     "@fontsource/fraunces": "^5.2.9",

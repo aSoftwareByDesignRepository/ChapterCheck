@@ -1,0 +1,57 @@
+=== LINUX-STORE-LISTING — DEUTSCH (de-DE) ===
+AppStream / Flathub-ID (Ziel): de.softwarebydesign.ChapterCheck
+Desktop-Paket (.deb): chapter-check
+Kategorie: AudioVideo; Audio; Player
+Schlüsselwörter: Hörbuch, Musikplayer, mpv, Fortsetzen, offline, linux
+Release Notes v0.1.0: release-notes/0.1.0.txt einfügen
+
+--- App-Name ---
+ChapterCheck
+
+--- Kurzbeschreibung ---
+Lokaler Hörbuch- und Musikplayer für Linux mit Fortsetzen, Tempo und Schlaf-Timer.
+
+--- Vollbeschreibung ---
+ChapterCheck ist ein ruhiger Desktop-Player für längere Audio-Dateien unter Linux. Ordner verknüpfen, dort weitermachen, wo Sie aufgehört haben, Tempo ändern und einen Schlaf-Timer setzen — ohne Streaming-Konto.
+
+SUCHBEGRIFFE
+Linux Hörbuch Player, lokaler Musikplayer, mpv Frontend, Wiedergabe fortsetzen, offline Hörbücher, Schlaf-Timer Hörbuch, Ordner-Playlist Linux.
+
+FÜR WEN
+• Menschen mit Hörbüchern und Musik als Dateien auf der Festplatte
+• Hörerinnen und Hörer ohne Cloud-Zwang
+• Linux-Mint- / Ubuntu-Nutzer mit einfachem .deb oder Flatpak
+
+WAS SIE BRAUCHEN
+• Linux-Desktop (x86_64)
+• mpv im PATH (beim .deb als Abhängigkeit)
+• Eigene Ordner oder Dateien (keine Demo-Bibliothek in der Cloud)
+
+FUNKTIONEN
+• Bibliotheksordner einmal verknüpfen — Hörbücher und Musik scannen
+• Fortschritt lokal in SQLite unter Ihrem Benutzerprofil
+• Variable Geschwindigkeit und Prozess-Schlaf-Timer
+• Playlists, Weitermachen, Medientasten (MPRIS)
+• Optionale Online-Metadaten (Open Library / MusicBrainz) — erst nach OS-Bestätigung
+• Wiedergabe über mpv
+
+DATENSCHUTZ
+• Keine Werbung, keine Analyse-SDKs
+• Bibliothek und Fortschritt bleiben auf Ihrem Rechner
+• Online-Metadaten nur nach expliziter Bestätigung
+• Datenschutz-URL im Store-Eintrag
+
+AUCH ERHÄLTLICH
+• AudioCheck — Nextcloud Hörbuch- und Musik-App fürs Smartphone
+• Nextcloud-Apps: https://nextcloud.software-by-design.de/de/
+
+Herausgeber: Software by Design GbR, Schleswig · info@software-by-design.de
+
+--- Kontakt-E-Mail ---
+info@software-by-design.de
+
+--- Website ---
+https://github.com/aSoftwareByDesignRepository/ChapterCheck
+
+--- Datenschutz-URL ---
+https://nextcloud.software-by-design.de/de/datenschutz-chaptercheck.html

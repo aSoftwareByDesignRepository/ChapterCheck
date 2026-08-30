@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="de">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Datenschutzerklärung — ChapterCheck</title>
+  <meta name="description" content="Datenschutzerklärung für den ChapterCheck Linux-Desktop-Hörbuch- und Musikplayer von Software by Design GbR." />
+  <meta name="color-scheme" content="dark light" />
+  <link rel="canonical" href="https://nextcloud.software-by-design.de/de/datenschutz-chaptercheck.html" />
+  <style>
+    :root { color-scheme: light dark; --bg: #0e1014; --text: #f5f7fb; --muted: #c2c8d6; --accent: #6ef0bf; --card: #1a1d27; }
+    @media (prefers-color-scheme: light) {
+      :root { --bg: #eef2f7; --text: #12151c; --muted: #3a4454; --accent: #0b6b56; --card: #fff; }
+    }
+    body { margin: 0; font: 1.05rem/1.55 system-ui, sans-serif; background: var(--bg); color: var(--text); }
+    main { max-width: 42rem; margin: 0 auto; padding: 2rem 1.25rem 4rem; }
+    h1 { font-size: 1.75rem; letter-spacing: -0.02em; }
+    h2 { font-size: 1.15rem; margin-top: 1.75rem; }
+    .meta { color: var(--muted); font-size: 0.95rem; }
+    a { color: var(--accent); }
+    table { width: 100%; border-collapse: collapse; margin: 1rem 0; font-size: 0.95rem; }
+    th, td { border: 1px solid color-mix(in oklab, var(--muted) 35%, transparent); padding: 0.5rem 0.6rem; text-align: left; vertical-align: top; }
+    th { background: var(--card); }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Datenschutzerklärung — ChapterCheck</h1>
+    <p class="meta">Zuletzt aktualisiert: 30. August 2026 · Linux-Desktop-App · Anbieter: Software by Design GbR, Husumer Baum 2, 24837 Schleswig, Deutschland<br />
+      Kontakt: <a href="mailto:info@software-by-design.de">info@software-by-design.de</a> ·
+      <a href="mailto:datenschutz@software-by-design.de">datenschutz@software-by-design.de</a></p>
+
+    <h2>1. Geltungsbereich</h2>
+    <p>Diese Erklärung gilt für die <strong>ChapterCheck</strong>-Desktop-App unter Linux. Die App spielt Audiodateien aus von Ihnen gewählten Ordnern. Software by Design betreibt <strong>keine</strong> Cloud-Bibliothek für ChapterCheck.</p>
+
+    <h2>2. Verantwortliche</h2>
+    <table>
+      <thead><tr><th>Ort</th><th>Verantwortung</th></tr></thead>
+      <tbody>
+        <tr><td>App und diese Erklärung</td><td>Software by Design GbR</td></tr>
+        <tr><td>Ihre Audiodateien und Hörfortschritt</td><td>Sie (auf Ihrem Gerät)</td></tr>
+      </tbody>
+    </table>
+
+    <h2>3. Daten auf dem Gerät</h2>
+    <table>
+      <thead><tr><th>Daten</th><th>Zweck</th><th>Speicherung</th></tr></thead>
+      <tbody>
+        <tr><td>Verknüpfte Ordnerpfade</td><td>Bibliothek / Wiedergabe</td><td>Lokale SQLite unter <code>~/.local/share/chaptercheck/</code> (typisch)</td></tr>
+        <tr><td>Position, Tempo, gehört-Markierungen</td><td>Fortsetzen</td><td>Dieselbe Datenbank</td></tr>
+        <tr><td>Cover-Cache</td><td>Anzeige</td><td><code>…/chaptercheck/covers/</code></td></tr>
+        <tr><td>UI-Einstellungen</td><td>Darstellung</td><td>Lokale Einstellungen</td></tr>
+      </tbody>
+    </table>
+
+    <h2>4. Optionale Netzwerkanfragen</h2>
+    <p>Wenn Sie <strong>Online-Metadaten</strong> erlauben, kann die App bereits lokal vorliegende Titel und Künstlernamen an Open Library und MusicBrainz per HTTPS senden. Das ist standardmäßig aus und erfordert eine Bestätigung im Betriebssystem. Audiodateien werden dafür nicht hochgeladen.</p>
+
+    <h2>5. Was wir nicht tun</h2>
+    <ul>
+      <li>Kein Verkauf personenbezogener Daten</li>
+      <li>Keine Werbe- oder Analyse-SDKs Dritter</li>
+      <li>Kein Software-by-Design-Konto für ChapterCheck</li>
+      <li>Keine Übertragung Ihrer Bibliothek an Server von Software by Design</li>
+    </ul>
+
+    <h2>6. Berechtigungen (Linux)</h2>
+    <table>
+      <thead><tr><th>Zugriff</th><th>Grund</th></tr></thead>
+      <tbody>
+        <tr><td>Von Ihnen gewählte Dateien / Ordner</td><td>Wiedergabe</td></tr>
+        <tr><td>Netzwerk (optional)</td><td>Metadaten, wenn aktiviert</td></tr>
+        <tr><td>Audioausgabe</td><td>Wiedergabe über mpv</td></tr>
+        <tr><td>Session-D-Bus</td><td>Medientasten (MPRIS)</td></tr>
+      </tbody>
+    </table>
+
+    <h2>7. Ihre Rechte</h2>
+    <p>Lokale Daten löschen Sie durch Entfernen des ChapterCheck-Datenordners und Deinstallation. Fragen: <a href="mailto:datenschutz@software-by-design.de">datenschutz@software-by-design.de</a>.</p>
+
+    <h2>8. Änderungen</h2>
+    <p>Die aktuelle Fassung steht unter der Datenschutz-URL im Store-Eintrag.</p>
+  </main>
+</body>
+</html>

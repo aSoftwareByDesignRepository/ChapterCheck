@@ -1,0 +1,73 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Draft AppStream metainfo for Flathub.
+  App ID: de.softwarebydesign.ChapterCheck
+  Align the Flatpak manifest desktop-file / rename with this ID before merge.
+-->
+<component type="desktop-application">
+  <id>de.softwarebydesign.ChapterCheck</id>
+  <name>ChapterCheck</name>
+  <name xml:lang="de">ChapterCheck</name>
+  <summary>Local audiobook and music player for Linux with resume, speed, and sleep timer</summary>
+  <summary xml:lang="de">Lokaler Hörbuch- und Musikplayer für Linux mit Fortsetzen, Tempo und Schlaf-Timer</summary>
+  <metadata_license>FSFAP</metadata_license>
+  <project_license>MIT</project_license>
+  <developer_name>Software by Design GbR</developer_name>
+  <url type="homepage">https://github.com/aSoftwareByDesignRepository/ChapterCheck</url>
+  <url type="bugtracker">https://github.com/aSoftwareByDesignRepository/ChapterCheck/issues</url>
+  <url type="help">https://nextcloud.software-by-design.de/en/privacy-chaptercheck.html</url>
+  <branding>
+    <color type="primary" scheme_preference="dark">#0e1014</color>
+    <color type="primary" scheme_preference="light">#0b6b56</color>
+  </branding>
+  <description>
+    <p>
+      ChapterCheck is a quiet desktop player for long-form audio on Linux.
+      Link your own folders, continue where you left off, change speed, and set a sleep timer —
+      without a streaming account. Playback uses mpv; library paths and progress stay on your machine.
+    </p>
+    <p xml:lang="de">
+      ChapterCheck ist ein ruhiger Desktop-Player für längere Audio-Dateien unter Linux.
+      Ordner verknüpfen, Fortschritt behalten, Tempo ändern und Schlaf-Timer setzen —
+      ohne Streaming-Konto. Wiedergabe über mpv; Bibliothek und Fortschritt bleiben lokal.
+    </p>
+    <ul>
+      <li>Resume progress in a local SQLite library</li>
+      <li>Variable speed and process-level sleep timer</li>
+      <li>Optional Open Library / MusicBrainz lookup (opt-in)</li>
+      <li>MPRIS media keys</li>
+    </ul>
+  </description>
+  <launchable type="desktop-id">de.softwarebydesign.ChapterCheck.desktop</launchable>
+  <screenshots>
+    <!-- Replace with real captures under docs/store/assets/screenshots/ once available -->
+  </screenshots>
+  <releases>
+    <release version="0.1.0" date="2026-08-30">
+      <description>
+        <p>First public Linux release: local library, resume, speed, sleep timer, dark-friendly UI.</p>
+      </description>
+    </release>
+  </releases>
+  <content_rating type="oars-1.1" />
+  <categories>
+    <category>AudioVideo</category>
+    <category>Audio</category>
+    <category>Player</category>
+  </categories>
+  <keywords>
+    <keyword>audiobook</keyword>
+    <keyword>music</keyword>
+    <keyword>mpv</keyword>
+    <keyword>offline</keyword>
+    <keyword xml:lang="de">Hörbuch</keyword>
+    <keyword xml:lang="de">Musikplayer</keyword>
+  </keywords>
+  <requires>
+    <display_length compare="ge">768</display_length>
+  </requires>
+  <recommends>
+    <control>keyboard</control>
+    <control>pointing</control>
+  </recommends>
+</component>
