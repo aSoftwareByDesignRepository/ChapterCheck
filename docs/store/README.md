@@ -27,6 +27,9 @@ Publication kit for the **ChapterCheck** desktop player (Tauri + mpv). Modeled o
 | [publish/en/privacy-chaptercheck.html](./publish/en/privacy-chaptercheck.html) | **Deploy (EN)** |
 | [publish/de/datenschutz-chaptercheck.html](./publish/de/datenschutz-chaptercheck.html) | **Deploy (DE)** |
 | [flathub/de.softwarebydesign.ChapterCheck.metainfo.xml](./flathub/de.softwarebydesign.ChapterCheck.metainfo.xml) | AppStream / Flathub draft |
+| [flathub/de.softwarebydesign.ChapterCheck.yml](./flathub/de.softwarebydesign.ChapterCheck.yml) | Flatpak manifest (local stage) |
+| [flathub/README.md](./flathub/README.md) | Stage / Flathub PR notes |
+| [assets/screenshots/](./assets/screenshots/) | Real desktop captures |
 | [release-notes/0.1.0.txt](./release-notes/0.1.0.txt) | First public release notes |
 
 **Local check:** `npm run store:preflight`

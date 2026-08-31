@@ -29,10 +29,17 @@ required=(
   docs/store/publish/de/datenschutz-chaptercheck.html
   docs/store/assets/feature-graphic-1024x500.png
   docs/store/assets/store-icon-512.png
+  docs/store/assets/screenshots/desktop-01-home.png
+  docs/store/assets/screenshots/desktop-03-music.png
+  docs/store/assets/screenshots/desktop-05-audiobooks.png
   docs/store/flathub/de.softwarebydesign.ChapterCheck.metainfo.xml
+  docs/store/flathub/de.softwarebydesign.ChapterCheck.yml
+  docs/store/flathub/de.softwarebydesign.ChapterCheck.desktop
   docs/store/release-notes/0.1.0.txt
   docs/store/assets/screenshots/README.md
   scripts/generate-store-graphics.py
+  scripts/publish-privacy-to-website.py
+  scripts/stage-flatpak-prefix.sh
 )
 missing=0
 for f in "${required[@]}"; do
@@ -56,6 +63,10 @@ for rel, size in checks.items():
     im = Image.open(root / rel)
     assert im.size == size, f'{rel}: expected {size}, got {im.size}'
     print(f'OK {rel} {im.size}')
+for shot in Path('docs/store/assets/screenshots').glob('desktop-*.png'):
+    im = Image.open(shot)
+    assert im.size[0] >= 1000 and im.size[1] >= 600, shot
+    print(f'OK {shot} {im.size}')
 PY
 
 echo "==> Listing privacy URLs present"

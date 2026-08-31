@@ -1,0 +1,15 @@
+[Desktop Entry]
+Type=Application
+Name=ChapterCheck
+GenericName=Audio Player
+GenericName[de]=Audioplayer
+Comment=Local audiobook and music player with resume, speed, and sleep timer
+Comment[de]=Lokaler Hörbuch- und Musikplayer mit Fortsetzen, Tempo und Schlaf-Timer
+Exec=audioplayer %F
+Icon=de.softwarebydesign.ChapterCheck
+Terminal=false
+Categories=AudioVideo;Audio;Player;
+Keywords=audiobook;music;mpv;player;chaptercheck;
+Keywords[de]=Hörbuch;Musik;mpv;Player;chaptercheck;
+StartupWMClass=audioplayer
+MimeType=audio/mpeg;audio/mp4;audio/aac;audio/flac;audio/ogg;audio/opus;audio/wav;audio/x-ms-wma;audio/aiff;

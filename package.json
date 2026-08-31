@@ -33,7 +33,9 @@
     "ship": "npm run tauri build && npm run install:deb",
     "run:release": "src-tauri/target/release/audioplayer",
     "store:graphics": "python3 scripts/generate-store-graphics.py",
-    "store:preflight": "bash scripts/store-preflight.sh"
+    "store:preflight": "bash scripts/store-preflight.sh",
+    "store:privacy": "python3 scripts/publish-privacy-to-website.py",
+    "store:flatpak-stage": "bash scripts/stage-flatpak-prefix.sh"
   },
   "dependencies": {
     "@fontsource/fraunces": "^5.2.9",

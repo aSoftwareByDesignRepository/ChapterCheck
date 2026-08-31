@@ -2,9 +2,9 @@
 
 | Asset | Size | Notes |
 |-------|------|-------|
-| App icon | 512×512 PNG | [assets/store-icon-512.png](./assets/store-icon-512.png) — from `src-tauri/icons/256x256.png` |
+| App icon | 512×512 PNG | [assets/store-icon-512.png](./assets/store-icon-512.png) |
 | Feature graphic | 1024×500 | [assets/feature-graphic-1024x500.png](./assets/feature-graphic-1024x500.png) |
-| Screenshots | ≥ 2 | **You capture** — see below |
+| Screenshots | 5 captures | [assets/screenshots/](./assets/screenshots/) — real Linux window |
 
 Regenerate icon + banner:
 
@@ -18,18 +18,14 @@ python3 scripts/generate-store-graphics.py
 - Left: app icon on elevated plate
 - Right text: **ChapterCheck** · *Local audiobook & music player for Linux* · mint accent subline
 
-## Screenshot content
+## Screenshots (captured)
 
-Capture on a 1280×800 (or similar) Linux desktop window:
+| File | Content |
+|------|---------|
+| `desktop-01-home.png` | Home — continue / music shelf |
+| `desktop-02-playing.png` | Session with transport visible |
+| `desktop-03-music.png` | Music catalog |
+| `desktop-04-playlists.png` | Playlists |
+| `desktop-05-audiobooks.png` | Audiobooks catalog |
 
-1. **home-empty** — welcome + one **Add my folder** CTA (dark theme)
-2. **home-continue** — continue row + mini player playing
-3. **catalog** (optional) — list of titles with clear play controls
-
-Place files in `docs/store/assets/screenshots/` as:
-
-- `desktop-01-home.png`
-- `desktop-02-playing.png`
-- `desktop-03-catalog.png` (optional)
-
-See [assets/screenshots/README.md](./assets/screenshots/README.md).
+Target window ≈ 1280×800, dark theme. See [assets/screenshots/README.md](./assets/screenshots/README.md).

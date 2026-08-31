@@ -1,13 +1,15 @@
-# Screenshots (capture required)
+# Screenshots (captured)
 
-Flathub and Snap need real window captures. Place PNG files here:
+Real window captures from the installed Linux build (1280×832, dark theme).
 
 | File | Content |
 |------|---------|
-| `desktop-01-home.png` | Welcome / empty library or Home with continue |
-| `desktop-02-playing.png` | Mini player active, dark theme |
-| `desktop-03-catalog.png` | Optional catalog list |
+| `desktop-01-home.png` | Home — continue / music shelf + mini player |
+| `desktop-02-playing.png` | Same session with transport visible (store “playing” slot) |
+| `desktop-03-music.png` | Music catalog — Play all / Shuffle |
+| `desktop-04-playlists.png` | Playlists empty state |
+| `desktop-05-audiobooks.png` | Audiobooks catalog |
 
-Suggested size: 1280×800 or the native window at 100% scale. No phone frames.
+Regenerate after UI changes: launch `audioplayer`, resize to 1280×800, `gnome-screenshot -w`.
 
 Graphics brief: [../GRAPHICS.md](../GRAPHICS.md).

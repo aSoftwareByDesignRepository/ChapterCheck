@@ -9,3 +9,4 @@ src-tauri/target
 reports
 src-tauri/mutants.out
 src-tauri/mutants.out.old
+docs/store/flathub/staged-prefix/

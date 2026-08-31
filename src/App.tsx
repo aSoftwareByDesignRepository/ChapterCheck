@@ -2067,7 +2067,11 @@ export default function App() {
             <span className="menubar-app-name">{t("app.title")}</span>
           </div>
 
-          <nav className="menubar-menus" aria-label={t("menubar.aria")}>
+          <nav
+            className="menubar-menus"
+            aria-label={t("menubar.aria")}
+            hidden={isTauri()}
+          >
             <div className="menubar-menu">
               <button
                 type="button"

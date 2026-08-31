@@ -4,7 +4,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Privacy policy — ChapterCheck</title>
-  <meta name="description" content="Privacy policy for the ChapterCheck Linux desktop audiobook and music player by Software by Design GbR." />
+  <meta name="description" content="Privacy policy for ChapterCheck, the Linux desktop audiobook and music player by Software by Design GbR." />
   <meta name="color-scheme" content="dark light" />
   <link rel="canonical" href="https://nextcloud.software-by-design.de/en/privacy-chaptercheck.html" />
   <style>
@@ -16,7 +16,6 @@
     main { max-width: 42rem; margin: 0 auto; padding: 2rem 1.25rem 4rem; }
     h1 { font-size: 1.75rem; letter-spacing: -0.02em; }
     h2 { font-size: 1.15rem; margin-top: 1.75rem; }
-    p, li { color: var(--text); }
     .meta { color: var(--muted); font-size: 0.95rem; }
     a { color: var(--accent); }
     table { width: 100%; border-collapse: collapse; margin: 1rem 0; font-size: 0.95rem; }
@@ -26,61 +25,78 @@
 </head>
 <body>
   <main>
-    <h1>Privacy policy — ChapterCheck</h1>
-    <p class="meta">Last updated: 30 August 2026 · Linux desktop app · Publisher: Software by Design GbR, Husumer Baum 2, 24837 Schleswig, Germany<br />
-      Contact: <a href="mailto:info@software-by-design.de">info@software-by-design.de</a> ·
-      <a href="mailto:datenschutz@software-by-design.de">datenschutz@software-by-design.de</a></p>
+    <section class="page-head">
+      <div class="container">
+        <nav class="page-head__crumbs" aria-label="Breadcrumb"><a href="index.html">Home</a> · <span aria-current="page">ChapterCheck — Privacy</span></nav>
+        <span class="eyebrow">Legal · Desktop app</span>
+        <h1>Privacy policy — ChapterCheck</h1>
+        <p class="lead">This notice covers the <strong>ChapterCheck</strong> Linux desktop player. Your audio files and listening progress stay on <strong>your computer</strong>.</p>
+        <p class="muted"><small>Last updated: 31 August 2026</small></p>
+      </div>
+    </section>
+    <section class="section">
+      <div class="container">
+        <div class="prose">
+          <h2 id="publisher">Publisher</h2>
+          <address>
+            Software by Design GbR<br>
+            Husumer Baum 2<br>
+            24837 Schleswig, Germany<br>
+            Email: <a href="mailto:info@software-by-design.de">info@software-by-design.de</a><br>
+            Privacy: <a href="mailto:datenschutz@software-by-design.de">datenschutz@software-by-design.de</a>
+          </address>
+          <p>Package: <code>chapter-check</code> · Flathub ID (target): <code>de.softwarebydesign.ChapterCheck</code></p>
+          <p>General website privacy: <a href="privacy.html">website privacy notice</a>.</p>
 
-    <h2>1. Scope</h2>
-    <p>This policy covers the <strong>ChapterCheck</strong> desktop application for Linux. The app plays audio files from folders you choose on your computer. Software by Design does <strong>not</strong> operate a cloud library for ChapterCheck.</p>
+          <h2 id="scope">1. Scope</h2>
+          <p>ChapterCheck plays audio from folders you choose. Software by Design does <strong>not</strong> operate a cloud library for this app.</p>
 
-    <h2>2. Controller</h2>
-    <table>
-      <thead><tr><th>Location</th><th>Controller</th></tr></thead>
-      <tbody>
-        <tr><td>App binary &amp; this policy</td><td>Software by Design GbR</td></tr>
-        <tr><td>Your audio files &amp; listening progress</td><td>You (on your device)</td></tr>
-      </tbody>
-    </table>
+          <h2 id="device">2. Data on your device</h2>
+          <div class="table-wrap"><table>
+            <thead><tr><th scope="col">Data</th><th scope="col">Purpose</th><th scope="col">Storage</th></tr></thead>
+            <tbody>
+              <tr><td>Linked folder paths</td><td>Library / playback</td><td>Local SQLite under <code>~/.local/share/chaptercheck/</code> (typical)</td></tr>
+              <tr><td>Progress, speed, listened flags</td><td>Resume</td><td>Same database</td></tr>
+              <tr><td>Cover cache</td><td>Display</td><td><code>…/chaptercheck/covers/</code></td></tr>
+              <tr><td>UI preferences</td><td>Appearance</td><td>Local settings</td></tr>
+            </tbody>
+          </table></div>
 
-    <h2>3. Data stored on the device</h2>
-    <table>
-      <thead><tr><th>Data</th><th>Purpose</th><th>Storage</th></tr></thead>
-      <tbody>
-        <tr><td>Linked folder paths</td><td>Library scan / playback</td><td>Local SQLite under <code>~/.local/share/chaptercheck/</code> (typical)</td></tr>
-        <tr><td>Playback position, speed, listened flags</td><td>Resume</td><td>Same database</td></tr>
-        <tr><td>Cover image cache</td><td>Display</td><td><code>…/chaptercheck/covers/</code></td></tr>
-        <tr><td>UI preferences</td><td>Appearance</td><td>Local settings</td></tr>
-      </tbody>
-    </table>
+          <h2 id="network">3. Optional network</h2>
+          <p>If you enable <strong>online metadata</strong>, titles and artist names you already have may be sent to Open Library and MusicBrainz over HTTPS. This is <strong>off by default</strong> and requires an OS confirmation. Audio files are not uploaded.</p>
 
-    <h2>4. Optional network requests</h2>
-    <p>If you enable <strong>online metadata</strong>, the app may send titles and artist names you already have locally to Open Library and MusicBrainz over HTTPS. This is off by default and requires an operating-system confirmation dialog. Audio file contents are not uploaded for that feature.</p>
+          <h2 id="not">4. What we do not do</h2>
+          <ul>
+            <li>No sale of personal data</li>
+            <li>No advertising or analytics SDKs</li>
+            <li>No Software by Design account for ChapterCheck</li>
+            <li>No transfer of your library to Software by Design servers</li>
+          </ul>
 
-    <h2>5. What we do not do</h2>
-    <ul>
-      <li>No sale of personal data</li>
-      <li>No third-party advertising or analytics SDKs</li>
-      <li>No Software by Design account for ChapterCheck</li>
-      <li>No transmission of your library to Software by Design servers</li>
-    </ul>
+          <h2 id="permissions">5. Permissions</h2>
+          <div class="table-wrap"><table>
+            <thead><tr><th scope="col">Access</th><th scope="col">Why</th></tr></thead>
+            <tbody>
+              <tr><td>Files / folders you select</td><td>Playback</td></tr>
+              <tr><td>Network (optional)</td><td>Metadata when enabled</td></tr>
+              <tr><td>Audio output</td><td>Playback via mpv</td></tr>
+              <tr><td>Session D-Bus</td><td>Media keys (MPRIS)</td></tr>
+            </tbody>
+          </table></div>
 
-    <h2>6. Permissions (Linux)</h2>
-    <table>
-      <thead><tr><th>Access</th><th>Reason</th></tr></thead>
-      <tbody>
-        <tr><td>Files / folders you select</td><td>Playback</td></tr>
-        <tr><td>Network (optional)</td><td>Metadata lookup when enabled</td></tr>
-        <tr><td>Audio output</td><td>Playback via mpv</td></tr>
-        <tr><td>Session D-Bus</td><td>Media keys (MPRIS)</td></tr>
-      </tbody>
-    </table>
+          <h2 id="deletion">6. Deletion</h2>
+          <p>Remove the ChapterCheck data directory and uninstall the package.</p>
 
-    <h2>7. Your rights</h2>
-    <p>Delete local data by removing the ChapterCheck data directory and uninstalling the package. Questions: <a href="mailto:datenschutz@software-by-design.de">datenschutz@software-by-design.de</a>.</p>
+          <h2 id="rights">7. Your rights (GDPR)</h2>
+          <p>Contact <a href="mailto:datenschutz@software-by-design.de">datenschutz@software-by-design.de</a> for questions about this app.</p>
 
-    <h2>8. Changes</h2>
-    <p>The current version is published at the privacy URL listed in the store listing.</p>
+          <h2 id="changes">8. Changes</h2>
+          <p>We may update this policy when the app changes. The “Last updated” date will change accordingly.</p>
+        </div>
+      </div>
+    </section>
+
+    <p class="meta"><a href="../de/datenschutz-chaptercheck.html">Deutsch</a></p>
   </main>
 </body>
 </html>

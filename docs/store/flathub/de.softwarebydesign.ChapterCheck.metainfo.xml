@@ -40,7 +40,18 @@
   </description>
   <launchable type="desktop-id">de.softwarebydesign.ChapterCheck.desktop</launchable>
   <screenshots>
-    <!-- Replace with real captures under docs/store/assets/screenshots/ once available -->
+    <screenshot type="default">
+      <caption>Home — continue listening and music shelf</caption>
+      <image>https://raw.githubusercontent.com/aSoftwareByDesignRepository/ChapterCheck/feature/unified-library/docs/store/assets/screenshots/desktop-01-home.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>Music library with play controls</caption>
+      <image>https://raw.githubusercontent.com/aSoftwareByDesignRepository/ChapterCheck/feature/unified-library/docs/store/assets/screenshots/desktop-03-music.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>Audiobooks catalog</caption>
+      <image>https://raw.githubusercontent.com/aSoftwareByDesignRepository/ChapterCheck/feature/unified-library/docs/store/assets/screenshots/desktop-05-audiobooks.png</image>
+    </screenshot>
   </screenshots>
   <releases>
     <release version="0.1.0" date="2026-08-30">
